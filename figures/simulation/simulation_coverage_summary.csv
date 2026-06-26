@@ -1,0 +1,11 @@
+filename,property_name,dataset_label,entry_count,covered_entity_count,entity_type,included_in_scatter
+simulated_PBE_TZVP_anions_structured.csv,PBE_TZVP_anions,PBE_TZVP_anions,7444,7444,anion,False
+simulated_PBE_TZVP_cations_structured.csv,PBE_TZVP_cations,PBE_TZVP_cations,9172,9172,cation,False
+simulated_QM_elec_HF_structured.csv,QM_elec_HF,QM_elec_HF,28231,27282,SMILES,False
+simulated_box_20260514_mapping_structured.csv,box,box,24093,11972,cation+anion,True
+simulated_charge_20260514_mapping_structured.csv,charge,charge,28214,27386,SMILES,False
+simulated_combi_qm_solv_structured.csv,combi_qm_solv,combi_qm_solv,1000000,1000000,solvent+solute,False
+simulated_density_structured.csv,density,density,25346,12554,cation+anion,True
+simulated_heat_capacity_structured.csv,heat_capacity,heat_capacity,12038,11946,cation+anion,True
+simulated_heat_of_vaporization_structured.csv,heat_of_vaporization,heat_of_vaporization,26835,13441,cation+anion,True
+simulated_thermal_expansion_structured.csv,thermal_expansion,thermal_expansion,12038,11946,cation+anion,True
