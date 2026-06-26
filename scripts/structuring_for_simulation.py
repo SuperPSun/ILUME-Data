@@ -1,4 +1,4 @@
-"""Structure raw simulation datasets into ILThermo-style wide CSV outputs."""
+"""Structure raw simulation datasets into compact, dataset-native CSV outputs."""
 
 from __future__ import annotations
 
@@ -18,27 +18,7 @@ if str(SRC_ROOT) not in sys.path:
 from raw_prep import canonicalize_smiles, disable_rdkit_logs, raw_root, structured_root
 
 
-STANDARD_COLUMNS = [
-    "cation",
-    "anion",
-    "temperature_K",
-    "pressure_kPa",
-    "frequency_MHz",
-    "wavelength_nm",
-    "property_name",
-    "property_unit",
-    "property_value",
-    "label",
-    "standard_unit",
-    "parse_error",
-    "note",
-    "source_text",
-]
-
-
 def to_float(value: object) -> float | None:
-    """Convert a value to float, returning None when conversion is impossible."""
-
     text = str(value or "").strip()
     if not text:
         return None
@@ -49,412 +29,149 @@ def to_float(value: object) -> float | None:
 
 
 @lru_cache(maxsize=None)
-def _canonicalize_cached(smiles: str) -> str:
-    """Canonicalize one SMILES string with a cache for repeated mapping rows."""
-
-    return canonicalize_smiles(smiles)
-
-
 def clean_smiles(value: object) -> str:
-    """Trim and canonicalize one SMILES string."""
-
-    return _canonicalize_cached(str(value or "").strip())
+    return canonicalize_smiles(str(value or "").strip())
 
 
-def write_output(rows: list[dict[str, object]], output_path: Path, extra_columns: list[str] | None = None) -> None:
-    """Write a structured CSV with standard columns first and source-specific columns after."""
-
+def write_output(df: pd.DataFrame, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    columns = STANDARD_COLUMNS + list(extra_columns or [])
-    pd.DataFrame(rows, columns=columns).drop_duplicates().to_csv(output_path, index=False)
+    df.to_csv(output_path, index=False)
     print(f"  Saved to {output_path}")
 
 
-def process_density_260501(raw_dir: Path, output_dir: Path) -> None:
-    """Structure density_260501.csv."""
+def canonicalize_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for column in columns:
+        if column in df.columns:
+            df[column] = df[column].map(clean_smiles)
+    return df
 
+
+def numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for column in columns:
+        if column in df.columns:
+            df[column] = df[column].map(to_float)
+    return df
+
+
+def process_density_260501(raw_dir: Path, output_dir: Path) -> None:
     input_path = raw_dir / "density_260501.csv"
     output_path = output_dir / "simulated_density_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        cation = clean_smiles(row.get("cation"))
-        anion = clean_smiles(row.get("anion"))
-        temperature = to_float(row.get("temperature"))
-        property_value = to_float(row.get("density"))
-        label = property_value * 0.001 if property_value is not None else None
-        rows.append(
-            {
-                "cation": cation,
-                "anion": anion,
-                "temperature_K": temperature,
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "Specific density",
-                "property_unit": "kg/m^3",
-                "property_value": property_value,
-                "label": label,
-                "standard_unit": "g/cm^3",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "density_err": to_float(row.get("density_err")),
-            }
-        )
-    write_output(rows, output_path, extra_columns=["density_err"])
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature", "density", "density_err"])
+    df = df.rename(columns={"temperature": "temperature_K"})
+    write_output(df[["cation", "anion", "temperature_K", "density", "density_err"]], output_path)
 
 
 def process_heat_capacity_260501(raw_dir: Path, output_dir: Path) -> None:
-    """Structure heat_capacity_260501.csv."""
-
     input_path = raw_dir / "heat_capacity_260501.csv"
     output_path = output_dir / "simulated_heat_capacity_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        cation = clean_smiles(row.get("cation"))
-        anion = clean_smiles(row.get("anion"))
-        temperature = to_float(row.get("temperature"))
-        property_value = to_float(row.get("Cp"))
-        rows.append(
-            {
-                "cation": cation,
-                "anion": anion,
-                "temperature_K": temperature,
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "Heat capacity at constant pressure",
-                "property_unit": "J/mol/K",
-                "property_value": property_value,
-                "label": property_value,
-                "standard_unit": "J/mol/K",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "Cp_err": to_float(row.get("Cp_err")),
-            }
-        )
-    write_output(rows, output_path, extra_columns=["Cp_err"])
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature", "Cp", "Cp_err"])
+    df = df.rename(columns={"temperature": "temperature_K"})
+    write_output(df[["cation", "anion", "temperature_K", "Cp", "Cp_err"]], output_path)
 
 
 def process_thermal_expansion_260501(raw_dir: Path, output_dir: Path) -> None:
-    """Structure thermal_expansion_260501.csv."""
-
     input_path = raw_dir / "thermal_expansion_260501.csv"
     output_path = output_dir / "simulated_thermal_expansion_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        cation = clean_smiles(row.get("cation"))
-        anion = clean_smiles(row.get("anion"))
-        temperature = to_float(row.get("temperature"))
-        property_value = to_float(row.get("alpha"))
-        rows.append(
-            {
-                "cation": cation,
-                "anion": anion,
-                "temperature_K": temperature,
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "Isobaric coefficient of volume expansion",
-                "property_unit": "K^-1",
-                "property_value": property_value,
-                "label": property_value,
-                "standard_unit": "K^-1",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "alpha_err": to_float(row.get("alpha_err")),
-            }
-        )
-    write_output(rows, output_path, extra_columns=["alpha_err"])
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature", "alpha", "alpha_err"])
+    df = df.rename(columns={"temperature": "temperature_K"})
+    write_output(df[["cation", "anion", "temperature_K", "alpha", "alpha_err"]], output_path)
 
 
 def process_heat_of_vaporization_260603(raw_dir: Path, output_dir: Path) -> None:
-    """Structure heat_of_vaporization_260603.csv."""
-
     input_path = raw_dir / "heat_of_vaporization_260603.csv"
     output_path = output_dir / "simulated_heat_of_vaporization_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        cation = clean_smiles(row.get("cation"))
-        anion = clean_smiles(row.get("anion"))
-        temperature = to_float(row.get("temperature"))
-        property_value = to_float(row.get("Hvap"))
-        rows.append(
-            {
-                "cation": cation,
-                "anion": anion,
-                "temperature_K": temperature,
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "Enthalpy of vaporization or sublimation",
-                "property_unit": "kJ/mol",
-                "property_value": property_value,
-                "label": property_value,
-                "standard_unit": "kJ/mol",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "Hvap_err": to_float(row.get("Hvap_err")),
-            }
-        )
-    write_output(rows, output_path, extra_columns=["Hvap_err"])
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature", "Hvap", "Hvap_err"])
+    df = df.rename(columns={"temperature": "temperature_K"})
+    write_output(df[["cation", "anion", "temperature_K", "Hvap", "Hvap_err"]], output_path)
 
 
 def process_pbe_tzvp_anions_260103(raw_dir: Path, output_dir: Path) -> None:
-    """Structure PBE_TZVP_anions_260103.csv as one wide row per anion."""
-
     input_path = raw_dir / "PBE_TZVP_anions_260103.csv"
     output_path = output_dir / "simulated_PBE_TZVP_anions_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        anion = clean_smiles(row.get("SMILES"))
-        gap = to_float(row.get("gap"))
-        rows.append(
-            {
-                "cation": "",
-                "anion": anion,
-                "temperature_K": None,
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "PBE_TZVP_gap",
-                "property_unit": "eV",
-                "property_value": gap,
-                "label": gap,
-                "standard_unit": "eV",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "SMILES": anion,
-                "HOMO": to_float(row.get("HOMO")),
-                "LUMO": to_float(row.get("LUMO")),
-                "gap": gap,
-            }
-        )
-    write_output(rows, output_path, extra_columns=["SMILES", "HOMO", "LUMO", "gap"])
+    df = canonicalize_columns(df, ["SMILES"])
+    df = numeric_columns(df, ["HOMO", "LUMO", "gap"])
+    df["anion"] = df["SMILES"]
+    write_output(df[["SMILES", "anion", "HOMO", "LUMO", "gap"]], output_path)
 
 
 def process_pbe_tzvp_cations_260103(raw_dir: Path, output_dir: Path) -> None:
-    """Structure PBE_TZVP_cations_260103.csv as one wide row per cation."""
-
     input_path = raw_dir / "PBE_TZVP_cations_260103.csv"
     output_path = output_dir / "simulated_PBE_TZVP_cations_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        cation = clean_smiles(row.get("SMILES"))
-        gap = to_float(row.get("gap"))
-        rows.append(
-            {
-                "cation": cation,
-                "anion": "",
-                "temperature_K": None,
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "PBE_TZVP_gap",
-                "property_unit": "eV",
-                "property_value": gap,
-                "label": gap,
-                "standard_unit": "eV",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "SMILES": cation,
-                "HOMO": to_float(row.get("HOMO")),
-                "LUMO": to_float(row.get("LUMO")),
-                "gap": gap,
-            }
-        )
-    write_output(rows, output_path, extra_columns=["SMILES", "HOMO", "LUMO", "gap"])
+    df = canonicalize_columns(df, ["SMILES"])
+    df = numeric_columns(df, ["HOMO", "LUMO", "gap"])
+    df["cation"] = df["SMILES"]
+    write_output(df[["SMILES", "cation", "HOMO", "LUMO", "gap"]], output_path)
 
 
-def process_hl_gap_pbe_tzvp(raw_dir: Path, output_dir: Path) -> None:
-    """Structure HL_gap_PBE_TZVP.csv as one wide row per molecule."""
-
+"""def process_hl_gap_pbe_tzvp(raw_dir: Path, output_dir: Path) -> None:
     input_path = raw_dir / "HL_gap_PBE_TZVP.csv"
     output_path = output_dir / "simulated_HL_gap_PBE_TZVP_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        smiles = clean_smiles(row.get("SMILES"))
-        gap = to_float(row.get("gap"))
-        rows.append(
-            {
-                "cation": "",
-                "anion": "",
-                "temperature_K": None,
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "PBE_TZVP_gap",
-                "property_unit": "eV",
-                "property_value": gap,
-                "label": gap,
-                "standard_unit": "eV",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "SMILES": smiles,
-                "HOMO": to_float(row.get("HOMO")),
-                "LUMO": to_float(row.get("LUMO")),
-                "gap": gap,
-            }
-        )
-    write_output(rows, output_path, extra_columns=["SMILES", "HOMO", "LUMO", "gap"])
-
+    df = canonicalize_columns(df, ["SMILES"])
+    df = numeric_columns(df, ["HOMO", "LUMO", "gap"])
+    write_output(df[["SMILES", "HOMO", "LUMO", "gap"]], output_path)
+"""
 
 def process_qm_elec_hf(raw_dir: Path, output_dir: Path) -> None:
-    """Structure QM_elec_HF.csv as one wide row per molecule while retaining all raw property columns."""
-
     input_path = raw_dir / "QM_elec_HF.csv"
     output_path = output_dir / "simulated_QM_elec_HF_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    raw_property_columns = [col for col in df.columns if col != "SMILES"]
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        smiles = clean_smiles(row.get("SMILES"))
-        gap = to_float(row.get("Gap"))
-        structured_row: dict[str, object] = {
-            "cation": "",
-            "anion": "",
-            "temperature_K": None,
-            "pressure_kPa": None,
-            "frequency_MHz": None,
-            "wavelength_nm": None,
-            "property_name": "HF_Gap",
-            "property_unit": "eV",
-            "property_value": gap,
-            "label": gap,
-            "standard_unit": "eV",
-            "parse_error": "",
-            "note": "",
-            "source_text": row.to_json(force_ascii=False),
-            "SMILES": smiles,
-        }
-        for col in raw_property_columns:
-            structured_row[col] = to_float(row.get(col))
-        rows.append(structured_row)
-    write_output(rows, output_path, extra_columns=["SMILES", *raw_property_columns])
+    df = canonicalize_columns(df, ["SMILES"])
+    numeric = [column for column in df.columns if column != "SMILES"]
+    df = numeric_columns(df, numeric)
+    write_output(df[["SMILES", *numeric]], output_path)
 
 
 def process_combi_qm_solv(raw_dir: Path, output_dir: Path) -> None:
-    """Structure combi_qm_solv.csv."""
-
     input_path = raw_dir / "combi_qm_solv.csv"
     output_path = output_dir / "simulated_combi_qm_solv_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        solvent = clean_smiles(row.get("solvent"))
-        solute = clean_smiles(row.get("solute"))
-        solv = to_float(row.get("solv"))
-        rows.append(
-            {
-                "cation": "",
-                "anion": "",
-                "temperature_K": None,
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "solvation",
-                "property_unit": "",
-                "property_value": solv,
-                "label": solv,
-                "standard_unit": "",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "solvent": solvent,
-                "solute": solute,
-            }
-        )
-    write_output(rows, output_path, extra_columns=["solvent", "solute"])
+    df = canonicalize_columns(df, ["solvent", "solute"])
+    df = numeric_columns(df, ["solv"])
+    write_output(df[["solvent", "solute", "solv"]], output_path)
 
 
 def process_box_mapping_20260514(raw_dir: Path, output_dir: Path) -> None:
-    """Structure box_20260514/mapping.csv and ignore sibling PDB files."""
-
     input_path = raw_dir / "box_20260514" / "mapping.csv"
     output_path = output_dir / "simulated_box_20260514_mapping_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        cation = clean_smiles(row.get("cation_smiles"))
-        anion = clean_smiles(row.get("anion_smiles"))
-        rows.append(
-            {
-                "cation": cation,
-                "anion": anion,
-                "temperature_K": to_float(row.get("temperature")),
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "simulation_box_mapping",
-                "property_unit": "",
-                "property_value": None,
-                "label": None,
-                "standard_unit": "",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "mol_id": row.get("mol_id", ""),
-            }
-        )
-    write_output(rows, output_path, extra_columns=["mol_id"])
+    df = df.rename(columns={"cation_smiles": "cation", "anion_smiles": "anion", "temperature": "temperature_K"})
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature_K"])
+    write_output(df[["mol_id", "cation", "anion", "temperature_K"]], output_path)
 
 
 def process_charge_mapping_20260514(raw_dir: Path, output_dir: Path) -> None:
-    """Structure charge_20260514/mapping.csv and ignore sibling MOL2 files."""
-
     input_path = raw_dir / "charge_20260514" / "mapping.csv"
     output_path = output_dir / "simulated_charge_20260514_mapping_structured.csv"
     print(f"Processing {input_path} -> {output_path}")
     df = pd.read_csv(input_path)
-    rows: list[dict[str, object]] = []
-    for _, row in df.iterrows():
-        smiles = clean_smiles(row.get("smiles"))
-        charge = to_float(row.get("charge"))
-        rows.append(
-            {
-                "cation": "",
-                "anion": "",
-                "temperature_K": None,
-                "pressure_kPa": None,
-                "frequency_MHz": None,
-                "wavelength_nm": None,
-                "property_name": "charge",
-                "property_unit": "",
-                "property_value": charge,
-                "label": charge,
-                "standard_unit": "",
-                "parse_error": "",
-                "note": "",
-                "source_text": row.to_json(force_ascii=False),
-                "mol_id": row.get("mol_id", ""),
-                "SMILES": smiles,
-                "charge": charge,
-            }
-        )
-    write_output(rows, output_path, extra_columns=["mol_id", "SMILES", "charge"])
+    df = df.rename(columns={"smiles": "SMILES"})
+    df = canonicalize_columns(df, ["SMILES"])
+    df = numeric_columns(df, ["charge"])
+    write_output(df[["mol_id", "SMILES", "charge"]], output_path)
 
 
 PROCESSORS: dict[str, Callable[[Path, Path], None]] = {
@@ -464,7 +181,7 @@ PROCESSORS: dict[str, Callable[[Path, Path], None]] = {
     "heat_of_vaporization_260603.csv": process_heat_of_vaporization_260603,
     "PBE_TZVP_anions_260103.csv": process_pbe_tzvp_anions_260103,
     "PBE_TZVP_cations_260103.csv": process_pbe_tzvp_cations_260103,
-    "HL_gap_PBE_TZVP.csv": process_hl_gap_pbe_tzvp,
+    #"HL_gap_PBE_TZVP.csv": process_hl_gap_pbe_tzvp,
     "QM_elec_HF.csv": process_qm_elec_hf,
     "combi_qm_solv.csv": process_combi_qm_solv,
     "box_20260514/mapping.csv": process_box_mapping_20260514,
@@ -473,10 +190,8 @@ PROCESSORS: dict[str, Callable[[Path, Path], None]] = {
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for the simulation-data structuring entrypoint."""
-
     parser = argparse.ArgumentParser(
-        description="Clean and structure raw simulation CSV files into ILThermo-style wide outputs."
+        description="Clean and structure raw simulation CSV files into dataset-native outputs."
     )
     parser.add_argument(
         "--input-dir",
@@ -500,8 +215,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run the fixed set of simulation cleaning jobs for this repository."""
-
     disable_rdkit_logs()
     args = parse_args()
     for name in args.files:
