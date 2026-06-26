@@ -1,4 +1,4 @@
-"""Structure AIonopedia raw CSV files into ILThermo-style wide CSV outputs."""
+"""Structure AIonopedia raw CSV files into compact, dataset-native CSV outputs."""
 
 from __future__ import annotations
 
@@ -19,23 +19,6 @@ if str(SRC_ROOT) not in sys.path:
 from raw_prep import canonicalize_smiles, disable_rdkit_logs, raw_root, structured_root
 
 
-STANDARD_COLUMNS = [
-    "cation",
-    "anion",
-    "temperature_K",
-    "pressure_kPa",
-    "frequency_MHz",
-    "wavelength_nm",
-    "property_name",
-    "property_unit",
-    "property_value",
-    "label",
-    "standard_unit",
-    "parse_error",
-    "note",
-    "source_text",
-]
-
 PROMPT_KEYS = [
     ("cation", r"cation\s*\[START_SMILES\](?P<cation>.*?)\[END_SMILES\]"),
     ("anion", r"anion\s*\[START_SMILES\](?P<anion>.*?)\[END_SMILES\]"),
@@ -46,8 +29,6 @@ PROMPT_KEYS = [
 
 
 def parse_prompt(text: str) -> dict[str, str]:
-    """Extract structured fields from a prompt-style AIonopedia row."""
-
     data = {key: "" for key, _ in PROMPT_KEYS}
     normalized = str(text).replace("\n", " ").replace("\r", " ")
     for key, pattern in PROMPT_KEYS:
@@ -58,8 +39,6 @@ def parse_prompt(text: str) -> dict[str, str]:
 
 
 def canonicalize_fields(row: dict[str, str], invalid_sink: set[str] | None = None) -> dict[str, str]:
-    """Canonicalize every chemical field present in a parsed AIonopedia row."""
-
     for key in ("cation", "anion", "solute", "solvent"):
         if row.get(key):
             row[key] = canonicalize_smiles(row[key], invalid_sink)
@@ -67,8 +46,6 @@ def canonicalize_fields(row: dict[str, str], invalid_sink: set[str] | None = Non
 
 
 def to_float(value: object) -> float | None:
-    """Convert a value to float, returning None when conversion is impossible."""
-
     text = str(value or "").strip()
     if not text:
         return None
@@ -79,8 +56,6 @@ def to_float(value: object) -> float | None:
 
 
 def prompt_fieldname(fieldnames: list[str] | None) -> str:
-    """Resolve the prompt column name used by one raw AIonopedia CSV."""
-
     fields = set(fieldnames or [])
     if "Prompt" in fields:
         return "Prompt"
@@ -89,232 +64,130 @@ def prompt_fieldname(fieldnames: list[str] | None) -> str:
     raise RuntimeError("missing Prompt/prompt column")
 
 
-def build_wide_row(
-    *,
-    parsed: dict[str, str],
-    label: object,
-    property_name: str,
-    property_unit: str,
-    standard_unit: str,
-    source_text: str,
-    extra: dict[str, object] | None = None,
-) -> dict[str, object]:
-    """Build one ILThermo-style wide row."""
-
-    label_value = to_float(label)
-    row: dict[str, object] = {
-        "cation": parsed.get("cation", ""),
-        "anion": parsed.get("anion", ""),
-        "temperature_K": to_float(parsed.get("temperature")),
-        "pressure_kPa": None,
-        "frequency_MHz": None,
-        "wavelength_nm": None,
-        "property_name": property_name,
-        "property_unit": property_unit,
-        "property_value": label_value,
-        "label": label_value,
-        "standard_unit": standard_unit,
-        "parse_error": "",
-        "note": "",
-        "source_text": source_text,
-    }
-    if extra:
-        row.update(extra)
-    return row
-
-
-def write_output(rows: list[dict[str, object]], output_path: Path, extra_columns: list[str] | None = None) -> None:
-    """Write a structured CSV with standard columns first and source-specific columns after."""
-
+def write_output(rows: list[dict[str, object]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    columns = STANDARD_COLUMNS + list(extra_columns or [])
-    pd.DataFrame(rows, columns=columns).drop_duplicates().to_csv(output_path, index=False)
+    pd.DataFrame(rows).to_csv(output_path, index=False)
     print(f"  Saved to {output_path}")
 
 
-def process_density_all(raw_dir: Path, output_dir: Path, invalid_smiles: set[str]) -> None:
-    """Structure density_all.csv."""
-
-    input_path = raw_dir / "density_all.csv"
-    output_path = output_dir / "AIonopedia_density_constructed.csv"
+def process_prompt_file(
+    raw_dir: Path,
+    output_dir: Path,
+    invalid_smiles: set[str],
+    *,
+    input_name: str,
+    output_name: str,
+    value_column: str,
+    kind: str = "il",
+) -> None:
+    input_path = raw_dir / input_name
+    output_path = output_dir / output_name
     print(f"Processing {input_path} -> {output_path}")
     rows: list[dict[str, object]] = []
     with input_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         prompt_col = prompt_fieldname(reader.fieldnames)
         for csv_row in reader:
-            prompt = csv_row.get(prompt_col, "")
-            parsed = canonicalize_fields(parse_prompt(prompt), invalid_smiles)
-            rows.append(
-                build_wide_row(
-                    parsed=parsed,
-                    label=csv_row.get("label", ""),
-                    property_name="Specific density",
-                    property_unit="g/cm^3",
-                    standard_unit="g/cm^3",
-                    source_text=prompt,
+            parsed = canonicalize_fields(parse_prompt(csv_row.get(prompt_col, "")), invalid_smiles)
+            value = to_float(csv_row.get("label", ""))
+            if kind == "solvation":
+                rows.append(
+                    {
+                        "solute": parsed.get("solute", ""),
+                        "solvent": parsed.get("solvent", ""),
+                        value_column: value,
+                    }
                 )
-            )
+            else:
+                rows.append(
+                    {
+                        "cation": parsed.get("cation", ""),
+                        "anion": parsed.get("anion", ""),
+                        "temperature_K": to_float(parsed.get("temperature")),
+                        value_column: value,
+                    }
+                )
     write_output(rows, output_path)
+
+
+def process_density_all(raw_dir: Path, output_dir: Path, invalid_smiles: set[str]) -> None:
+    process_prompt_file(
+        raw_dir,
+        output_dir,
+        invalid_smiles,
+        input_name="density_all.csv",
+        output_name="AIonopedia_density_constructed.csv",
+        value_column="density",
+    )
 
 
 def process_melt_all(raw_dir: Path, output_dir: Path, invalid_smiles: set[str]) -> None:
-    """Structure melt_all.csv."""
-
-    input_path = raw_dir / "melt_all.csv"
-    output_path = output_dir / "AIonopedia_melt_constructed.csv"
-    print(f"Processing {input_path} -> {output_path}")
-    rows: list[dict[str, object]] = []
-    with input_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        prompt_col = prompt_fieldname(reader.fieldnames)
-        for csv_row in reader:
-            prompt = csv_row.get(prompt_col, "")
-            parsed = canonicalize_fields(parse_prompt(prompt), invalid_smiles)
-            rows.append(
-                build_wide_row(
-                    parsed=parsed,
-                    label=csv_row.get("label", ""),
-                    property_name="Normal melting temperature",
-                    property_unit="K",
-                    standard_unit="K",
-                    source_text=prompt,
-                )
-            )
-    write_output(rows, output_path)
+    process_prompt_file(
+        raw_dir,
+        output_dir,
+        invalid_smiles,
+        input_name="melt_all.csv",
+        output_name="AIonopedia_melt_constructed.csv",
+        value_column="melt",
+    )
 
 
 def process_tension_all(raw_dir: Path, output_dir: Path, invalid_smiles: set[str]) -> None:
-    """Structure tension_all.csv."""
-
-    input_path = raw_dir / "tension_all.csv"
-    output_path = output_dir / "AIonopedia_tension_constructed.csv"
-    print(f"Processing {input_path} -> {output_path}")
-    rows: list[dict[str, object]] = []
-    with input_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        prompt_col = prompt_fieldname(reader.fieldnames)
-        for csv_row in reader:
-            prompt = csv_row.get(prompt_col, "")
-            parsed = canonicalize_fields(parse_prompt(prompt), invalid_smiles)
-            rows.append(
-                build_wide_row(
-                    parsed=parsed,
-                    label=csv_row.get("label", ""),
-                    property_name="Surface tension liquid-gas",
-                    property_unit="mN/m",
-                    standard_unit="mN/m",
-                    source_text=prompt,
-                )
-            )
-    write_output(rows, output_path)
+    process_prompt_file(
+        raw_dir,
+        output_dir,
+        invalid_smiles,
+        input_name="tension_all.csv",
+        output_name="AIonopedia_tension_constructed.csv",
+        value_column="tension",
+    )
 
 
 def process_viscosity_all(raw_dir: Path, output_dir: Path, invalid_smiles: set[str]) -> None:
-    """Structure viscosity_all.csv."""
-
-    input_path = raw_dir / "viscosity_all.csv"
-    output_path = output_dir / "AIonopedia_viscosity_constructed.csv"
-    print(f"Processing {input_path} -> {output_path}")
-    rows: list[dict[str, object]] = []
-    with input_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        prompt_col = prompt_fieldname(reader.fieldnames)
-        for csv_row in reader:
-            prompt = csv_row.get(prompt_col, "")
-            parsed = canonicalize_fields(parse_prompt(prompt), invalid_smiles)
-            rows.append(
-                build_wide_row(
-                    parsed=parsed,
-                    label=csv_row.get("label", ""),
-                    property_name="Viscosity",
-                    property_unit="mPa*s (log scale)",
-                    standard_unit="mPa*s (log scale)",
-                    source_text=prompt,
-                )
-            )
-    write_output(rows, output_path)
+    process_prompt_file(
+        raw_dir,
+        output_dir,
+        invalid_smiles,
+        input_name="viscosity_all.csv",
+        output_name="AIonopedia_viscosity_constructed.csv",
+        value_column="viscosity",
+    )
 
 
 def process_solvation_all(raw_dir: Path, output_dir: Path, invalid_smiles: set[str]) -> None:
-    """Structure solvation_all.csv."""
-
-    input_path = raw_dir / "solvation_all.csv"
-    output_path = output_dir / "AIonopedia_solvation_constructed.csv"
-    print(f"Processing {input_path} -> {output_path}")
-    rows: list[dict[str, object]] = []
-    with input_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        prompt_col = prompt_fieldname(reader.fieldnames)
-        for csv_row in reader:
-            prompt = csv_row.get(prompt_col, "")
-            parsed = canonicalize_fields(parse_prompt(prompt), invalid_smiles)
-            rows.append(
-                build_wide_row(
-                    parsed=parsed,
-                    label=csv_row.get("label", ""),
-                    property_name="solvation",
-                    property_unit="",
-                    standard_unit="",
-                    source_text=prompt,
-                    extra={"solute": parsed.get("solute", ""), "solvent": parsed.get("solvent", "")},
-                )
-            )
-    write_output(rows, output_path, extra_columns=["solute", "solvent"])
+    process_prompt_file(
+        raw_dir,
+        output_dir,
+        invalid_smiles,
+        input_name="solvation_all.csv",
+        output_name="AIonopedia_solvation_constructed.csv",
+        value_column="solvation",
+        kind="solvation",
+    )
 
 
 def process_transfer_all(raw_dir: Path, output_dir: Path, invalid_smiles: set[str]) -> None:
-    """Structure transfer_all.csv."""
-
-    input_path = raw_dir / "transfer_all.csv"
-    output_path = output_dir / "AIonopedia_transfer_constructed.csv"
-    print(f"Processing {input_path} -> {output_path}")
-    rows: list[dict[str, object]] = []
-    with input_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        prompt_col = prompt_fieldname(reader.fieldnames)
-        for csv_row in reader:
-            prompt = csv_row.get(prompt_col, "")
-            parsed = canonicalize_fields(parse_prompt(prompt), invalid_smiles)
-            rows.append(
-                build_wide_row(
-                    parsed=parsed,
-                    label=csv_row.get("label", ""),
-                    property_name="transfer",
-                    property_unit="",
-                    standard_unit="",
-                    source_text=prompt,
-                    extra={"solute": parsed.get("solute", ""), "solvent": parsed.get("solvent", "")},
-                )
-            )
-    write_output(rows, output_path, extra_columns=["solute", "solvent"])
+    process_prompt_file(
+        raw_dir,
+        output_dir,
+        invalid_smiles,
+        input_name="transfer_all.csv",
+        output_name="AIonopedia_transfer_constructed.csv",
+        value_column="transfer",
+        kind="solvation",
+    )
 
 
 def process_transfer_organic_all(raw_dir: Path, output_dir: Path, invalid_smiles: set[str]) -> None:
-    """Structure transfer_organic_all.csv."""
-
-    input_path = raw_dir / "transfer_organic_all.csv"
-    output_path = output_dir / "AIonopedia_transfer_organic_constructed.csv"
-    print(f"Processing {input_path} -> {output_path}")
-    rows: list[dict[str, object]] = []
-    with input_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        prompt_col = prompt_fieldname(reader.fieldnames)
-        for csv_row in reader:
-            prompt = csv_row.get(prompt_col, "")
-            parsed = canonicalize_fields(parse_prompt(prompt), invalid_smiles)
-            rows.append(
-                build_wide_row(
-                    parsed=parsed,
-                    label=csv_row.get("label", ""),
-                    property_name="transfer_organic",
-                    property_unit="",
-                    standard_unit="",
-                    source_text=prompt,
-                    extra={"solute": parsed.get("solute", ""), "solvent": parsed.get("solvent", "")},
-                )
-            )
-    write_output(rows, output_path, extra_columns=["solute", "solvent"])
+    process_prompt_file(
+        raw_dir,
+        output_dir,
+        invalid_smiles,
+        input_name="transfer_organic_all.csv",
+        output_name="AIonopedia_transfer_organic_constructed.csv",
+        value_column="transfer_organic",
+        kind="solvation",
+    )
 
 
 PROCESSORS: dict[str, Callable[[Path, Path, set[str]], None]] = {
@@ -329,11 +202,7 @@ PROCESSORS: dict[str, Callable[[Path, Path, set[str]], None]] = {
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for the AIonopedia-data structuring entrypoint."""
-
-    parser = argparse.ArgumentParser(
-        description="Clean and structure AIonopedia CSV files into ILThermo-style wide outputs."
-    )
+    parser = argparse.ArgumentParser(description="Clean and structure AIonopedia CSV files into dataset-native outputs.")
     parser.add_argument(
         "--input-dir",
         type=Path,
@@ -362,8 +231,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Process every requested AIonopedia CSV and log invalid SMILES values."""
-
     disable_rdkit_logs()
     args = parse_args()
     invalid_smiles: set[str] = set()
