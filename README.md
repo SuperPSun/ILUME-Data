@@ -10,8 +10,7 @@ The current structuring entrypoint processes these raw directories:
 - `data/raw/ILBERT/`
 - `data/raw/ILThermo/`
 - `data/raw/after_AIonopedia/`
-
-`data/raw/simulation_data/` is not processed by the current structuring workflow.
+- `data/raw/simulation_data/`
 
 ## Usage
 
@@ -30,7 +29,7 @@ python scripts/structure_raw_data.py
 Run selected sources:
 
 ```bash
-python scripts/structure_raw_data.py --sources AIonopedia ILBERT ILThermo after_AIonopedia
+python scripts/structure_raw_data.py --sources AIonopedia ILBERT ILThermo after_AIonopedia simulation
 ```
 
 ## Output Layout
@@ -41,8 +40,9 @@ Structured files are written under:
 - `data/structured/ILBERT/`
 - `data/structured/ILThermo/`
 - `data/structured/after_AIonopedia/`
+- `data/structured/simulation/`
 
-Output columns are ordered as system identifiers first, experimental conditions second, metadata next, and unit-explicit labels last. Column names use underscore unit suffixes, for example `temperature_K`, `pressure_kPa`, and `density_g_cm3`.
+Output columns are ordered as system identifiers first, experimental conditions second, metadata next, and unit-explicit labels last. Condition columns keep stable names such as `temperature_K` and `pressure_kPa`; label columns preserve unit symbols in the unit suffix, for example `density_g/cm^3` and `surface_tension_mN/m`.
 
 ## Legacy Scripts
 
