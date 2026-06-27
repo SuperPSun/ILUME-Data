@@ -325,6 +325,19 @@ def to_kpa(value: float | None, unit: str | None) -> float | None:
     raise ValueError(f"unsupported pressure unit: {unit}")
 
 
+def to_g_cm3(value: float | None, unit: str | None) -> float | None:
+    """Convert density values to grams per cubic centimeter."""
+
+    if value is None or unit is None:
+        return None
+    normalized = normalize_unit(unit)
+    if normalized in {"g/cm^3", "g/ml", "g*cm^-3"}:
+        return value
+    if normalized in {"kg/m^3", "kg*m^-3", "g/l"}:
+        return value / 1000.0
+    raise ValueError(f"unsupported density unit: {unit}")
+
+
 def to_mhz(value: float | None, unit: str | None) -> float | None:
     """Convert a frequency value to megahertz."""
 
