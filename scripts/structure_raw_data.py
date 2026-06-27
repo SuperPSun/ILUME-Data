@@ -42,7 +42,7 @@ PROMPT_PATTERNS = {
 }
 SYSTEM_COLUMNS = ["cation", "anion", "solute", "solvent", "smiles"]
 CONDITION_COLUMNS = ["temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm"]
-META_COLUMNS = ["property_name", "phase", "note", "source_text"]
+META_COLUMNS = ["phase"]
 
 
 def to_float(value: object) -> float | None:
@@ -109,18 +109,18 @@ def parse_aionopedia_prompt(text: str) -> dict[str, object]:
 
 
 AIONOPEDIA_SPECS = {
-    "density": ("density_all.csv", "AIonopedia_density_structured.csv", "density_g_cm3", None),
+    "density": ("density_all.csv", "AIonopedia_density_structured.csv", "density_g/cm^3", None),
     "melt": ("melt_all.csv", "AIonopedia_melt_structured.csv", "melting_point_K", None),
-    "solvation": ("solvation_all.csv", "AIonopedia_solvation_structured.csv", "solvation_unitless", None),
-    "tension": ("tension_all.csv", "AIonopedia_tension_structured.csv", "surface_tension_mN_m", None),
-    "transfer": ("transfer_all.csv", "AIonopedia_transfer_structured.csv", "transfer_unitless", None),
+    "solvation": ("solvation_all.csv", "AIonopedia_solvation_structured.csv", "solvation_kcal/mol", None),
+    "tension": ("tension_all.csv", "AIonopedia_tension_structured.csv", "surface_tension_mN/m", None),
+    "transfer": ("transfer_all.csv", "AIonopedia_transfer_structured.csv", "transfer_kcal/mol", None),
     "transfer_organic": (
         "transfer_organic_all.csv",
         "AIonopedia_transfer_organic_structured.csv",
-        "transfer_organic_unitless",
+        "transfer_organic_kcal/mol",
         None,
     ),
-    "viscosity": ("viscosity_all.csv", "AIonopedia_viscosity_structured.csv", "viscosity_mPa_s_log10", None),
+    "viscosity": ("viscosity_all.csv", "AIonopedia_viscosity_structured.csv", "viscosity_mPa*s_log10", None),
 }
 
 
@@ -133,7 +133,6 @@ def structure_aionopedia_file(input_path: Path, output_path: Path, property_key:
         parsed = parse_aionopedia_prompt(str(csv_row[prompt_column]))
         value = to_float(csv_row.get("label"))
         row = {key: value for key, value in parsed.items() if value not in ("", None)}
-        row["property_name"] = property_key
         row[label_column] = value
         rows.append(row)
     out = ordered_frame(rows, [label_column])
@@ -141,20 +140,20 @@ def structure_aionopedia_file(input_path: Path, output_path: Path, property_key:
 
 
 AFTER_AIONOPEDIA_SPECS = {
-    "density": ("updated_data_density", "after_AIonopedia_density_structured.csv", "density_g_cm3"),
+    "density": ("updated_data_density", "after_AIonopedia_density_structured.csv", "density_g/cm^3"),
     "melting_point": (
         "updated_data_melting_point",
         "after_AIonopedia_melting_point_structured.csv",
         "melting_point_K",
     ),
-    "part": ("updated_data_part", "after_AIonopedia_part_structured.csv", "partition_unitless"),
-    "solv": ("updated_data_solv", "after_AIonopedia_solv_structured.csv", "solvation_unitless"),
+    "part": ("updated_data_part", "after_AIonopedia_part_structured.csv", "partition_log10"),
+    "solv": ("updated_data_solv", "after_AIonopedia_solv_structured.csv", "solvation_kcal/mol"),
     "surface_tension": (
         "updated_data_surface_tension",
         "after_AIonopedia_surface_tension_structured.csv",
-        "surface_tension_mN_m",
+        "surface_tension_mN/m",
     ),
-    "viscosity": ("updated_data_viscosity", "after_AIonopedia_viscosity_structured.csv", "viscosity_mPa_s"),
+    "viscosity": ("updated_data_viscosity", "after_AIonopedia_viscosity_structured.csv", "viscosity_mPa*s"),
 }
 
 
@@ -177,7 +176,6 @@ def structure_after_aionopedia_file(input_path: Path, output_path: Path, propert
         row: dict[str, object] = {
             "cation": clean_smiles(csv_row.get("ion1")),
             "anion": clean_smiles(csv_row.get("ion2")),
-            "property_name": str(csv_row.get("property") or property_key).strip(),
             label_column: value,
         }
         if "T" in df.columns:
@@ -208,7 +206,7 @@ ILBERT_SPECS = {
     "EC.csv": ILBERTSpec(
         "EC.csv",
         "ILBERT_EC_structured.csv",
-        (("Exp(S/m)", "electrical_conductivity_S_m", identity), ("lnEC", "lnEC_unitless", identity)),
+        (("Exp(S/m)", "electrical_conductivity_S/m", identity), ("lnEC", "lnEC_unitless", identity)),
     ),
     "MP.csv": ILBERTSpec("MP.csv", "ILBERT_MP_structured.csv", (("MP_K", "melting_point_K", identity),)),
     "Norm_C.csv": ILBERTSpec(
@@ -239,23 +237,23 @@ ILBERT_SPECS = {
     "Norm_surface.csv": ILBERTSpec(
         "Norm_surface.csv",
         "ILBERT_surface_tension_structured.csv",
-        (("s_mNm", "surface_tension_mN_m", identity),),
+        (("s_mNm", "surface_tension_mN/m", identity),),
     ),
     "RR.csv": ILBERTSpec("RR.csv", "ILBERT_refractive_index_structured.csv", (("R", "refractive_index_unitless", identity),)),
     "TC_Norm.csv": ILBERTSpec(
         "TC_Norm.csv",
         "ILBERT_thermal_conductivity_structured.csv",
-        (("TC/W m-1 K-1", "thermal_conductivity_W_m_K", identity),),
+        (("TC/W m-1 K-1", "thermal_conductivity_W/m/K", identity),),
     ),
     "density_P.csv": ILBERTSpec(
         "density_P.csv",
         "ILBERT_density_structured.csv",
-        (("d_kg m-3", "density_g_cm3", kg_m3_to_g_cm3),),
+        (("d_kg m-3", "density_g/cm^3", kg_m3_to_g_cm3),),
     ),
     "viscosity_P.csv": ILBERTSpec(
         "viscosity_P.csv",
         "ILBERT_viscosity_structured.csv",
-        (("n_mPas(o)", "viscosity_mPa_s", identity), ("ln(n_mPas)", "ln_viscosity_mPa_s_unitless", identity)),
+        (("n_mPas(o)", "viscosity_mPa*s", identity), ("ln(n_mPas)", "ln_viscosity_mPa*s_unitless", identity)),
     ),
 }
 
@@ -280,7 +278,7 @@ def structure_ilbert_file(input_path: Path, output_path: Path, input_name: str) 
     label_columns = [target for _source, target, _convert in spec.labels]
     for _, csv_row in df.iterrows():
         cation, anion = extract_ilbert_ions(csv_row, invalid_smiles)
-        row: dict[str, object] = {"cation": cation, "anion": anion, "property_name": Path(input_name).stem}
+        row: dict[str, object] = {"cation": cation, "anion": anion}
         if "T/K" in df.columns:
             row["temperature_K"] = to_float(csv_row.get("T/K"))
         if "P/bar" in df.columns:
@@ -329,7 +327,7 @@ ILTHERMO_SPECS = {
         "density",
         "ilt_density_data.txt",
         "ilt_density_structured.csv",
-        "density_g_cm3",
+        "density_g/cm^3",
         r"(?:Specific density|Mass density|Density)",
         "g/cm^3",
         density_transform,
@@ -338,7 +336,7 @@ ILTHERMO_SPECS = {
         "electrical_conductivity",
         "ilt_electrical_conductivity_data.txt",
         "ilt_electrical_conductivity_structured.csv",
-        "electrical_conductivity_S_m_log10",
+        "electrical_conductivity_S/m_log10",
         r"Electrical conductivity",
         "S/m",
         lambda value, unit: maybe_log10(by_unit({"s/m": 1.0, "ms/cm": 0.1})(value, unit)),
@@ -347,7 +345,7 @@ ILTHERMO_SPECS = {
         "enthalpy",
         "pure_compound_enthalpy.csv",
         "ilt_enthalpy_structured.csv",
-        "enthalpy_kJ_mol",
+        "enthalpy_kJ/mol",
         r"Enthalpy(?:<SUP>\*</SUP>)?",
         "kJ/mol",
         by_unit({"kj/mol": 1.0, "j/mol": 0.001}),
@@ -357,7 +355,7 @@ ILTHERMO_SPECS = {
         "enthalpy_of_transition_or_fusion",
         "pure_compound_enthalpy_of_transition_or_fusion.csv",
         "ilt_enthalpy_of_transition_or_fusion_structured.csv",
-        "enthalpy_of_transition_or_fusion_kJ_mol",
+        "enthalpy_of_transition_or_fusion_kJ/mol",
         r"Enthalpy of transition or fusion",
         "kJ/mol",
         by_unit({"kj/mol": 1.0, "j/mol": 0.001}),
@@ -367,7 +365,7 @@ ILTHERMO_SPECS = {
         "enthalpy_of_vaporization_or_sublimation",
         "pure_compound_enthalpy_of_vaporization_or_sublimation.csv",
         "ilt_enthalpy_of_vaporization_or_sublimation_structured.csv",
-        "enthalpy_of_vaporization_or_sublimation_kJ_mol",
+        "enthalpy_of_vaporization_or_sublimation_kJ/mol",
         r"Enthalpy of vaporization or sublimation",
         "kJ/mol",
         by_unit({"kj/mol": 1.0, "j/mol": 0.001}),
@@ -377,7 +375,7 @@ ILTHERMO_SPECS = {
         "entropy",
         "pure_compound_entropy.csv",
         "ilt_entropy_structured.csv",
-        "entropy_J_mol_K",
+        "entropy_J/mol/K",
         r"Entropy(?:<SUP>\*</SUP>)?",
         "J/mol/K",
         by_unit({"j/k/mol": 1.0, "j/mol/k": 1.0, "kj/k/mol": 1000.0}),
@@ -405,7 +403,7 @@ ILTHERMO_SPECS = {
         "heat_capacity_at_constant_pressure",
         "ilt_heat_capacity_at_constant_pressure_data.txt",
         "ilt_heat_capacity_at_constant_pressure_structured.csv",
-        "heat_capacity_J_mol_K",
+        "heat_capacity_J/mol/K",
         r"Heat capacity at constant pressure",
         "J/mol/K",
         by_unit({"j/k/mol": 1.0, "j/mol/k": 1.0, "kj/k/mol": 1000.0}),
@@ -414,7 +412,7 @@ ILTHERMO_SPECS = {
         "heat_capacity_at_vapor_saturation_pressure",
         "ilt_heat_capacity_at_vapor_saturation_pressure_data.txt",
         "ilt_heat_capacity_at_vapor_saturation_pressure_structured.csv",
-        "heat_capacity_at_vapor_saturation_pressure_J_mol_K",
+        "heat_capacity_at_vapor_saturation_pressure_J/mol/K",
         r"Heat capacity at vapor saturation pressure",
         "J/mol/K",
         by_unit({"j/k/mol": 1.0, "j/mol/k": 1.0, "kj/k/mol": 1000.0}),
@@ -423,7 +421,7 @@ ILTHERMO_SPECS = {
         "isobaric_coefficient_of_volume_expansion",
         "ilt_isobaric_coefficient_of_volume_expansion_data.txt",
         "ilt_isobaric_coefficient_of_volume_expansion_structured.csv",
-        "isobaric_coefficient_of_volume_expansion_K_1",
+        "isobaric_coefficient_of_volume_expansion_K^-1",
         r"Isobaric coefficient of volume expansion",
         "K^-1",
         by_unit({"k^-1": 1.0, "1/k": 1.0}),
@@ -459,7 +457,7 @@ ILTHERMO_SPECS = {
         "self_diffusion_coefficient",
         "ilt_self_diffusion_coefficient_data.txt",
         "ilt_self_diffusion_coefficient_structured.csv",
-        "self_diffusion_coefficient_10_9_m2_s",
+        "self_diffusion_coefficient_10^-9*m^2/s",
         r"Self diffusion coefficient",
         "10^-9*m^2/s",
         by_unit({"10^-9*m^2/s": 1.0, "m^2/s": 1e9}),
@@ -468,7 +466,7 @@ ILTHERMO_SPECS = {
         "speed_of_sound",
         "ilt_speed_of_sound_data.txt",
         "ilt_speed_of_sound_structured.csv",
-        "speed_of_sound_m_s",
+        "speed_of_sound_m/s",
         r"Speed of sound",
         "m/s",
         by_unit({"m/s": 1.0}),
@@ -477,7 +475,7 @@ ILTHERMO_SPECS = {
         "surface_tension_liquid_gas",
         "ilt_surface_tension_liquid-gas_data.txt",
         "ilt_surface_tension_liquid_gas_structured.csv",
-        "surface_tension_mN_m",
+        "surface_tension_mN/m",
         r"Surface tension liquid-gas",
         "mN/m",
         by_unit({"n/m": 1000.0, "mn/m": 1.0}),
@@ -486,7 +484,7 @@ ILTHERMO_SPECS = {
         "thermal_conductivity",
         "ilt_thermal_conductivity_data.txt",
         "ilt_thermal_conductivity_structured.csv",
-        "thermal_conductivity_W_m_K",
+        "thermal_conductivity_W/m/K",
         r"Thermal conductivity",
         "W/m/K",
         by_unit({"w/m/k": 1.0, "w/(m*k)": 1.0}),
@@ -495,7 +493,7 @@ ILTHERMO_SPECS = {
         "thermal_diffusivity",
         "ilt_thermal_diffusivity_data.txt",
         "ilt_thermal_diffusivity_structured.csv",
-        "thermal_diffusivity_m2_s",
+        "thermal_diffusivity_m^2/s",
         r"Thermal diffusivity",
         "m^2/s",
         by_unit({"m^2/s": 1.0}),
@@ -504,7 +502,7 @@ ILTHERMO_SPECS = {
         "viscosity",
         "ilt_viscosity_data.txt",
         "ilt_viscosity_structured.csv",
-        "viscosity_mPa_s_log10",
+        "viscosity_mPa*s_log10",
         r"(?:Dynamic viscosity|Kinematic viscosity|Viscosity)",
         "mPa*s",
         lambda value, unit: maybe_log10(by_unit({"pa*s": 1000.0, "mpa*s": 1.0, "m^2/s": 1.0})(value, unit)),
@@ -544,7 +542,7 @@ def parse_phase(text: str) -> str:
 
 
 def parse_ilthermo_text_line(line: str, spec: ILThermoSpec, invalid_smiles: set[str]) -> dict[str, object]:
-    row: dict[str, object] = {"source_text": line, "property_name": "", "phase": parse_phase(line), "note": ""}
+    row: dict[str, object] = {"phase": parse_phase(line)}
     smiles_match = SMILES_RE.search(line)
     if smiles_match:
         cation, anion = split_ion_pair(smiles_match.group(1), invalid_smiles)
@@ -556,26 +554,15 @@ def parse_ilthermo_text_line(line: str, spec: ILThermoSpec, invalid_smiles: set[
             row[output_name] = converter(float(match.group(2)), match.group(1).strip())
     prop_re = re.compile(r"({})(?:,\s*([^:]+?))?\s*(?:=>\s*([^:]+?))?\s*:\s*({})".format(spec.property_pattern, NUM_PAT), re.I)
     for match in prop_re.finditer(line):
-        property_name = match.group(1).strip()
-        if property_name.lower().startswith("error of"):
+        matched_property = match.group(1).strip()
+        if matched_property.lower().startswith("error of"):
             continue
         unit = match.group(2).strip() if match.group(2) else spec.unit
-        row["property_name"] = property_name
         if match.group(3):
             row["phase"] = match.group(3).strip()
         row[spec.label_column] = spec.transform(float(match.group(4)), unit)
         break
     return row
-
-
-def build_note(row: dict[str, str]) -> str:
-    note = str(row.get("note_text") or row.get("standard_state_note") or "").strip()
-    phase = str(row.get("phase") or "").strip()
-    if phase and note:
-        return f"Phase: {phase} | {note}"
-    if note:
-        return note
-    return ""
 
 
 def structure_ilthermo_csv(input_path: Path, output_path: Path, spec: ILThermoSpec) -> pd.DataFrame:
@@ -593,18 +580,7 @@ def structure_ilthermo_csv(input_path: Path, output_path: Path, spec: ILThermoSp
                 "pressure_kPa": to_kpa(to_float(csv_row.get("pressure_value")), csv_row.get("pressure_unit")),
                 "frequency_MHz": to_mhz(to_float(csv_row.get("frequency_value")), csv_row.get("frequency_unit")),
                 "wavelength_nm": to_nm(to_float(csv_row.get("wavelength_value")), csv_row.get("wavelength_unit")),
-                "property_name": str(csv_row.get("property_name") or spec.slug).strip(),
                 "phase": str(csv_row.get("phase") or "").strip(),
-                "note": build_note(csv_row),
-                "source_text": " | ".join(
-                    part
-                    for part in [
-                        f"record_id={csv_row.get('record_id', '')}",
-                        f"set_id={csv_row.get('set_id', '')}",
-                        f"component_name={csv_row.get('component_name', '')}",
-                    ]
-                    if not part.endswith("=")
-                ),
                 spec.label_column: value,
             }
             rows.append(row)
@@ -649,11 +625,191 @@ def structure_ilthermo(input_dir: Path, output_dir: Path) -> None:
         structure_ilthermo_file(input_dir / spec.input_name, output_dir / spec.output_name, slug)
 
 
+def canonicalize_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for column in columns:
+        if column in df.columns:
+            df[column] = df[column].map(clean_smiles)
+    return df
+
+
+def numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for column in columns:
+        if column in df.columns:
+            df[column] = df[column].map(to_float)
+    return df
+
+
+def remove_if_exists(path: Path) -> None:
+    if path.exists():
+        path.unlink()
+
+
+def structure_simulation_density(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "density_260501.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature", "density", "density_err"])
+    df = df.rename(columns={"temperature": "temperature_K"})
+    return write_frame(df[["cation", "anion", "temperature_K", "density", "density_err"]], output_dir / "simulated_density_structured.csv")
+
+
+def structure_simulation_heat_capacity(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "heat_capacity_260501.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature", "Cp", "Cp_err"])
+    df = df.rename(columns={"temperature": "temperature_K"})
+    return write_frame(
+        df[["cation", "anion", "temperature_K", "Cp", "Cp_err"]],
+        output_dir / "simulated_heat_capacity_structured.csv",
+    )
+
+
+def structure_simulation_thermal_expansion(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "thermal_expansion_260501.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature", "alpha", "alpha_err"])
+    df = df.rename(columns={"temperature": "temperature_K"})
+    return write_frame(
+        df[["cation", "anion", "temperature_K", "alpha", "alpha_err"]],
+        output_dir / "simulated_thermal_expansion_structured.csv",
+    )
+
+
+def structure_simulation_heat_of_vaporization(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "heat_of_vaporization_260603.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature", "Hvap", "Hvap_err"])
+    df = df.rename(columns={"temperature": "temperature_K"})
+    return write_frame(
+        df[["cation", "anion", "temperature_K", "Hvap", "Hvap_err"]],
+        output_dir / "simulated_heat_of_vaporization_structured.csv",
+    )
+
+
+def structure_simulation_pbe_tzvp_anions(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "PBE_TZVP_anions_260103.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = canonicalize_columns(df, ["SMILES"])
+    df = numeric_columns(df, ["HOMO", "LUMO", "gap"])
+    df["anion"] = df["SMILES"]
+    remove_if_exists(output_dir / "simulated_PBE_TZVP_anions_structured.csv")
+    return write_frame(
+        df[["anion", "HOMO", "LUMO", "gap"]],
+        output_dir / "simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv",
+    )
+
+
+def structure_simulation_pbe_tzvp_cations(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "PBE_TZVP_cations_260103.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = canonicalize_columns(df, ["SMILES"])
+    df = numeric_columns(df, ["HOMO", "LUMO", "gap"])
+    df["cation"] = df["SMILES"]
+    remove_if_exists(output_dir / "simulated_PBE_TZVP_cations_structured.csv")
+    return write_frame(
+        df[["cation", "HOMO", "LUMO", "gap"]],
+        output_dir / "simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv",
+    )
+
+
+def structure_simulation_qm_elec_hf(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "QM_elec_HF.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = canonicalize_columns(df, ["SMILES"])
+    numeric = [column for column in df.columns if column != "SMILES"]
+    df = numeric_columns(df, numeric)
+    return write_frame(df[["SMILES", *numeric]], output_dir / "simulated_QM_elec_HF_structured.csv")
+
+
+def structure_simulation_combi_qm_solv(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "combi_qm_solv.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = canonicalize_columns(df, ["solvent", "solute"])
+    df = numeric_columns(df, ["solv"])
+    return write_frame(df[["solvent", "solute", "solv"]], output_dir / "simulated_combi_qm_solv_structured.csv")
+
+
+def structure_simulation_box_mapping(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "box_20260514" / "mapping.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = df.rename(columns={"cation_smiles": "cation", "anion_smiles": "anion", "temperature": "temperature_K"})
+    df = canonicalize_columns(df, ["cation", "anion"])
+    df = numeric_columns(df, ["temperature_K"])
+    return write_frame(
+        df[["mol_id", "cation", "anion", "temperature_K"]],
+        output_dir / "simulated_box_20260514_mapping_structured.csv",
+    )
+
+
+def structure_simulation_charge_mapping(input_dir: Path, output_dir: Path) -> pd.DataFrame | None:
+    input_path = input_dir / "charge_20260514" / "mapping.csv"
+    if not input_path.exists():
+        return None
+    df = pd.read_csv(input_path)
+    df = df.rename(columns={"smiles": "SMILES"})
+    df = canonicalize_columns(df, ["SMILES"])
+    df = numeric_columns(df, ["charge"])
+    return write_frame(
+        df[["mol_id", "SMILES", "charge"]],
+        output_dir / "simulated_charge_20260514_mapping_structured.csv",
+    )
+
+
+SIMULATION_PROCESSORS: tuple[Callable[[Path, Path], pd.DataFrame | None], ...] = (
+    structure_simulation_density,
+    structure_simulation_heat_capacity,
+    structure_simulation_thermal_expansion,
+    structure_simulation_heat_of_vaporization,
+    structure_simulation_pbe_tzvp_anions,
+    structure_simulation_pbe_tzvp_cations,
+    structure_simulation_qm_elec_hf,
+    structure_simulation_combi_qm_solv,
+    structure_simulation_box_mapping,
+    structure_simulation_charge_mapping,
+)
+
+
+def structure_simulation(input_dir: Path, output_dir: Path) -> None:
+    for processor in SIMULATION_PROCESSORS:
+        processor(input_dir, output_dir)
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    raw_subdir: str
+    output_subdir: str
+    runner: Callable[[Path, Path], None]
+
+
 SOURCE_RUNNERS = {
-    "AIonopedia": structure_aionopedia,
-    "ILBERT": structure_ilbert,
-    "ILThermo": structure_ilthermo,
-    "after_AIonopedia": structure_after_aionopedia,
+    "AIonopedia": SourceSpec("AIonopedia", "AIonopedia", structure_aionopedia),
+    "ILBERT": SourceSpec("ILBERT", "ILBERT", structure_ilbert),
+    "ILThermo": SourceSpec("ILThermo", "ILThermo", structure_ilthermo),
+    "after_AIonopedia": SourceSpec("after_AIonopedia", "after_AIonopedia", structure_after_aionopedia),
+    "simulation": SourceSpec("simulation_data", "simulation", structure_simulation),
 }
 
 
@@ -676,7 +832,8 @@ def main() -> None:
     args = parse_args()
     for source in args.sources:
         print(f"processing={source}")
-        SOURCE_RUNNERS[source](args.raw_root / source, args.output_root / source)
+        spec = SOURCE_RUNNERS[source]
+        spec.runner(args.raw_root / spec.raw_subdir, args.output_root / spec.output_subdir)
 
 
 if __name__ == "__main__":
