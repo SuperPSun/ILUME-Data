@@ -34,10 +34,11 @@ def test_experiment_sources_merge_by_property_and_aggregate_identical_records(tm
     results = merge_final_data(input_root, output_root)
 
     out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
-    assert len(out) == 3
-    aggregated = out[out["source_record_count"] == 2].iloc[0]
-    assert aggregated["source_list"] == "AIonopedia; ILBERT"
-    assert aggregated["source_file_list"] == "AIonopedia_density_structured.csv; ILBERT_density_structured.csv"
+    assert len(out) == 2
+    assert list(out.columns) == ["cation", "anion", "temperature_K", "phase", "density_g/cm^3", "source_list"]
+    aggregated = out[out["density_g/cm^3"] == 1.2].iloc[0]
+    assert aggregated["phase"] == "Liquid"
+    assert aggregated["source_list"] == "AIonopedia; ILBERT; ILThermo"
     assert set(out["density_g/cm^3"]) == {1.2, 1.3}
     assert not (output_root / "AIonopedia").exists()
     assert not (output_root / "ILBERT").exists()
@@ -92,35 +93,39 @@ def test_multi_label_simulation_file_is_split_and_error_labels_are_dropped(tmp_p
     assert (output_root / "simulation" / "gap_ev.csv").exists()
     heat_capacity = pd.read_csv(output_root / "simulation" / "heat_capacity_j_per_mol_per_k.csv")
     assert list(heat_capacity.columns) == [
-        "source_list",
-        "source_file_list",
-        "source_record_count",
         "cation",
         "anion",
         "temperature_K",
         "heat_capacity_J/mol/K",
+        "source_list",
     ]
     assert not (output_root / "simulation" / "heat_capacity_err_j_per_mol_per_k.csv").exists()
 
 
-def test_property_split_drops_rows_missing_that_property(tmp_path: Path):
+def test_qm_elec_hf_file_outputs_one_wide_table_instead_of_split_labels(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "final"
     write_csv(
         input_root / "simulation" / "simulated_QM_elec_HF_structured.csv",
         [
-            {"SMILES": "CCO", "ESP_max": 1.0, "ESP_min": -1.0},
-            {"SMILES": "CCN", "ESP_max": None, "ESP_min": -2.0},
+            {"SMILES": "CCO", "ESP_max": 1.0, "ESP_min": -1.0, "gap_eV": 2.0},
+            {"SMILES": "CCN", "ESP_max": None, "ESP_min": -2.0, "gap_eV": 3.0},
         ],
     )
 
     merge_final_data(input_root, output_root)
 
-    esp_max = pd.read_csv(output_root / "simulation" / "esp_max.csv")
-    esp_min = pd.read_csv(output_root / "simulation" / "esp_min.csv")
-    assert len(esp_max) == 1
-    assert len(esp_min) == 2
-    assert not esp_max["ESP_max"].isna().any()
+    wide = pd.read_csv(output_root / "simulation" / "simulated_qm_elec_hf.csv")
+    assert list(wide.columns) == ["SMILES", "ESP_max", "ESP_min", "gap_eV", "source_list"]
+    assert len(wide) == 2
+    assert wide["ESP_max"].isna().sum() == 1
+    assert not (output_root / "simulation" / "esp_max.csv").exists()
+    assert not (output_root / "simulation" / "esp_min.csv").exists()
+    assert not (output_root / "simulation" / "gap_ev.csv").exists()
+
+    manifest = pd.read_csv(output_root / "final_manifest.csv")
+    assert manifest.iloc[0]["property_label"] == "simulated_QM_elec_HF"
+    assert manifest.iloc[0]["output_file"] == "simulation/simulated_qm_elec_hf.csv"
 
 
 def test_same_key_different_label_values_remain_separate_rows(tmp_path: Path):
@@ -135,7 +140,89 @@ def test_same_key_different_label_values_remain_separate_rows(tmp_path: Path):
     out = pd.read_csv(output_root / "experiment" / "viscosity_mpa_s_log10.csv")
     assert len(out) == 2
     assert set(out["viscosity_mPa*s_log10"]) == {1.0, 2.0}
-    assert set(out["source_record_count"]) == {1}
+    assert set(out["source_list"]) == {"AIonopedia", "ILBERT"}
+
+
+def test_condition_subset_row_collapses_into_more_complete_record(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "final"
+    partial = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+        "density_g/cm^3": 1.2,
+    }
+    complete = {**partial, "pressure_kPa": 100.0}
+    write_csv(input_root / "AIonopedia" / "AIonopedia_density_structured.csv", [partial])
+    write_csv(input_root / "ILBERT" / "ILBERT_density_structured.csv", [complete])
+
+    merge_final_data(input_root, output_root)
+
+    out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
+    assert len(out) == 1
+    assert out.iloc[0]["pressure_kPa"] == 100.0
+    assert out.iloc[0]["source_list"] == "AIonopedia; ILBERT"
+
+
+def test_condition_subset_does_not_collapse_different_label_values(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "final"
+    base = {"cation": "CC[n+]1ccn(C)c1", "anion": "F[B-](F)(F)F", "temperature_K": 298.15}
+    write_csv(input_root / "AIonopedia" / "AIonopedia_density_structured.csv", [{**base, "density_g/cm^3": 1.2}])
+    write_csv(
+        input_root / "ILBERT" / "ILBERT_density_structured.csv",
+        [{**base, "pressure_kPa": 100.0, "density_g/cm^3": 1.3}],
+    )
+
+    merge_final_data(input_root, output_root)
+
+    out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
+    assert len(out) == 2
+    assert set(out["density_g/cm^3"]) == {1.2, 1.3}
+
+
+def test_ambiguous_condition_subset_candidates_are_preserved(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "final"
+    partial = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+        "density_g/cm^3": 1.2,
+    }
+    write_csv(input_root / "AIonopedia" / "AIonopedia_density_structured.csv", [partial])
+    write_csv(
+        input_root / "ILBERT" / "ILBERT_density_structured.csv",
+        [
+            {**partial, "pressure_kPa": 100.0},
+            {**partial, "pressure_kPa": 200.0},
+        ],
+    )
+
+    merge_final_data(input_root, output_root)
+
+    out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
+    assert len(out) == 3
+    assert out["pressure_kPa"].isna().sum() == 1
+
+
+def test_complementary_condition_rows_are_preserved(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "final"
+    base = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+        "density_g/cm^3": 1.2,
+    }
+    write_csv(input_root / "AIonopedia" / "AIonopedia_density_structured.csv", [{**base, "phase": "Liquid"}])
+    write_csv(input_root / "ILBERT" / "ILBERT_density_structured.csv", [{**base, "pressure_kPa": 100.0}])
+
+    merge_final_data(input_root, output_root)
+
+    out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
+    assert len(out) == 2
+    assert set(out["source_list"]) == {"AIonopedia", "ILBERT"}
 
 
 def test_manifest_records_output_files_and_counts(tmp_path: Path):
