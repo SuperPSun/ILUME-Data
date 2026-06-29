@@ -24,7 +24,6 @@ SMILES_COLUMNS = ("cation", "anion", "solute", "solvent", "smiles", "SMILES")
 CONDITION_COLUMNS = ("temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
 NON_LABEL_COLUMNS = {*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS}
 FRACTION_COLUMNS = {"ESP_pos_frac", "ESP_neg_frac", "q_pos_frac"}
-IQR_MIN_ROWS = 20
 
 HARD_THRESHOLDS: dict[str, tuple[float, float]] = {
     "density_g/cm^3": (0.5, 3.0),
@@ -36,14 +35,9 @@ HARD_THRESHOLDS: dict[str, tuple[float, float]] = {
     "transfer_kcal/mol": (-50, 50),
     "transfer_organic_kcal/mol": (-50, 50),
     "partition_log10": (-10, 15),
-    "electrical_conductivity_S/m": (0, 20),
-    "lnEC_unitless": (-12, 5),
+    "electrical_conductivity_S/m_log10": (-6, 3),
     "x_CO2_unitless": (0, 1),
-    "ln_x_CO2_unitless": (-20, 0),
-    "hc_unitless": (0, 5000),
-    "lnhc_unitless": (0, 10),
-    "EC50_unitless": (0, 1_000_000),
-    "logEC50_unitless": (-5, 8),
+    "pEC50": (-8, 5),
     "glass_transition_temperature_K": (100, 600),
     "refractive_index_unitless": (1, 2),
     "thermal_conductivity_W/m/K": (0, 1),
@@ -59,18 +53,6 @@ HARD_THRESHOLDS: dict[str, tuple[float, float]] = {
     "gap_eV": (0, 20),
     "charge": (-20, 20),
     "solv": (-100, 100),
-}
-IQR_ELIGIBLE_COLUMNS = {
-    column
-    for column in HARD_THRESHOLDS
-    if column
-    not in {
-        "charge",
-        "density_err_g/cm^3",
-        "heat_capacity_err_J/mol/K",
-        "heat_of_vaporization_err_kJ/mol",
-        "thermal_expansion_err_K^-1",
-    }
 }
 
 OUTPUT_ORDER = (
@@ -98,7 +80,6 @@ class CleanResult:
     rejected_rows: int
     rejection_counts: dict[str, int] = field(default_factory=dict)
     unit_conversions: list[str] = field(default_factory=list)
-    iqr_bounds: dict[str, dict[str, float | bool | int | None]] = field(default_factory=dict)
     conflict_key_groups: int = 0
     output_path: str = ""
     rejected_path: str = ""
@@ -209,7 +190,7 @@ def standardize_units(df: pd.DataFrame, filename: str) -> tuple[pd.DataFrame, li
 
     if "viscosity_mPa*s" in out.columns:
         values = pd.to_numeric(out.pop("viscosity_mPa*s"), errors="coerce")
-        out["viscosity_mPa*s_log10"] = values.map(lambda value: math.log10(value) if pd.notna(value) and value > 0 else -999.0)
+        out["viscosity_mPa*s_log10"] = values.map(lambda value: math.log10(value) if pd.notna(value) and value > 0 else pd.NA)
         conversions.append("viscosity_mPa*s -> viscosity_mPa*s_log10")
         if "ln_viscosity_mPa*s_unitless" in out.columns:
             out = out.drop(columns=["ln_viscosity_mPa*s_unitless"])
@@ -218,6 +199,51 @@ def standardize_units(df: pd.DataFrame, filename: str) -> tuple[pd.DataFrame, li
         values = pd.to_numeric(out.pop("ln_viscosity_mPa*s_unitless"), errors="coerce")
         out["viscosity_mPa*s_log10"] = values / math.log(10)
         conversions.append("ln_viscosity_mPa*s_unitless -> viscosity_mPa*s_log10")
+
+    if "electrical_conductivity_S/m" in out.columns:
+        values = pd.to_numeric(out.pop("electrical_conductivity_S/m"), errors="coerce")
+        out["electrical_conductivity_S/m_log10"] = values.map(
+            lambda value: math.log10(value) if pd.notna(value) and value > 0 else pd.NA
+        )
+        conversions.append("electrical_conductivity_S/m -> electrical_conductivity_S/m_log10")
+        if "lnEC_unitless" in out.columns:
+            out = out.drop(columns=["lnEC_unitless"])
+            conversions.append("dropped lnEC_unitless after electrical conductivity conversion")
+    elif "lnEC_unitless" in out.columns:
+        values = pd.to_numeric(out.pop("lnEC_unitless"), errors="coerce")
+        out["electrical_conductivity_S/m_log10"] = values / math.log(10)
+        conversions.append("lnEC_unitless -> electrical_conductivity_S/m_log10")
+
+    if "logEC50_unitless" in out.columns:
+        values = pd.to_numeric(out.pop("logEC50_unitless"), errors="coerce")
+        out["pEC50"] = -values
+        conversions.append("logEC50_unitless -> pEC50")
+        if "EC50_unitless" in out.columns:
+            out = out.drop(columns=["EC50_unitless"])
+            conversions.append("dropped EC50_unitless after pEC50 conversion")
+    elif "EC50_unitless" in out.columns:
+        values = pd.to_numeric(out.pop("EC50_unitless"), errors="coerce")
+        out["pEC50"] = values.map(lambda value: -math.log10(value) if pd.notna(value) and value > 0 else pd.NA)
+        conversions.append("EC50_unitless -> pEC50")
+
+    if "x_CO2_unitless" in out.columns and "ln_x_CO2_unitless" in out.columns:
+        out = out.drop(columns=["ln_x_CO2_unitless"])
+        conversions.append("dropped ln_x_CO2_unitless; kept x_CO2_unitless")
+    elif "ln_x_CO2_unitless" in out.columns:
+        values = pd.to_numeric(out.pop("ln_x_CO2_unitless"), errors="coerce")
+        out["x_CO2_unitless"] = values.map(lambda value: math.exp(value) if pd.notna(value) else pd.NA)
+        conversions.append("ln_x_CO2_unitless -> x_CO2_unitless")
+
+    if "hc_unitless" in out.columns:
+        out = out.rename(columns={"hc_unitless": "heat_capacity_J/mol/K"})
+        conversions.append("hc_unitless -> heat_capacity_J/mol/K")
+        if "lnhc_unitless" in out.columns:
+            out = out.drop(columns=["lnhc_unitless"])
+            conversions.append("dropped lnhc_unitless after heat capacity conversion")
+    elif "lnhc_unitless" in out.columns:
+        values = pd.to_numeric(out.pop("lnhc_unitless"), errors="coerce")
+        out["heat_capacity_J/mol/K"] = values.map(lambda value: math.exp(value) if pd.notna(value) else pd.NA)
+        conversions.append("lnhc_unitless -> heat_capacity_J/mol/K")
 
     rename_only = {
         "solv": "solvation_kcal/mol",
@@ -278,37 +304,23 @@ def apply_hard_thresholds(
     return active
 
 
-def apply_iqr_rules(
+def reject_nonpositive_log_inputs(
     df: pd.DataFrame,
-    labels: list[str],
     rejected_rows: list[dict[str, object]],
     active: pd.Series,
-) -> tuple[pd.Series, dict[str, dict[str, float | bool | int | None]]]:
-    bounds: dict[str, dict[str, float | bool | int | None]] = {}
-    for column in labels:
-        if column not in IQR_ELIGIBLE_COLUMNS:
-            continue
+) -> pd.Series:
+    log_columns = ["viscosity_mPa*s", "electrical_conductivity_S/m"]
+    if "EC50_unitless" in df.columns and "logEC50_unitless" not in df.columns:
+        log_columns.append("EC50_unitless")
+    for column in log_columns:
         if column not in df.columns:
             continue
-        values = pd.to_numeric(df.loc[active, column], errors="coerce").dropna()
-        if len(values) < IQR_MIN_ROWS:
-            bounds[column] = {"applied": False, "n": int(len(values)), "lower": None, "upper": None}
-            continue
-        q1 = float(values.quantile(0.25))
-        q3 = float(values.quantile(0.75))
-        iqr = q3 - q1
-        if iqr == 0:
-            bounds[column] = {"applied": False, "n": int(len(values)), "lower": q1, "upper": q3}
-            continue
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        bounds[column] = {"applied": True, "n": int(len(values)), "lower": lower, "upper": upper}
-        full_values = pd.to_numeric(df[column], errors="coerce")
-        mask = active & full_values.notna() & ((full_values < lower) | (full_values > upper))
+        values = pd.to_numeric(df[column], errors="coerce")
+        mask = active & values.notna() & (values <= 0)
         if mask.any():
-            add_rejections(rejected_rows, df, mask, "iqr_outlier", column, full_values)
+            add_rejections(rejected_rows, df, mask, "nonpositive_for_log", column, values)
             active = active & ~mask
-    return active, bounds
+    return active
 
 
 def count_conflict_key_groups(df: pd.DataFrame, labels: list[str]) -> int:
@@ -362,6 +374,7 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
             active = active & ~missing
 
     df = coerce_numeric_columns(df)
+    active = reject_nonpositive_log_inputs(df, rejected_rows, active)
     df, unit_conversions = standardize_units(df, input_path.name)
     labels = label_columns(df)
 
@@ -376,7 +389,6 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
         active = active & ~duplicate_mask
 
     active = apply_hard_thresholds(df, rejected_rows, active)
-    active, iqr_bounds = apply_iqr_rules(df, labels, rejected_rows, active)
 
     cleaned = ordered_frame(df[active].reset_index(drop=True))
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -397,7 +409,6 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
         rejected_rows=len(rejected_rows),
         rejection_counts=rejection_counts,
         unit_conversions=unit_conversions,
-        iqr_bounds=iqr_bounds,
         conflict_key_groups=count_conflict_key_groups(cleaned, labels),
         output_path=str(output_path),
         rejected_path=str(rejected_path) if rejected_rows else "",
@@ -421,14 +432,6 @@ def write_reports(results: list[CleanResult], output_root: Path) -> None:
                 f"- Unit conversions: {'; '.join(result.unit_conversions) if result.unit_conversions else 'none'}",
             ]
         )
-        if result.iqr_bounds:
-            bounds = []
-            for column, detail in result.iqr_bounds.items():
-                if detail["applied"]:
-                    bounds.append(f"{column}: n={detail['n']}, lower={detail['lower']:.6g}, upper={detail['upper']:.6g}")
-                else:
-                    bounds.append(f"{column}: skipped, n={detail['n']}")
-            lines.append(f"- IQR bounds: {'; '.join(bounds)}")
         if result.rejection_counts:
             lines.append(f"- Rejection counts: {'; '.join(f'{k}={v}' for k, v in sorted(result.rejection_counts.items()))}")
         if result.rejected_path:
