@@ -17,6 +17,7 @@ from scripts.structure_raw_data import (  # noqa: E402
     CONDITION_COLUMNS,
     ILTHERMO_SPECS,
     SYSTEM_COLUMNS,
+    clean_smiles,
     ordered_frame,
     parse_phase,
     write_frame,
@@ -62,7 +63,10 @@ def extract_phase(row: pd.Series) -> str:
 
 def cleaned_row(row: pd.Series, label_column: str) -> dict[str, object]:
     output: dict[str, object] = {}
-    for column in [*SYSTEM_COLUMNS, *CONDITION_COLUMNS]:
+    for column in SYSTEM_COLUMNS:
+        if column in row.index and not pd.isna(row[column]):
+            output[column] = clean_smiles(row[column])
+    for column in CONDITION_COLUMNS:
         if column in row.index and not pd.isna(row[column]):
             output[column] = row[column]
 
