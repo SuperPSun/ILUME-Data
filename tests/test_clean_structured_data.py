@@ -54,7 +54,7 @@ def test_temperature_and_pressure_do_not_trigger_hard_threshold_rejection(tmp_pa
     assert not rejected_path.exists()
 
 
-def test_hard_threshold_and_iqr_reject_label_outliers(tmp_path: Path):
+def test_rare_values_within_hard_threshold_are_retained(tmp_path: Path):
     input_path = tmp_path / "after_AIonopedia_viscosity_structured.csv"
     output_path = tmp_path / "out.csv"
     rejected_path = tmp_path / "rejected.csv"
@@ -65,7 +65,7 @@ def test_hard_threshold_and_iqr_reject_label_outliers(tmp_path: Path):
                 "cation": f"{'C' * (index + 1)}n1cc[n+](C)c1",
                 "anion": "F[B-](F)(F)F",
                 "temperature_K": 298.15,
-                "viscosity_mPa*s": 100.0 + index % 3,
+                "viscosity_mPa*s": 100.0,
             }
         )
     rows.append(
@@ -76,46 +76,62 @@ def test_hard_threshold_and_iqr_reject_label_outliers(tmp_path: Path):
             "viscosity_mPa*s": 10000.0,
         }
     )
-    rows.append(
-        {
-            "cation": "CCCCCCCCCCCCCCCCCCCn1cc[n+](C)c1",
-            "anion": "F[B-](F)(F)F",
-            "temperature_K": 298.15,
-            "viscosity_mPa*s": -5.0,
-        }
-    )
     pd.DataFrame(rows).to_csv(input_path, index=False)
 
     result = clean_structured_file(input_path, output_path, rejected_path)
 
     cleaned = pd.read_csv(output_path)
-    rejected = pd.read_csv(rejected_path)
     assert "viscosity_mPa*s_log10" in cleaned.columns
-    assert result.iqr_bounds["viscosity_mPa*s_log10"]["applied"] is True
-    assert set(rejected["rejection_reason"]) == {"hard_threshold", "iqr_outlier"}
-    assert len(cleaned) == 20
+    assert len(cleaned) == 21
+    assert result.rejected_rows == 0
+    assert not rejected_path.exists()
 
 
-def test_iqr_skips_small_samples(tmp_path: Path):
+def test_report_does_not_include_iqr_fields_or_reasons(tmp_path: Path):
     input_path = tmp_path / "after_AIonopedia_solv_structured.csv"
+    input_root = tmp_path / "structured"
+    output_root = tmp_path / "cleaned"
+    (input_root / "after_AIonopedia").mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "cation": ["CC[n+]1ccn(C)c1", ""],
+            "anion": ["F[B-](F)(F)F", "F[B-](F)(F)F"],
+            "solute": ["O=C=O", "CCO"],
+            "temperature_K": [298.15, 298.15],
+            "solvation_kcal/mol": [-1.0, -2.0],
+        }
+    ).to_csv(input_root / "after_AIonopedia" / input_path.name, index=False)
+
+    clean_non_ilthermo_structured(input_root, output_root, sources=["after_AIonopedia"])
+
+    report_md = (output_root / "cleaning_report.md").read_text(encoding="utf-8")
+    report_csv = pd.read_csv(output_root / "cleaning_report.csv")
+    assert "IQR" not in report_md
+    assert "iqr_outlier" not in report_md
+    assert "iqr_outlier" not in str(report_csv["rejection_counts"].iloc[0])
+
+
+def test_nonpositive_values_are_rejected_before_log_conversion(tmp_path: Path):
+    input_path = tmp_path / "ILBERT_EC_structured.csv"
     output_path = tmp_path / "out.csv"
     rejected_path = tmp_path / "rejected.csv"
     pd.DataFrame(
         {
-            "cation": ["CC[n+]1ccn(C)c1"] * 3,
-            "anion": ["F[B-](F)(F)F"] * 3,
-            "solute": ["O=C=O", "CCO", "CCCC"],
-            "temperature_K": [298.15, 298.15, 298.15],
-            "solvation_kcal/mol": [-1.0, -2.0, -90.0],
+            "cation": ["CC[n+]1ccn(C)c1", "CCC[n+]1ccn(C)c1"],
+            "anion": ["F[B-](F)(F)F", "F[B-](F)(F)F"],
+            "temperature_K": [298.15, 298.15],
+            "electrical_conductivity_S/m": [0.1, 0.0],
+            "lnEC_unitless": [-2.302585092994046, None],
         }
     ).to_csv(input_path, index=False)
 
-    result = clean_structured_file(input_path, output_path, rejected_path)
+    clean_structured_file(input_path, output_path, rejected_path)
 
     cleaned = pd.read_csv(output_path)
-    assert len(cleaned) == 3
-    assert result.iqr_bounds["solvation_kcal/mol"]["applied"] is False
-    assert not rejected_path.exists()
+    rejected = pd.read_csv(rejected_path)
+    assert list(cleaned.columns) == ["cation", "anion", "temperature_K", "electrical_conductivity_S/m_log10"]
+    assert cleaned.loc[0, "electrical_conductivity_S/m_log10"] == -1.0
+    assert rejected.loc[0, "rejection_reason"] == "nonpositive_for_log"
 
 
 def test_units_are_unified_for_simulation_and_viscosity(tmp_path: Path):
@@ -155,6 +171,73 @@ def test_units_are_unified_for_simulation_and_viscosity(tmp_path: Path):
     viscosity = pd.read_csv(viscosity_output)
     assert list(viscosity.columns) == ["cation", "anion", "temperature_K", "viscosity_mPa*s_log10"]
     assert viscosity.loc[0, "viscosity_mPa*s_log10"] == 2.0
+
+
+def test_log_or_linear_label_choices_are_applied(tmp_path: Path):
+    ec_input = tmp_path / "ILBERT_EC_structured.csv"
+    ec_output = tmp_path / "ec_out.csv"
+    pd.DataFrame(
+        {
+            "cation": ["CC[n+]1ccn(C)c1"],
+            "anion": ["F[B-](F)(F)F"],
+            "temperature_K": [298.15],
+            "electrical_conductivity_S/m": [0.01],
+            "lnEC_unitless": [-4.605170185988092],
+        }
+    ).to_csv(ec_input, index=False)
+    clean_structured_file(ec_input, ec_output, tmp_path / "ec_rejected.csv")
+    assert list(pd.read_csv(ec_output).columns) == [
+        "cation",
+        "anion",
+        "temperature_K",
+        "electrical_conductivity_S/m_log10",
+    ]
+
+    co2_input = tmp_path / "ILBERT_CO2_structured.csv"
+    co2_output = tmp_path / "co2_out.csv"
+    pd.DataFrame(
+        {
+            "cation": ["CC[n+]1ccn(C)c1"],
+            "anion": ["F[B-](F)(F)F"],
+            "temperature_K": [298.15],
+            "pressure_kPa": [100.0],
+            "x_CO2_unitless": [0.25],
+            "ln_x_CO2_unitless": [-1.3862943611198906],
+        }
+    ).to_csv(co2_input, index=False)
+    clean_structured_file(co2_input, co2_output, tmp_path / "co2_rejected.csv")
+    assert list(pd.read_csv(co2_output).columns) == ["cation", "anion", "temperature_K", "pressure_kPa", "x_CO2_unitless"]
+
+    hc_input = tmp_path / "ILBERT_HC_structured.csv"
+    hc_output = tmp_path / "hc_out.csv"
+    pd.DataFrame(
+        {
+            "cation": ["CC[n+]1ccn(C)c1"],
+            "anion": ["F[B-](F)(F)F"],
+            "temperature_K": [298.15],
+            "hc_unitless": [500.0],
+            "lnhc_unitless": [6.214608098422191],
+        }
+    ).to_csv(hc_input, index=False)
+    clean_structured_file(hc_input, hc_output, tmp_path / "hc_rejected.csv")
+    hc = pd.read_csv(hc_output)
+    assert list(hc.columns) == ["cation", "anion", "temperature_K", "heat_capacity_J/mol/K"]
+    assert hc.loc[0, "heat_capacity_J/mol/K"] == 500.0
+
+    ec50_input = tmp_path / "ILBERT_norm_cytotoxicity_structured.csv"
+    ec50_output = tmp_path / "ec50_out.csv"
+    pd.DataFrame(
+        {
+            "cation": ["CC[n+]1ccn(C)c1"],
+            "anion": ["F[B-](F)(F)F"],
+            "logEC50_unitless": [3.0],
+            "EC50_unitless": [1000.0],
+        }
+    ).to_csv(ec50_input, index=False)
+    clean_structured_file(ec50_input, ec50_output, tmp_path / "ec50_rejected.csv")
+    ec50 = pd.read_csv(ec50_output)
+    assert list(ec50.columns) == ["cation", "anion", "pEC50"]
+    assert ec50.loc[0, "pEC50"] == -3.0
 
 
 def test_simulation_property_columns_are_renamed(tmp_path: Path):
@@ -223,13 +306,10 @@ def test_unknown_unit_simulation_columns_are_not_iqr_filtered(tmp_path: Path):
     rows.append({"SMILES": "CCCCCCCCCCCCCCCCCCCCC", "ESP_max": 9999.0, "Dipole": 999.0, "q_abs_mean": 99.0, "ESP_pos_frac": 0.5, "Gap": 5.0})
     pd.DataFrame(rows).to_csv(input_path, index=False)
 
-    result = clean_structured_file(input_path, output_path, rejected_path)
+    clean_structured_file(input_path, output_path, rejected_path)
 
     cleaned = pd.read_csv(output_path)
     assert len(cleaned) == 21
-    assert "ESP_max" not in result.iqr_bounds
-    assert "Dipole" not in result.iqr_bounds
-    assert "q_abs_mean" not in result.iqr_bounds
     assert "gap_eV" in cleaned.columns
     assert not rejected_path.exists()
 
