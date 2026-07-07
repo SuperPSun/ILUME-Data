@@ -19,10 +19,40 @@ ERROR_LABEL_PATTERNS = ("_err", "_error", "stddev", "stderr")
 WIDE_TABLE_FILES = {"simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF"}
 SOURCE_COLUMNS = {"source", "source_file"}
 MISSING_TOKEN = "__ILUME_MISSING_CONDITION__"
+UNIT_SUFFIXES = (
+    "_10^-9*m^2/s",
+    "_J/mol/K",
+    "_kJ/mol",
+    "_kcal/mol",
+    "_g/cm^3",
+    "_kg/m^3",
+    "_mPa*s",
+    "_mN/m",
+    "_S/m",
+    "_W/m/K",
+    "_m^2/s",
+    "_K^-1",
+    "_unitless",
+    "_kPa",
+    "_MHz",
+    "_nm",
+    "_m/s",
+    "_eV",
+    "_K",
+)
+
+
+def property_name(label: str) -> str:
+    name = re.sub(r"_log10$", "", label, flags=re.IGNORECASE)
+    lower = name.lower()
+    for suffix in UNIT_SUFFIXES:
+        if lower.endswith(suffix.lower()):
+            return name[: -len(suffix)]
+    return name
 
 
 def property_slug(label: str) -> str:
-    slug = label.lower()
+    slug = property_name(label).lower()
     slug = slug.replace("/", "_per_")
     slug = slug.replace("*", "_")
     slug = slug.replace("^", "_pow_")
@@ -230,6 +260,9 @@ def clean_output_root(output_root: Path) -> None:
     manifest = output_root / "final_manifest.csv"
     if manifest.exists():
         manifest.unlink()
+    system_counts = output_root / "system_property_counts.csv"
+    if system_counts.exists():
+        system_counts.unlink()
 
 
 def write_bucket(
@@ -240,12 +273,20 @@ def write_bucket(
     bucket_dir = output_root / bucket
     bucket_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows: list[dict[str, object]] = []
+    output_labels: dict[str, str] = {}
     for label, rows in sorted(properties.items()):
         if label in set(WIDE_TABLE_FILES.values()):
             merged = aggregate_wide_table(rows)
         else:
             merged = aggregate_property(rows, label)
         output_name = f"{property_slug(label)}.csv"
+        previous_label = output_labels.get(output_name)
+        if previous_label is not None and previous_label != label:
+            raise ValueError(
+                f"Property filename collision for {bucket}/{output_name}: "
+                f"{previous_label!r} and {label!r}"
+            )
+        output_labels[output_name] = label
         output_path = bucket_dir / output_name
         merged.to_csv(output_path, index=False)
         input_files = sorted(
