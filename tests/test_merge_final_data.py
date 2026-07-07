@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from scripts.merge_final_data import merge_final_data, property_slug
 
@@ -11,10 +12,14 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def test_property_slug_uses_stable_filename_rules():
-    assert property_slug("density_g/cm^3") == "density_g_per_cm_pow_3"
-    assert property_slug("viscosity_mPa*s_log10") == "viscosity_mpa_s_log10"
-    assert property_slug("heat_capacity_J/mol/K") == "heat_capacity_j_per_mol_per_k"
+    assert property_slug("density_g/cm^3") == "density"
+    assert property_slug("viscosity_mPa*s_log10") == "viscosity"
+    assert property_slug("heat_capacity_J/mol/K") == "heat_capacity"
     assert property_slug("pEC50") == "pec50"
+    assert property_slug("partition_log10") == "partition"
+    assert property_slug("HOMO_eV") == "homo"
+    assert property_slug("x_CO2_unitless") == "x_co2"
+    assert property_slug("simulated_QM_elec_HF") == "simulated_qm_elec_hf"
 
 
 def test_experiment_sources_merge_by_property_and_aggregate_identical_records(tmp_path: Path):
@@ -33,7 +38,7 @@ def test_experiment_sources_merge_by_property_and_aggregate_identical_records(tm
 
     results = merge_final_data(input_root, output_root)
 
-    out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
+    out = pd.read_csv(output_root / "experiment" / "density.csv")
     assert len(out) == 2
     assert list(out.columns) == ["cation", "anion", "temperature_K", "phase", "density_g/cm^3", "source_list"]
     aggregated = out[out["density_g/cm^3"] == 1.2].iloc[0]
@@ -58,12 +63,12 @@ def test_simulation_stays_separate_from_experiment_for_same_property(tmp_path: P
 
     merge_final_data(input_root, output_root)
 
-    experiment = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
-    simulation = pd.read_csv(output_root / "simulation" / "density_g_per_cm_pow_3.csv")
+    experiment = pd.read_csv(output_root / "experiment" / "density.csv")
+    simulation = pd.read_csv(output_root / "simulation" / "density.csv")
     assert len(experiment) == 1
     assert len(simulation) == 1
     assert "density_err_g/cm^3" not in simulation.columns
-    assert not (output_root / "simulation" / "density_err_g_per_cm_pow_3.csv").exists()
+    assert not (output_root / "simulation" / "density_err.csv").exists()
 
 
 def test_multi_label_simulation_file_is_split_and_error_labels_are_dropped(tmp_path: Path):
@@ -88,10 +93,10 @@ def test_multi_label_simulation_file_is_split_and_error_labels_are_dropped(tmp_p
 
     merge_final_data(input_root, output_root)
 
-    assert (output_root / "simulation" / "homo_ev.csv").exists()
-    assert (output_root / "simulation" / "lumo_ev.csv").exists()
-    assert (output_root / "simulation" / "gap_ev.csv").exists()
-    heat_capacity = pd.read_csv(output_root / "simulation" / "heat_capacity_j_per_mol_per_k.csv")
+    assert (output_root / "simulation" / "homo.csv").exists()
+    assert (output_root / "simulation" / "lumo.csv").exists()
+    assert (output_root / "simulation" / "gap.csv").exists()
+    heat_capacity = pd.read_csv(output_root / "simulation" / "heat_capacity.csv")
     assert list(heat_capacity.columns) == [
         "cation",
         "anion",
@@ -99,7 +104,7 @@ def test_multi_label_simulation_file_is_split_and_error_labels_are_dropped(tmp_p
         "heat_capacity_J/mol/K",
         "source_list",
     ]
-    assert not (output_root / "simulation" / "heat_capacity_err_j_per_mol_per_k.csv").exists()
+    assert not (output_root / "simulation" / "heat_capacity_err.csv").exists()
 
 
 def test_qm_elec_hf_file_outputs_one_wide_table_instead_of_split_labels(tmp_path: Path):
@@ -121,7 +126,7 @@ def test_qm_elec_hf_file_outputs_one_wide_table_instead_of_split_labels(tmp_path
     assert wide["ESP_max"].isna().sum() == 1
     assert not (output_root / "simulation" / "esp_max.csv").exists()
     assert not (output_root / "simulation" / "esp_min.csv").exists()
-    assert not (output_root / "simulation" / "gap_ev.csv").exists()
+    assert not (output_root / "simulation" / "gap.csv").exists()
 
     manifest = pd.read_csv(output_root / "final_manifest.csv")
     assert manifest.iloc[0]["property_label"] == "simulated_QM_elec_HF"
@@ -137,7 +142,7 @@ def test_same_key_different_label_values_remain_separate_rows(tmp_path: Path):
 
     merge_final_data(input_root, output_root)
 
-    out = pd.read_csv(output_root / "experiment" / "viscosity_mpa_s_log10.csv")
+    out = pd.read_csv(output_root / "experiment" / "viscosity.csv")
     assert len(out) == 2
     assert set(out["viscosity_mPa*s_log10"]) == {1.0, 2.0}
     assert set(out["source_list"]) == {"AIonopedia", "ILBERT"}
@@ -158,7 +163,7 @@ def test_condition_subset_row_collapses_into_more_complete_record(tmp_path: Path
 
     merge_final_data(input_root, output_root)
 
-    out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
+    out = pd.read_csv(output_root / "experiment" / "density.csv")
     assert len(out) == 1
     assert out.iloc[0]["pressure_kPa"] == 100.0
     assert out.iloc[0]["source_list"] == "AIonopedia; ILBERT"
@@ -176,7 +181,7 @@ def test_condition_subset_does_not_collapse_different_label_values(tmp_path: Pat
 
     merge_final_data(input_root, output_root)
 
-    out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
+    out = pd.read_csv(output_root / "experiment" / "density.csv")
     assert len(out) == 2
     assert set(out["density_g/cm^3"]) == {1.2, 1.3}
 
@@ -201,7 +206,7 @@ def test_ambiguous_condition_subset_candidates_are_preserved(tmp_path: Path):
 
     merge_final_data(input_root, output_root)
 
-    out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
+    out = pd.read_csv(output_root / "experiment" / "density.csv")
     assert len(out) == 3
     assert out["pressure_kPa"].isna().sum() == 1
 
@@ -220,7 +225,7 @@ def test_complementary_condition_rows_are_preserved(tmp_path: Path):
 
     merge_final_data(input_root, output_root)
 
-    out = pd.read_csv(output_root / "experiment" / "density_g_per_cm_pow_3.csv")
+    out = pd.read_csv(output_root / "experiment" / "density.csv")
     assert len(out) == 2
     assert set(out["source_list"]) == {"AIonopedia", "ILBERT"}
 
@@ -228,6 +233,9 @@ def test_complementary_condition_rows_are_preserved(tmp_path: Path):
 def test_manifest_records_output_files_and_counts(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "final"
+    stale_system_counts = output_root / "system_property_counts.csv"
+    stale_system_counts.parent.mkdir(parents=True, exist_ok=True)
+    stale_system_counts.write_text("stale\n")
     write_csv(
         input_root / "ILBERT" / "ILBERT_HC_structured.csv",
         [{"cation": "CC[n+]1ccn(C)c1", "anion": "F[B-](F)(F)F", "temperature_K": 298.15, "heat_capacity_J/mol/K": 500.0}],
@@ -240,7 +248,20 @@ def test_manifest_records_output_files_and_counts(tmp_path: Path):
     row = manifest.iloc[0]
     assert row["bucket"] == "experiment"
     assert row["property_label"] == "heat_capacity_J/mol/K"
-    assert row["output_file"] == "experiment/heat_capacity_j_per_mol_per_k.csv"
+    assert row["output_file"] == "experiment/heat_capacity.csv"
     assert row["input_files"] == "ILBERT/ILBERT_HC_structured.csv"
     assert row["input_rows"] == 1
     assert row["output_rows"] == 1
+    assert not stale_system_counts.exists()
+
+
+def test_property_filename_collisions_raise_clear_error(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "final"
+    row = {"cation": "CC[n+]1ccn(C)c1", "anion": "F[B-](F)(F)F"}
+    write_csv(input_root / "ILBERT" / "a.csv", [{**row, "temperature_K": 298.15, "density_g/cm^3": 1.2}])
+    write_csv(input_root / "ILBERT" / "b.csv", [{**row, "temperature_K": 298.15, "density_kg/m^3": 1200.0}])
+
+    with pytest.raises(ValueError, match="experiment/density.csv"):
+        merge_final_data(input_root, output_root)
+
