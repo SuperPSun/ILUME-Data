@@ -1,4 +1,4 @@
-"""Merge cleaned IL datasets into final property-level experiment/simulation CSVs."""
+"""Merge cleaned IL datasets into merged property-level experiment/simulation CSVs."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ EXPERIMENT_SOURCES = ("AIonopedia", "ILBERT", "ILThermo", "after_AIonopedia")
 SIMULATION_SOURCES = ("simulation",)
 IDENTIFIER_COLUMNS = ("mol_id", "cation", "anion", "solute", "solvent", "smiles", "SMILES")
 CONDITION_COLUMNS = ("temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
-BASE_COLUMNS = (*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS)
+METADATA_COLUMNS = ("standard_state_note",)
+BASE_COLUMNS = (*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS, *METADATA_COLUMNS)
 NON_LABEL_COLUMNS = set(BASE_COLUMNS)
 ERROR_LABEL_PATTERNS = ("_err", "_error", "stddev", "stderr")
 WIDE_TABLE_FILES = {"simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF"}
@@ -257,7 +258,7 @@ def clean_output_root(output_root: Path) -> None:
         path = output_root / subdir
         if path.exists():
             shutil.rmtree(path)
-    manifest = output_root / "final_manifest.csv"
+    manifest = output_root / "merged_manifest.csv"
     if manifest.exists():
         manifest.unlink()
     system_counts = output_root / "system_property_counts.csv"
@@ -305,7 +306,7 @@ def write_bucket(
     return manifest_rows
 
 
-def merge_final_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
+def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     input_root = Path(input_root)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -318,20 +319,20 @@ def merge_final_data(input_root: Path, output_root: Path) -> list[dict[str, obje
         manifest_rows,
         columns=["bucket", "property_label", "output_file", "input_files", "input_rows", "output_rows"],
     )
-    manifest.to_csv(output_root / "final_manifest.csv", index=False)
+    manifest.to_csv(output_root / "merged_manifest.csv", index=False)
     return manifest_rows
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-root", type=Path, default=Path("data/cleaned"))
-    parser.add_argument("--output-root", type=Path, default=Path("data/final"))
+    parser.add_argument("--output-root", type=Path, default=Path("data/merged"))
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    rows = merge_final_data(args.input_root, args.output_root)
+    rows = merge_data(args.input_root, args.output_root)
     for row in rows:
         print(
             f"bucket={row['bucket']} property={row['property_label']} "
