@@ -25,7 +25,7 @@ from scripts.merge_data import (
     NON_LABEL_COLUMNS,
     WIDE_TABLE_FILES,
     is_error_label,
-    property_slug,
+    output_slug,
 )
 
 SUMMARY_COLUMNS = [
@@ -145,8 +145,8 @@ def analyze_value_column(
 
     return {
         "bucket": bucket,
-        "property": property_slug(value_column),
-        "property_label": value_column,
+        "property": output_slug(value_column),
+        "property_label": output_slug(value_column),
         "output_file": output_file,
         "rows": int(len(df)),
         "data_points": int(present.sum()),
