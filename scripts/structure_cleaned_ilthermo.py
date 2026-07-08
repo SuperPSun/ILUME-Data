@@ -61,6 +61,17 @@ def extract_phase(row: pd.Series) -> str:
     return parsed_phase.strip()
 
 
+def extract_standard_state_note(row: pd.Series) -> str:
+    standard_state_note = clean_text(row.get("standard_state_note"))
+    if standard_state_note:
+        return standard_state_note
+
+    note_text = clean_text(row.get("note"))
+    if "reference state" in note_text.lower():
+        return note_text
+    return ""
+
+
 def cleaned_row(row: pd.Series, label_column: str) -> dict[str, object]:
     output: dict[str, object] = {}
     for column in SYSTEM_COLUMNS:
@@ -74,8 +85,23 @@ def cleaned_row(row: pd.Series, label_column: str) -> dict[str, object]:
     if phase:
         output["phase"] = phase
 
+    standard_state_note = extract_standard_state_note(row)
+    if standard_state_note:
+        output["standard_state_note"] = standard_state_note
+
     output[label_column] = row["label"]
     return output
+
+
+def drop_liquid_only_phase(df: pd.DataFrame) -> pd.DataFrame:
+    if "phase" not in df.columns:
+        return df
+
+    phases = df["phase"].dropna().astype(str).str.strip()
+    phases = phases[phases != ""]
+    if not phases.empty and phases.str.lower().eq("liquid").all():
+        return df.drop(columns=["phase"])
+    return df
 
 
 def structure_cleaned_ilthermo_file(input_path: Path, output_path: Path, property_slug: str) -> pd.DataFrame:
@@ -86,6 +112,7 @@ def structure_cleaned_ilthermo_file(input_path: Path, output_path: Path, propert
 
     rows = [cleaned_row(csv_row, spec.label_column) for _, csv_row in df.iterrows()]
     out = ordered_frame(rows, [spec.label_column]).drop_duplicates().reset_index(drop=True)
+    out = drop_liquid_only_phase(out)
     return write_frame(out, output_path)
 
 
