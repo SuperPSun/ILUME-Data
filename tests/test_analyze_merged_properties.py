@@ -166,6 +166,44 @@ def test_analyze_merged_properties_summarizes_regular_properties(tmp_path: Path)
     assert "Generated Figures" in report
 
 
+def test_analyze_merged_properties_uses_equilibrium_pressure_name(tmp_path: Path):
+    input_root = tmp_path / "merged"
+    output_dir = input_root / "analysis"
+    write_csv(
+        input_root / "merged_manifest.csv",
+        [
+            {
+                "bucket": "experiment",
+                "property_label": "pressure_kPa_log10",
+                "output_file": "experiment/equilibrium_pressure.csv",
+                "input_files": "ILThermo/ilt_equilibrium_pressure_structured.csv",
+                "input_rows": 1,
+                "output_rows": 1,
+            }
+        ],
+    )
+    write_csv(
+        input_root / "experiment" / "equilibrium_pressure.csv",
+        [
+            {
+                "cation": "cat1",
+                "anion": "an1",
+                "temperature_K": 298.15,
+                "pressure_kPa_log10": 2.0,
+                "source_list": "ILThermo",
+            }
+        ],
+    )
+
+    summary = analyze_merged_properties(input_root, output_dir)
+
+    row = summary.iloc[0]
+    assert row["property"] == "equilibrium_pressure"
+    assert row["property_label"] == "pressure_kPa_log10"
+    plot_manifest = pd.read_csv(output_dir / "plot_manifest.csv")
+    assert plot_manifest["path"].str.contains("experiment_equilibrium_pressure").any()
+
+
 def test_analyze_merged_properties_splits_wide_tables_by_value_column(tmp_path: Path):
     input_root = tmp_path / "merged"
     output_dir = input_root / "analysis"
