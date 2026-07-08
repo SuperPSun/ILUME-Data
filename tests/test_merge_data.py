@@ -268,6 +268,32 @@ def test_standard_state_note_is_metadata_not_property(tmp_path: Path):
     assert not (output_root / "experiment" / "standard_state_note.csv").exists()
 
 
+def test_ilthermo_equilibrium_pressure_uses_specific_output_filename(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    write_csv(
+        input_root / "ILThermo" / "ilt_equilibrium_pressure_structured.csv",
+        [
+            {
+                "cation": "CC[n+]1ccn(C)c1",
+                "anion": "F[B-](F)(F)F",
+                "temperature_K": 298.15,
+                "pressure_kPa_log10": 2.0,
+            }
+        ],
+    )
+
+    merge_data(input_root, output_root)
+
+    out = pd.read_csv(output_root / "experiment" / "equilibrium_pressure.csv")
+    assert list(out.columns) == ["cation", "anion", "temperature_K", "pressure_kPa_log10", "source_list"]
+    assert out.loc[0, "pressure_kPa_log10"] == 2.0
+    assert not (output_root / "experiment" / "pressure.csv").exists()
+    manifest = pd.read_csv(output_root / "merged_manifest.csv")
+    assert manifest.iloc[0]["property_label"] == "pressure_kPa_log10"
+    assert manifest.iloc[0]["output_file"] == "experiment/equilibrium_pressure.csv"
+
+
 def test_manifest_records_output_files_and_counts(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
