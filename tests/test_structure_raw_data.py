@@ -202,6 +202,52 @@ def test_ilthermo_single_line_outputs_specific_label(tmp_path: Path):
     assert df.loc[0, "density_g/cm^3"] == 1.252
 
 
+def test_ilthermo_csv_preserves_standard_state_note(tmp_path: Path):
+    input_path = tmp_path / "pure_compound_enthalpy.csv"
+    output_path = tmp_path / "ilt_enthalpy_structured.csv"
+    reference_note = (
+        "* property value is given as the difference ( x - x ref ) from the reference state: "
+        "Crystal at the temperature of 298.15 K and the pressure of 101.3 kPa"
+    )
+    pd.DataFrame(
+        {
+            "canonical_smiles": ["CCCC[n+]1ccccc1.F[B-](F)(F)F"],
+            "temperature_value": [290.0],
+            "temperature_unit": ["K"],
+            "pressure_value": [101.325],
+            "pressure_unit": ["kPa"],
+            "frequency_value": [None],
+            "frequency_unit": [None],
+            "wavelength_value": [None],
+            "wavelength_unit": [None],
+            "phase": ["Liquid"],
+            "property_value": [-4.329],
+            "property_unit": ["kJ/mol"],
+            "standard_state_note": [reference_note],
+            "starred": [True],
+            "note_text": [reference_note],
+        }
+    ).to_csv(input_path, index=False)
+
+    df = structure_ilthermo_file(input_path, output_path, "enthalpy")
+
+    assert list(df.columns) == [
+        "cation",
+        "anion",
+        "temperature_K",
+        "pressure_kPa",
+        "frequency_MHz",
+        "wavelength_nm",
+        "phase",
+        "standard_state_note",
+        "enthalpy_kJ/mol",
+    ]
+    assert df.loc[0, "standard_state_note"] == reference_note
+    assert df.loc[0, "enthalpy_kJ/mol"] == -4.329
+    assert "starred" not in df.columns
+    assert "note_text" not in df.columns
+
+
 def test_structure_simulation_pbe_tzvp_renames_outputs_and_drops_smiles(tmp_path: Path):
     input_dir = tmp_path / "raw"
     output_dir = tmp_path / "structured"
@@ -283,10 +329,9 @@ def test_structure_cleaned_ilthermo_file_renames_label_and_drops_intermediate_co
 
     df = structure_cleaned_ilthermo_file(input_path, output_path, "density")
 
-    assert list(df.columns) == ["cation", "anion", "temperature_K", "pressure_kPa", "phase", "density_g/cm^3"]
+    assert list(df.columns) == ["cation", "anion", "temperature_K", "pressure_kPa", "density_g/cm^3"]
     assert df.loc[0, "cation"] == "CC[N+](C)(C)C"
     assert df.loc[0, "anion"] == "CC(=O)[O-]"
-    assert df.loc[0, "phase"] == "Liquid"
     assert df.loc[0, "density_g/cm^3"] == 1.252
     for column in ["property_name", "property_unit", "property_value", "standard unit", "parse_error", "source_text"]:
         assert column not in df.columns
@@ -305,15 +350,46 @@ def test_structure_cleaned_ilthermo_file_extracts_energetics_phase_from_note_and
             "standard_unit": ["kJ/mol"],
             "parse_error": [None],
             "note": ["Phase: Crystal | Gas"],
-            "source_text": ["record_id=1 | property_name=Enthalpy | property_value=220 | property_unit=kJ/mol | phase=Liquid"],
+            "source_text": [
+                "record_id=1 | property_name=Enthalpy | property_value=220 | property_unit=kJ/mol | "
+                "phase=Crystal | Liquid"
+            ],
         }
     ).to_csv(input_path, index=False)
 
-    df = structure_cleaned_ilthermo_file(input_path, output_path, "enthalpy")
+    df = structure_cleaned_ilthermo_file(input_path, output_path, "enthalpy_of_transition_or_fusion")
 
-    assert list(df.columns) == ["cation", "anion", "phase", "enthalpy_kJ/mol"]
-    assert df.loc[0, "phase"] == "Liquid"
-    assert df.loc[0, "enthalpy_kJ/mol"] == 220.0
+    assert list(df.columns) == ["cation", "anion", "phase", "enthalpy_of_transition_or_fusion_kJ/mol"]
+    assert df.loc[0, "phase"] == "Crystal | Liquid"
+    assert df.loc[0, "enthalpy_of_transition_or_fusion_kJ/mol"] == 220.0
+
+
+def test_structure_cleaned_ilthermo_file_preserves_standard_state_note_without_liquid_phase(tmp_path: Path):
+    from scripts.structure_cleaned_ilthermo import structure_cleaned_ilthermo_file
+
+    input_path = tmp_path / "ilt_entropy_structured.csv"
+    output_path = tmp_path / "out" / "ilt_entropy_structured.csv"
+    reference_note = (
+        "* property value is given as the difference ( x - x ref ) from the reference state: "
+        "Crystal at the temperature of 0 K and the pressure of 0 kPa"
+    )
+    pd.DataFrame(
+        {
+            "cation": ["CCCC[n+]1ccn(C)c1"],
+            "anion": ["F[P-](F)(F)(F)(F)F"],
+            "temperature_K": [190.6],
+            "pressure_kPa": [101.325],
+            "phase": ["Liquid"],
+            "label": [324.4],
+            "standard_state_note": [reference_note],
+        }
+    ).to_csv(input_path, index=False)
+
+    df = structure_cleaned_ilthermo_file(input_path, output_path, "entropy")
+
+    assert list(df.columns) == ["cation", "anion", "temperature_K", "pressure_kPa", "standard_state_note", "entropy_J/mol/K"]
+    assert df.loc[0, "standard_state_note"] == reference_note
+    assert df.loc[0, "entropy_J/mol/K"] == 324.4
 
 
 def test_structure_cleaned_ilthermo_file_requires_label_column(tmp_path: Path):
@@ -361,6 +437,5 @@ def test_structure_cleaned_ilthermo_directory_cli(tmp_path: Path):
     )
 
     df = pd.read_csv(output_dir / "ilt_electrical_conductivity_structured.csv")
-    assert list(df.columns) == ["cation", "anion", "phase", "electrical_conductivity_S/m_log10"]
-    assert df.loc[0, "phase"] == "Liquid"
+    assert list(df.columns) == ["cation", "anion", "electrical_conductivity_S/m_log10"]
     assert df.loc[0, "electrical_conductivity_S/m_log10"] == 2.160168
