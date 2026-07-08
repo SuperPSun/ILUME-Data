@@ -42,7 +42,7 @@ PROMPT_PATTERNS = {
 }
 SYSTEM_COLUMNS = ["cation", "anion", "solute", "solvent", "smiles"]
 CONDITION_COLUMNS = ["temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm"]
-META_COLUMNS = ["phase"]
+META_COLUMNS = ["phase", "standard_state_note"]
 
 
 def to_float(value: object) -> float | None:
@@ -583,6 +583,9 @@ def structure_ilthermo_csv(input_path: Path, output_path: Path, spec: ILThermoSp
                 "phase": str(csv_row.get("phase") or "").strip(),
                 spec.label_column: value,
             }
+            standard_state_note = str(csv_row.get("standard_state_note") or "").strip()
+            if standard_state_note:
+                row["standard_state_note"] = standard_state_note
             rows.append(row)
     out = ordered_frame(rows, [spec.label_column]).drop_duplicates().reset_index(drop=True)
     if invalid_smiles:
