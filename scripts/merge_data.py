@@ -18,6 +18,7 @@ BASE_COLUMNS = (*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS, *METADATA_COLUMNS)
 NON_LABEL_COLUMNS = set(BASE_COLUMNS)
 ERROR_LABEL_PATTERNS = ("_err", "_error", "stddev", "stderr")
 WIDE_TABLE_FILES = {"simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF"}
+PROPERTY_OUTPUT_SLUGS = {"pressure_kPa_log10": "equilibrium_pressure"}
 SOURCE_COLUMNS = {"source", "source_file"}
 MISSING_TOKEN = "__ILUME_MISSING_CONDITION__"
 UNIT_SUFFIXES = (
@@ -60,6 +61,10 @@ def property_slug(label: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", slug)
     slug = re.sub(r"_+", "_", slug)
     return slug.strip("_")
+
+
+def output_slug(label: str) -> str:
+    return PROPERTY_OUTPUT_SLUGS.get(label, property_slug(label))
 
 
 def is_error_label(label: str) -> bool:
@@ -280,7 +285,7 @@ def write_bucket(
             merged = aggregate_wide_table(rows)
         else:
             merged = aggregate_property(rows, label)
-        output_name = f"{property_slug(label)}.csv"
+        output_name = f"{output_slug(label)}.csv"
         previous_label = output_labels.get(output_name)
         if previous_label is not None and previous_label != label:
             raise ValueError(
