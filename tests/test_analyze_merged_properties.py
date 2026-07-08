@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.analyze_final_properties import analyze_final_properties
+from scripts.analyze_merged_properties import analyze_merged_properties
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -10,11 +10,11 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
-def test_analyze_final_properties_summarizes_regular_properties(tmp_path: Path):
-    input_root = tmp_path / "final"
+def test_analyze_merged_properties_summarizes_regular_properties(tmp_path: Path):
+    input_root = tmp_path / "merged"
     output_dir = input_root / "analysis"
     write_csv(
-        input_root / "final_manifest.csv",
+        input_root / "merged_manifest.csv",
         [
             {
                 "bucket": "experiment",
@@ -105,7 +105,7 @@ def test_analyze_final_properties_summarizes_regular_properties(tmp_path: Path):
         ],
     )
 
-    summary = analyze_final_properties(
+    summary = analyze_merged_properties(
         input_root,
         output_dir,
         min_holdout_systems=2,
@@ -161,16 +161,16 @@ def test_analyze_final_properties_summarizes_regular_properties(tmp_path: Path):
     assert (plot_manifest["path"].str.contains("experiment_density_temperature_pressure.png").any())
     assert (plot_manifest["path"].str.contains("experiment_electrical_conductivity_temperature_frequency.png").any())
     report = (output_dir / "property_analysis_report.md").read_text()
-    assert "Final Property Analysis Report" in report
+    assert "Merged Property Analysis Report" in report
     assert "High Leakage Risk Properties" in report
     assert "Generated Figures" in report
 
 
-def test_analyze_final_properties_splits_wide_tables_by_value_column(tmp_path: Path):
-    input_root = tmp_path / "final"
+def test_analyze_merged_properties_splits_wide_tables_by_value_column(tmp_path: Path):
+    input_root = tmp_path / "merged"
     output_dir = input_root / "analysis"
     write_csv(
-        input_root / "final_manifest.csv",
+        input_root / "merged_manifest.csv",
         [
             {
                 "bucket": "simulation",
@@ -190,7 +190,7 @@ def test_analyze_final_properties_splits_wide_tables_by_value_column(tmp_path: P
         ],
     )
 
-    summary = analyze_final_properties(input_root, output_dir, min_holdout_systems=200, test_fraction=0.1)
+    summary = analyze_merged_properties(input_root, output_dir, min_holdout_systems=200, test_fraction=0.1)
 
     assert set(summary["property"]) == {"esp_max", "esp_min", "gap"}
     esp_max = summary[summary["property"].eq("esp_max")].iloc[0]
@@ -206,11 +206,11 @@ def test_analyze_final_properties_splits_wide_tables_by_value_column(tmp_path: P
     assert gap["unique_systems"] == 2
 
 
-def test_analyze_final_properties_recommends_grouped_cv_for_mid_sized_data(tmp_path: Path):
-    input_root = tmp_path / "final"
+def test_analyze_merged_properties_recommends_grouped_cv_for_mid_sized_data(tmp_path: Path):
+    input_root = tmp_path / "merged"
     output_dir = input_root / "analysis"
     write_csv(
-        input_root / "final_manifest.csv",
+        input_root / "merged_manifest.csv",
         [
             {
                 "bucket": "experiment",
@@ -235,7 +235,7 @@ def test_analyze_final_properties_recommends_grouped_cv_for_mid_sized_data(tmp_p
         ],
     )
 
-    summary = analyze_final_properties(input_root, output_dir, min_holdout_systems=200, test_fraction=0.1)
+    summary = analyze_merged_properties(input_root, output_dir, min_holdout_systems=200, test_fraction=0.1)
 
     row = summary.iloc[0]
     assert row["unique_systems"] == 20
@@ -243,11 +243,11 @@ def test_analyze_final_properties_recommends_grouped_cv_for_mid_sized_data(tmp_p
     assert row["recommended_test_systems"] == 0
 
 
-def test_analyze_final_properties_can_skip_plots(tmp_path: Path):
-    input_root = tmp_path / "final"
+def test_analyze_merged_properties_can_skip_plots(tmp_path: Path):
+    input_root = tmp_path / "merged"
     output_dir = input_root / "analysis"
     write_csv(
-        input_root / "final_manifest.csv",
+        input_root / "merged_manifest.csv",
         [
             {
                 "bucket": "experiment",
@@ -264,7 +264,7 @@ def test_analyze_final_properties_can_skip_plots(tmp_path: Path):
         [{"cation": "cat1", "anion": "an1", "melting_point_K": 250.0, "source_list": "ILBERT"}],
     )
 
-    analyze_final_properties(input_root, output_dir, skip_plots=True)
+    analyze_merged_properties(input_root, output_dir, skip_plots=True)
 
     assert (output_dir / "property_analysis_summary.csv").exists()
     assert (output_dir / "property_analysis_report.md").exists()
