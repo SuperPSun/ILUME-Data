@@ -1,4 +1,4 @@
-"""Analyze final property CSVs for data quality and split planning."""
+"""Analyze merged property CSVs for data quality and split planning."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.merge_final_data import (
+from scripts.merge_data import (
     CONDITION_COLUMNS,
     IDENTIFIER_COLUMNS,
     NON_LABEL_COLUMNS,
@@ -63,8 +63,8 @@ SUMMARY_COLUMNS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-root", type=Path, default=Path("data/final"))
-    parser.add_argument("--output-dir", type=Path, default=Path("data/final/analysis"))
+    parser.add_argument("--input-root", type=Path, default=Path("data/merged"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/merged/analysis"))
     parser.add_argument("--min-holdout-systems", type=int, default=200)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--dpi", type=int, default=300)
@@ -176,7 +176,7 @@ def analyze_value_column(
     }
 
 
-def analyze_final_properties(
+def analyze_merged_properties(
     input_root: Path,
     output_dir: Path,
     *,
@@ -190,9 +190,9 @@ def analyze_final_properties(
 ) -> pd.DataFrame:
     input_root = Path(input_root)
     output_dir = Path(output_dir)
-    manifest_path = input_root / "final_manifest.csv"
+    manifest_path = input_root / "merged_manifest.csv"
     if not manifest_path.exists():
-        raise FileNotFoundError(f"Missing final manifest: {manifest_path}")
+        raise FileNotFoundError(f"Missing merged manifest: {manifest_path}")
 
     rows: list[dict[str, object]] = []
     manifest = pd.read_csv(manifest_path)
@@ -665,7 +665,7 @@ def write_markdown_report(summary: pd.DataFrame, output_path: Path, plot_manifes
     largest = summary.sort_values("data_points", ascending=False)
 
     lines = [
-        "# Final Property Analysis Report",
+        "# Merged Property Analysis Report",
         "",
         "## Global Summary",
         "",
@@ -723,7 +723,7 @@ def write_markdown_report(summary: pd.DataFrame, output_path: Path, plot_manifes
 
 def main() -> None:
     args = parse_args()
-    summary = analyze_final_properties(
+    summary = analyze_merged_properties(
         args.input_root,
         args.output_dir,
         min_holdout_systems=args.min_holdout_systems,
