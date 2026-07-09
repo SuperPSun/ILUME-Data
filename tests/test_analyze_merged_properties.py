@@ -3,7 +3,7 @@ from pathlib import Path
 import matplotlib.axes
 import pandas as pd
 
-from scripts.analyze_merged_properties import analyze_merged_properties, plot_system_frequency
+from scripts.analyze_merged_properties import analyze_merged_properties, numeric_condition_dimensions, plot_system_frequency
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -218,6 +218,51 @@ def test_analyze_merged_properties_uses_equilibrium_pressure_name(tmp_path: Path
     assert plot_manifest["path"].str.contains("experiment_equilibrium_pressure").any()
 
 
+def test_analyze_merged_properties_preserves_self_diffusion_log_label(tmp_path: Path):
+    input_root = tmp_path / "merged"
+    output_dir = input_root / "analysis"
+    write_csv(
+        input_root / "merged_manifest.csv",
+        [
+            {
+                "bucket": "experiment",
+                "property_label": "self_diffusion_coefficient_10^-9*m^2/s_log10",
+                "output_file": "experiment/self_diffusion_coefficient.csv",
+                "input_files": "ILThermo/ilt_self_diffusion_coefficient_structured.csv",
+                "input_rows": 2,
+                "output_rows": 2,
+            }
+        ],
+    )
+    write_csv(
+        input_root / "experiment" / "self_diffusion_coefficient.csv",
+        [
+            {
+                "cation": "cat1",
+                "anion": "an1",
+                "temperature_K": 298.15,
+                "self_diffusion_coefficient_10^-9*m^2/s_log10": -2.0,
+                "source_list": "ILThermo",
+            },
+            {
+                "cation": "cat2",
+                "anion": "an2",
+                "temperature_K": 308.15,
+                "self_diffusion_coefficient_10^-9*m^2/s_log10": -1.0,
+                "source_list": "ILThermo",
+            },
+        ],
+    )
+
+    summary = analyze_merged_properties(input_root, output_dir)
+
+    row = summary.iloc[0]
+    assert row["property"] == "self_diffusion_coefficient"
+    assert row["property_label"] == "self_diffusion_coefficient_10^-9*m^2/s_log10"
+    assert row["value_min"] == -2.0
+    assert row["value_max"] == -1.0
+
+
 def test_analyze_merged_properties_splits_wide_tables_by_value_column(tmp_path: Path):
     input_root = tmp_path / "merged"
     output_dir = input_root / "analysis"
@@ -311,6 +356,41 @@ def test_analyze_merged_properties_draws_single_condition_property_distribution(
         / "low"
         / "experiment_surface_tension_temperature_k_surface_tension_value.png"
     ).exists()
+
+
+def test_numeric_condition_dimensions_fill_missing_values_for_plotting():
+    df = pd.DataFrame(
+        {
+            "temperature_K": [None, 310.0, 320.0, 330.0],
+            "pressure_kPa": [101.0, None, 102.0, 103.0],
+            "frequency_MHz": [1.0, None, 0.0, 10.0],
+            "wavelength_nm": [589.0, None, 600.0, None],
+            "density_g/cm^3": [1.0, 1.1, 1.2, 1.3],
+        }
+    )
+    present = df["density_g/cm^3"].notna()
+
+    dimensions = {str(dimension["slug"]): dimension for dimension in numeric_condition_dimensions(df, present)}
+
+    assert dimensions["temperature_k"]["series"].isna().sum() == 0
+    assert dimensions["temperature_k"]["series"].iloc[0] == 298.15
+    assert dimensions["temperature_k"]["fill_note"] == "filled: temperature_K=1"
+
+    assert dimensions["pressure_kpa"]["series"].isna().sum() == 0
+    assert dimensions["pressure_kpa"]["series"].iloc[1] == 101.325
+    assert dimensions["pressure_kpa"]["fill_note"] == "filled: pressure_kPa=1"
+
+    frequency = dimensions["log10_frequency_mhz"]
+    assert frequency["series"].isna().sum() == 0
+    assert frequency["missing_tick"]["label"] == "Missing"
+    assert frequency["missing_tick"]["value"] < 0.0
+    assert frequency["fill_note"] == "missing bucket: frequency_MHz=2"
+
+    wavelength = dimensions["wavelength_nm"]
+    assert wavelength["series"].isna().sum() == 0
+    assert wavelength["missing_tick"]["label"] == "Missing"
+    assert wavelength["missing_tick"]["value"] < 589.0
+    assert wavelength["fill_note"] == "missing bucket: wavelength_nm=2"
 
 
 def test_system_frequency_uses_linear_x_axis(tmp_path: Path, monkeypatch):
