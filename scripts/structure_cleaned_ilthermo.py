@@ -18,6 +18,7 @@ from scripts.structure_raw_data import (  # noqa: E402
     ILTHERMO_SPECS,
     SYSTEM_COLUMNS,
     clean_smiles,
+    maybe_log10,
     ordered_frame,
     parse_phase,
     write_frame,
@@ -93,6 +94,12 @@ def cleaned_row(row: pd.Series, label_column: str) -> dict[str, object]:
     return output
 
 
+def transform_cleaned_label(value: object, property_slug: str) -> object:
+    if property_slug != "self_diffusion_coefficient":
+        return value
+    return maybe_log10(pd.to_numeric(value, errors="coerce"))
+
+
 def drop_liquid_only_phase(df: pd.DataFrame) -> pd.DataFrame:
     if "phase" not in df.columns:
         return df
@@ -110,7 +117,11 @@ def structure_cleaned_ilthermo_file(input_path: Path, output_path: Path, propert
     if "label" not in df.columns:
         raise ValueError(f"{input_path} missing required label column")
 
-    rows = [cleaned_row(csv_row, spec.label_column) for _, csv_row in df.iterrows()]
+    rows = []
+    for _, csv_row in df.iterrows():
+        csv_row = csv_row.copy()
+        csv_row["label"] = transform_cleaned_label(csv_row["label"], property_slug)
+        rows.append(cleaned_row(csv_row, spec.label_column))
     out = ordered_frame(rows, [spec.label_column]).drop_duplicates().reset_index(drop=True)
     out = drop_liquid_only_phase(out)
     return write_frame(out, output_path)
