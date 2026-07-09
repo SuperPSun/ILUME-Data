@@ -457,10 +457,10 @@ ILTHERMO_SPECS = {
         "self_diffusion_coefficient",
         "ilt_self_diffusion_coefficient_data.txt",
         "ilt_self_diffusion_coefficient_structured.csv",
-        "self_diffusion_coefficient_10^-9*m^2/s",
+        "self_diffusion_coefficient_10^-9*m^2/s_log10",
         r"Self diffusion coefficient",
         "10^-9*m^2/s",
-        by_unit({"10^-9*m^2/s": 1.0, "m^2/s": 1e9}),
+        lambda value, unit: maybe_log10(by_unit({"10^-9*m^2/s": 1.0, "m^2/s": 1e9})(value, unit)),
     ),
     "speed_of_sound": ILThermoSpec(
         "speed_of_sound",
