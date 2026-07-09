@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from itertools import combinations
 import math
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -13,6 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +62,8 @@ SUMMARY_COLUMNS = [
     "recommended_split",
     "recommended_test_systems",
 ]
+
+NUMERIC_CONDITION_COLUMNS = tuple(column for column in CONDITION_COLUMNS if column != "phase")
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,11 +133,11 @@ def analyze_value_column(
         unique_systems = 0
 
     if condition_columns:
-        condition_complete_rows = int(df[condition_columns].notna().all(axis=1).sum())
-        unique_condition_sets = int(df[condition_columns].drop_duplicates().shape[0])
+        condition_complete_rows = int(rows_with_values[condition_columns].notna().all(axis=1).sum())
+        unique_condition_sets = int(rows_with_values[condition_columns].drop_duplicates().shape[0])
         condition_column_text = "; ".join(condition_columns)
     else:
-        condition_complete_rows = int(len(df))
+        condition_complete_rows = int(present.sum())
         unique_condition_sets = 0
         condition_column_text = ""
 
@@ -146,7 +151,7 @@ def analyze_value_column(
     return {
         "bucket": bucket,
         "property": output_slug(value_column),
-        "property_label": output_slug(value_column),
+        "property_label": value_column,
         "output_file": output_file,
         "rows": int(len(df)),
         "data_points": int(present.sum()),
@@ -265,7 +270,8 @@ def format_count(value: object) -> str:
 
 def save_figure(fig: plt.Figure, path: Path, dpi: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
+    if not fig.get_constrained_layout():
+        fig.tight_layout()
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
@@ -438,17 +444,23 @@ def plot_property_figures(
     property_name = str(summary_row["property"])
     coverage = str(summary_row["coverage_group"])
     base_name = f"{bucket}_{property_name}"
-    values = pd.to_numeric(df[value_column], errors="coerce").dropna()
 
-    if not values.empty:
-        hist_path = unique_path(figures_dir / "value_histograms" / coverage / f"{base_name}.png", used_paths)
-        plot_value_histogram(values, summary_row, hist_path, dpi)
+    for figure_type, distribution_path in plot_property_distributions(
+        df,
+        value_column,
+        summary_row,
+        figures_dir,
+        base_name,
+        coverage,
+        used_paths,
+        dpi=dpi,
+    ):
         plot_record(
             plot_records,
-            figure_type="value_histogram",
+            figure_type=figure_type,
             bucket=bucket,
             property_name=property_name,
-            path=hist_path,
+            path=distribution_path,
             output_dir=output_dir,
             data_points=int(summary_row["data_points"]),
             unique_systems=int(summary_row["unique_systems"]),
@@ -471,41 +483,183 @@ def plot_property_figures(
             coverage=coverage,
         )
 
-    for condition_kind, condition_path in plot_condition_spaces(
-        df,
-        value_column,
-        summary_row,
-        figures_dir,
-        base_name,
-        used_paths,
-        dpi=dpi,
-        max_condition_scatter_points=max_condition_scatter_points,
-    ):
-        plot_record(
-            plot_records,
-            figure_type="condition_space",
-            bucket=bucket,
-            property_name=property_name,
-            path=condition_path,
-            output_dir=output_dir,
-            data_points=int(summary_row["data_points"]),
-            unique_systems=int(summary_row["unique_systems"]),
-            coverage=condition_kind,
-        )
+def axis_slug(label: str) -> str:
+    slug = label.lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", slug)
+    slug = re.sub(r"_+", "_", slug)
+    return slug.strip("_")
 
 
-def plot_value_histogram(values: pd.Series, summary_row: dict[str, object], output_path: Path, dpi: int) -> None:
+def smooth_counts(counts: np.ndarray) -> np.ndarray:
+    if len(counts) < 3:
+        return counts.astype(float)
+    window = min(5, len(counts))
+    kernel = np.ones(window, dtype=float) / window
+    return np.convolve(counts.astype(float), kernel, mode="same")
+
+
+def histogram_bin_count(values: pd.Series, *, max_bins: int = 40) -> int:
+    unique_values = int(values.nunique())
+    return min(max_bins, max(5, unique_values))
+
+
+def plot_histogram_with_density(
+    ax: plt.Axes,
+    values: pd.Series,
+    bins: int | np.ndarray,
+    *,
+    orientation: str,
+    color: str,
+) -> None:
+    counts, edges = np.histogram(values, bins=bins)
+    centers = (edges[:-1] + edges[1:]) / 2
+    widths = np.diff(edges)
+    smoothed = smooth_counts(counts)
+    if orientation == "horizontal":
+        ax.barh(edges[:-1], counts, height=widths, align="edge", color=color, alpha=0.75, edgecolor="white")
+        ax.plot(smoothed, centers, color="#222222", linewidth=1.2)
+    else:
+        ax.bar(edges[:-1], counts, width=widths, align="edge", color=color, alpha=0.75, edgecolor="white")
+        ax.plot(centers, smoothed, color="#222222", linewidth=1.2)
+
+
+def numeric_condition_dimensions(df: pd.DataFrame, present: pd.Series) -> list[dict[str, object]]:
+    dimensions: list[dict[str, object]] = []
+    for column in NUMERIC_CONDITION_COLUMNS:
+        if column not in df.columns:
+            continue
+        series = pd.to_numeric(df[column], errors="coerce")
+        label = column
+        slug = axis_slug(column)
+        if column == "frequency_MHz":
+            series = series.where(series > 0).map(lambda value: math.log10(value) if pd.notna(value) else pd.NA)
+            label = "log10 frequency_MHz"
+            slug = "log10_frequency_mhz"
+        if series.loc[present].notna().any():
+            dimensions.append({"label": label, "slug": slug, "series": series})
+    return dimensions
+
+
+def value_dimension(df: pd.DataFrame, value_column: str, summary_row: dict[str, object]) -> dict[str, object]:
+    property_name = str(summary_row["property"])
+    return {
+        "label": str(summary_row["property_label"]),
+        "slug": f"{axis_slug(property_name)}_value",
+        "series": pd.to_numeric(df[value_column], errors="coerce"),
+    }
+
+
+def plot_property_distributions(
+    df: pd.DataFrame,
+    value_column: str,
+    summary_row: dict[str, object],
+    figures_dir: Path,
+    base_name: str,
+    coverage: str,
+    used_paths: set[Path],
+    *,
+    dpi: int,
+) -> list[tuple[str, Path]]:
+    outputs: list[tuple[str, Path]] = []
+    value_dim = value_dimension(df, value_column, summary_row)
+    value_series = value_dim["series"]
+    present = value_series.notna()
+    if not present.any():
+        return outputs
+
+    condition_dims = numeric_condition_dimensions(df, present)
+    distribution_dir = figures_dir / "property_distributions" / coverage
+    if not condition_dims:
+        values = value_series.loc[present]
+        path = unique_path(distribution_dir / f"{base_name}_{value_dim['slug']}.png", used_paths)
+        plot_property_distribution_1d(values, value_dim, summary_row, path, dpi)
+        outputs.append(("property_distribution_1d", path))
+        return outputs
+
+    dimensions = [*condition_dims, value_dim]
+    for x_dim, y_dim in combinations(dimensions, 2):
+        plot_df = pd.DataFrame(
+            {
+                "x": x_dim["series"],
+                "y": y_dim["series"],
+                "value": value_series,
+            }
+        ).dropna()
+        if plot_df.empty:
+            continue
+        path = unique_path(distribution_dir / f"{base_name}_{x_dim['slug']}_{y_dim['slug']}.png", used_paths)
+        plot_property_distribution_2d(plot_df, x_dim, y_dim, summary_row, path, dpi)
+        outputs.append(("property_distribution_2d", path))
+    return outputs
+
+
+def plot_property_distribution_1d(
+    values: pd.Series,
+    value_dim: dict[str, object],
+    summary_row: dict[str, object],
+    output_path: Path,
+    dpi: int,
+) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    bins = min(40, max(5, int(values.nunique())))
-    ax.hist(values, bins=bins, color="#34699A", alpha=0.85, edgecolor="white")
+    bins = histogram_bin_count(values)
+    plot_histogram_with_density(ax, values, bins, orientation="vertical", color="#34699A")
     ax.set_title(
         f"{summary_row['bucket']}/{summary_row['property']} value distribution\n"
         f"n={format_count(summary_row['data_points'])}, systems={format_count(summary_row['unique_systems'])}, "
         f"split={summary_row['recommended_split']}"
     )
-    ax.set_xlabel(str(summary_row["property_label"]))
+    ax.set_xlabel(str(value_dim["label"]))
     ax.set_ylabel("Frequency")
     ax.grid(axis="y", alpha=0.25)
+    save_figure(fig, output_path, dpi)
+
+
+def plot_property_distribution_2d(
+    plot_df: pd.DataFrame,
+    x_dim: dict[str, object],
+    y_dim: dict[str, object],
+    summary_row: dict[str, object],
+    output_path: Path,
+    dpi: int,
+) -> None:
+    x_bins = histogram_bin_count(plot_df["x"], max_bins=60)
+    y_bins = histogram_bin_count(plot_df["y"], max_bins=60)
+    _, x_edges = np.histogram(plot_df["x"], bins=x_bins)
+    _, y_edges = np.histogram(plot_df["y"], bins=y_bins)
+
+    fig = plt.figure(figsize=(8, 7), constrained_layout=True)
+    grid = fig.add_gridspec(
+        2,
+        2,
+        width_ratios=(4, 1.25),
+        height_ratios=(1.25, 4),
+        hspace=0.08,
+        wspace=0.08,
+    )
+    ax_histx = fig.add_subplot(grid[0, 0])
+    ax_main = fig.add_subplot(grid[1, 0], sharex=ax_histx)
+    ax_histy = fig.add_subplot(grid[1, 1], sharey=ax_main)
+
+    hist = ax_main.hist2d(plot_df["x"], plot_df["y"], bins=[x_edges, y_edges], cmap="YlGnBu", cmin=1)
+    cbar = fig.colorbar(hist[3], ax=ax_main)
+    cbar.set_label("Frequency")
+
+    plot_histogram_with_density(ax_histx, plot_df["x"], x_edges, orientation="vertical", color="#34699A")
+    plot_histogram_with_density(ax_histy, plot_df["y"], y_edges, orientation="horizontal", color="#D9822B")
+    ax_histx.tick_params(axis="x", labelbottom=False)
+    ax_histy.tick_params(axis="y", labelleft=False)
+
+    ax_main.set_xlabel(str(x_dim["label"]))
+    ax_main.set_ylabel(str(y_dim["label"]))
+    ax_histx.set_ylabel("Frequency")
+    ax_histy.set_xlabel("Frequency")
+    ax_main.grid(alpha=0.2)
+    ax_histx.grid(axis="y", alpha=0.2)
+    ax_histy.grid(axis="x", alpha=0.2)
+    ax_histx.set_title(
+        f"{summary_row['bucket']}/{summary_row['property']} distribution: "
+        f"{x_dim['label']} vs {y_dim['label']}"
+    )
     save_figure(fig, output_path, dpi)
 
 
@@ -526,8 +680,6 @@ def plot_system_frequency(system_counts: pd.Series, summary_row: dict[str, objec
     else:
         bins = min(40, max_count)
     ax.hist(system_counts, bins=bins, color="#5F8D4E", alpha=0.85, edgecolor="white")
-    if max_count > 20:
-        ax.set_xscale("log")
     ax.set_title(
         f"{summary_row['bucket']}/{summary_row['property']} system frequency\n"
         f"max={summary_row['max_points_per_system']}, leakage={summary_row['leakage_risk']}"
