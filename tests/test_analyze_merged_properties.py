@@ -1,8 +1,9 @@
 from pathlib import Path
 
+import matplotlib.axes
 import pandas as pd
 
-from scripts.analyze_merged_properties import analyze_merged_properties
+from scripts.analyze_merged_properties import analyze_merged_properties, plot_system_frequency
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -144,22 +145,35 @@ def test_analyze_merged_properties_summarizes_regular_properties(tmp_path: Path)
     plot_manifest = pd.read_csv(output_dir / "plot_manifest.csv")
     assert {
         "coverage",
-        "value_histogram",
+        "property_distribution_2d",
         "system_frequency",
         "condition_availability",
-        "condition_space",
     }.issubset(set(plot_manifest["figure_type"]))
     assert (output_dir / "figures" / "coverage" / "property_coverage_all.png").exists()
     assert (output_dir / "figures" / "coverage" / "property_coverage_high.png").exists()
     assert (output_dir / "figures" / "coverage" / "property_coverage_medium.png").exists()
     assert (output_dir / "figures" / "coverage" / "property_coverage_low.png").exists()
-    assert (output_dir / "figures" / "value_histograms" / "high" / "experiment_density.png").exists()
+    assert (
+        output_dir
+        / "figures"
+        / "property_distributions"
+        / "high"
+        / "experiment_density_temperature_k_pressure_kpa.png"
+    ).exists()
+    assert (
+        plot_manifest["path"]
+        .str.contains("experiment_density_temperature_k_density_value.png")
+        .any()
+    )
+    assert (
+        plot_manifest["path"]
+        .str.contains("experiment_electrical_conductivity_log10_frequency_mhz_electrical_conductivity_value.png")
+        .any()
+    )
     assert (output_dir / "figures" / "system_frequency" / "high" / "experiment_density.png").exists()
     assert (
         output_dir / "figures" / "condition_availability" / "property_condition_availability_heatmap.png"
     ).exists()
-    assert (plot_manifest["path"].str.contains("experiment_density_temperature_pressure.png").any())
-    assert (plot_manifest["path"].str.contains("experiment_electrical_conductivity_temperature_frequency.png").any())
     report = (output_dir / "property_analysis_report.md").read_text()
     assert "Merged Property Analysis Report" in report
     assert "High Leakage Risk Properties" in report
@@ -242,6 +256,130 @@ def test_analyze_merged_properties_splits_wide_tables_by_value_column(tmp_path: 
     gap = summary[summary["property"].eq("gap")].iloc[0]
     assert gap["data_points"] == 2
     assert gap["unique_systems"] == 2
+
+    plot_manifest = pd.read_csv(output_dir / "plot_manifest.csv")
+    assert "property_distribution_1d" in set(plot_manifest["figure_type"])
+    assert (
+        output_dir / "figures" / "property_distributions" / "low" / "simulation_esp_max_esp_max_value.png"
+    ).exists()
+
+
+def test_analyze_merged_properties_draws_single_condition_property_distribution(tmp_path: Path):
+    input_root = tmp_path / "merged"
+    output_dir = input_root / "analysis"
+    write_csv(
+        input_root / "merged_manifest.csv",
+        [
+            {
+                "bucket": "experiment",
+                "property_label": "surface_tension_mN/m",
+                "output_file": "experiment/surface_tension.csv",
+                "input_files": "ILThermo/ilt_surface_tension_structured.csv",
+                "input_rows": 2,
+                "output_rows": 2,
+            }
+        ],
+    )
+    write_csv(
+        input_root / "experiment" / "surface_tension.csv",
+        [
+            {
+                "cation": "cat1",
+                "anion": "an1",
+                "temperature_K": 298.15,
+                "surface_tension_mN/m": 40.0,
+                "source_list": "ILThermo",
+            },
+            {
+                "cation": "cat2",
+                "anion": "an2",
+                "temperature_K": 308.15,
+                "surface_tension_mN/m": 35.0,
+                "source_list": "ILThermo",
+            },
+        ],
+    )
+
+    analyze_merged_properties(input_root, output_dir)
+
+    plot_manifest = pd.read_csv(output_dir / "plot_manifest.csv")
+    assert "property_distribution_2d" in set(plot_manifest["figure_type"])
+    assert (
+        output_dir
+        / "figures"
+        / "property_distributions"
+        / "low"
+        / "experiment_surface_tension_temperature_k_surface_tension_value.png"
+    ).exists()
+
+
+def test_system_frequency_uses_linear_x_axis(tmp_path: Path, monkeypatch):
+    xscale_calls: list[str] = []
+
+    def record_xscale(self, value, *args, **kwargs):
+        xscale_calls.append(value)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_xscale", record_xscale)
+
+    plot_system_frequency(
+        pd.Series([1, 2, 25]),
+        {
+            "bucket": "experiment",
+            "property": "density",
+            "max_points_per_system": 25,
+            "leakage_risk": "high",
+        },
+        tmp_path / "system_frequency.png",
+        dpi=80,
+    )
+
+    assert xscale_calls == []
+
+
+def test_analyze_merged_properties_counts_conditions_only_for_present_values(tmp_path: Path):
+    input_root = tmp_path / "merged"
+    output_dir = input_root / "analysis"
+    write_csv(
+        input_root / "merged_manifest.csv",
+        [
+            {
+                "bucket": "simulation",
+                "property_label": "simulated_QM_elec_HF",
+                "output_file": "simulation/simulated_qm_elec_hf.csv",
+                "input_files": "simulation/simulated_QM_elec_HF_structured.csv",
+                "input_rows": 2,
+                "output_rows": 2,
+            }
+        ],
+    )
+    write_csv(
+        input_root / "simulation" / "simulated_qm_elec_hf.csv",
+        [
+            {
+                "SMILES": "CCO",
+                "temperature_K": 298.15,
+                "pressure_kPa": 101.3,
+                "q_max": 1.0,
+                "q_min": -1.0,
+                "source_list": "simulation",
+            },
+            {
+                "SMILES": "CCN",
+                "temperature_K": 308.15,
+                "pressure_kPa": 101.3,
+                "q_max": None,
+                "q_min": -2.0,
+                "source_list": "simulation",
+            },
+        ],
+    )
+
+    summary = analyze_merged_properties(input_root, output_dir)
+
+    q_max = summary[summary["property"].eq("q_max")].iloc[0]
+    assert q_max["data_points"] == 1
+    assert q_max["condition_complete_rows"] == 1
+    assert q_max["unique_condition_sets"] == 1
 
 
 def test_analyze_merged_properties_recommends_grouped_cv_for_mid_sized_data(tmp_path: Path):
