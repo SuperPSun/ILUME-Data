@@ -202,6 +202,29 @@ def test_ilthermo_single_line_outputs_specific_label(tmp_path: Path):
     assert df.loc[0, "density_g/cm^3"] == 1.252
 
 
+def test_ilthermo_self_diffusion_is_log10_after_unit_conversion(tmp_path: Path):
+    input_path = tmp_path / "ilt_self_diffusion_coefficient_data.txt"
+    output_path = tmp_path / "ilt_self_diffusion_coefficient_structured.csv"
+    input_path.write_text(
+        "smiles:CC[n+]1ccn(C)c1.F[B-](F)(F)F Temperature, K:298.15 "
+        "Self diffusion coefficient, 10^-9*m^2/s => Liquid:0.01\n"
+        "smiles:CCC[n+]1ccn(C)c1.F[B-](F)(F)F Temperature, K:298.15 "
+        "Self diffusion coefficient, m^2/s => Liquid:1e-11\n",
+        encoding="utf-8",
+    )
+
+    df = structure_ilthermo_file(input_path, output_path, "self_diffusion_coefficient")
+
+    assert list(df.columns) == [
+        "cation",
+        "anion",
+        "temperature_K",
+        "phase",
+        "self_diffusion_coefficient_10^-9*m^2/s_log10",
+    ]
+    assert set(df["self_diffusion_coefficient_10^-9*m^2/s_log10"]) == {-2.0}
+
+
 def test_ilthermo_csv_preserves_standard_state_note(tmp_path: Path):
     input_path = tmp_path / "pure_compound_enthalpy.csv"
     output_path = tmp_path / "ilt_enthalpy_structured.csv"
@@ -335,6 +358,34 @@ def test_structure_cleaned_ilthermo_file_renames_label_and_drops_intermediate_co
     assert df.loc[0, "density_g/cm^3"] == 1.252
     for column in ["property_name", "property_unit", "property_value", "standard unit", "parse_error", "source_text"]:
         assert column not in df.columns
+
+
+def test_structure_cleaned_ilthermo_file_log_transforms_self_diffusion(tmp_path: Path):
+    from scripts.structure_cleaned_ilthermo import structure_cleaned_ilthermo_file
+
+    input_path = tmp_path / "ilt_self_diffusion_coefficient_structured.csv"
+    output_path = tmp_path / "out" / "ilt_self_diffusion_coefficient_structured.csv"
+    pd.DataFrame(
+        {
+            "cation": ["CC[n+]1ccn(C)c1"],
+            "anion": ["F[B-](F)(F)F"],
+            "temperature_K": [298.15],
+            "pressure_kPa": [101.325],
+            "label": [0.01],
+            "standard unit": ["10^-9*m^2/s"],
+        }
+    ).to_csv(input_path, index=False)
+
+    df = structure_cleaned_ilthermo_file(input_path, output_path, "self_diffusion_coefficient")
+
+    assert list(df.columns) == [
+        "cation",
+        "anion",
+        "temperature_K",
+        "pressure_kPa",
+        "self_diffusion_coefficient_10^-9*m^2/s_log10",
+    ]
+    assert df.loc[0, "self_diffusion_coefficient_10^-9*m^2/s_log10"] == -2.0
 
 
 def test_structure_cleaned_ilthermo_file_extracts_energetics_phase_from_note_and_source_text(tmp_path: Path):
