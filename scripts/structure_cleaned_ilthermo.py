@@ -118,6 +118,8 @@ def structure_cleaned_ilthermo_file(input_path: Path, output_path: Path, propert
         raise ValueError(f"{input_path} missing required label column")
     if property_slug == "electrical_conductivity" and "frequency_MHz" in df.columns:
         df = df[df["frequency_MHz"].isna()]
+    if property_slug == "speed_of_sound" and "frequency_MHz" in df.columns:
+        df = df.drop(columns=["frequency_MHz"])
 
     rows = []
     for _, csv_row in df.iterrows():
