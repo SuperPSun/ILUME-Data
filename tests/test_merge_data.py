@@ -77,6 +77,34 @@ def test_refractive_index_missing_wavelength_defaults_to_sodium_d_line(tmp_path:
     assert out["wavelength_nm"].isna().sum() == 0
 
 
+def test_relative_permittivity_labels_merge_into_static_and_dynamic_files(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    base = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+        "pressure_kPa": 101.325,
+    }
+    write_csv(
+        input_root / "ILThermo" / "ilt_static_relative_permittivity_structured.csv",
+        [{**base, "static_relative_permittivity_unitless": 12.0}],
+    )
+    write_csv(
+        input_root / "ILThermo" / "ilt_dynamic_relative_permittivity_structured.csv",
+        [{**base, "frequency_MHz": 10.0, "dynamic_relative_permittivity_unitless": 8.0}],
+    )
+
+    merge_data(input_root, output_root)
+
+    static = pd.read_csv(output_root / "experiment" / "static_relative_permittivity.csv")
+    dynamic = pd.read_csv(output_root / "experiment" / "dynamic_relative_permittivity.csv")
+    assert "frequency_MHz" not in static.columns
+    assert static.loc[0, "static_relative_permittivity_unitless"] == 12.0
+    assert dynamic.loc[0, "frequency_MHz"] == 10.0
+    assert dynamic.loc[0, "dynamic_relative_permittivity_unitless"] == 8.0
+
+
 def test_simulation_stays_separate_from_experiment_for_same_property(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"

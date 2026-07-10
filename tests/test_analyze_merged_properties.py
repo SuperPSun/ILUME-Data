@@ -411,7 +411,7 @@ def test_normalized_property_violin_uses_experiment_and_simulation_subplots(tmp_
     assert not axes[0].get_shared_x_axes().joined(axes[0], axes[1])
 
 
-def test_numeric_condition_dimensions_fill_missing_values_for_plotting():
+def test_numeric_condition_dimensions_only_fill_temperature_and_pressure_for_plotting():
     df = pd.DataFrame(
         {
             "temperature_K": [None, 310.0, 320.0, 330.0],
@@ -434,16 +434,14 @@ def test_numeric_condition_dimensions_fill_missing_values_for_plotting():
     assert dimensions["pressure_kpa"]["fill_note"] == "filled: pressure_kPa=1"
 
     frequency = dimensions["log10_frequency_mhz"]
-    assert frequency["series"].isna().sum() == 0
-    assert frequency["missing_tick"]["label"] == "NaN"
-    assert frequency["missing_tick"]["value"] < 0.0
-    assert frequency["fill_note"] == "missing bucket: frequency_MHz=2"
+    assert frequency["series"].isna().sum() == 2
+    assert "missing_tick" not in frequency
+    assert "fill_note" not in frequency
 
     wavelength = dimensions["wavelength_nm"]
-    assert wavelength["series"].isna().sum() == 0
-    assert wavelength["missing_tick"]["label"] == "NaN"
-    assert wavelength["missing_tick"]["value"] < 589.0
-    assert wavelength["fill_note"] == "missing bucket: wavelength_nm=2"
+    assert wavelength["series"].isna().sum() == 2
+    assert "missing_tick" not in wavelength
+    assert "fill_note" not in wavelength
 
 
 def test_system_frequency_uses_linear_x_axis(tmp_path: Path, monkeypatch):

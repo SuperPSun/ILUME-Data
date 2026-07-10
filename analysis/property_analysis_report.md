@@ -2,11 +2,11 @@
 
 ## Global Summary
 
-- Analyzed properties: 49
+- Analyzed properties: 50
 - Total data points across analyzed properties: 1913874
-- Sum of property-level unique systems: 1617397
+- Sum of property-level unique systems: 1617417
 - Properties recommended for system holdout test: 43
-- Properties recommended for grouped CV: 6
+- Properties recommended for grouped CV: 7
 - Properties recommended for leave-one-system-out or descriptive analysis: 0
 
 ## Largest Properties
@@ -17,14 +17,14 @@
 | experiment | density | 98517 | 6206 | system_holdout_test |
 | experiment | viscosity | 45804 | 2750 | system_holdout_test |
 | experiment | solvation | 44400 | 3611 | system_holdout_test |
-| simulation | gap | 28213 | 27275 | system_holdout_test |
 | simulation | esp_min | 28213 | 27275 | system_holdout_test |
-| simulation | esp_abs_mean | 28213 | 27275 | system_holdout_test |
+| simulation | gap | 28213 | 27275 | system_holdout_test |
 | simulation | esp_std | 28213 | 27275 | system_holdout_test |
+| simulation | esp_abs_mean | 28213 | 27275 | system_holdout_test |
 | simulation | esp_max | 28213 | 27275 | system_holdout_test |
 | simulation | q_max | 28212 | 27274 | system_holdout_test |
+| simulation | q_std | 28212 | 27274 | system_holdout_test |
 | simulation | q_abs_mean | 28212 | 27274 | system_holdout_test |
-| simulation | quadrupole | 28212 | 27274 | system_holdout_test |
 
 ## High Leakage Risk Properties
 
@@ -32,6 +32,7 @@ These properties should not be split by random rows because repeated systems can
 
 | bucket | property | unique_systems | multi_point_system_ratio | max_points_per_system |
 | --- | --- | --- | --- | --- |
+| experiment | dynamic_relative_permittivity | 49 | 1.0 | 18 |
 | simulation | heat_of_vaporization | 13441 | 0.9965032363663417 | 2 |
 | simulation | density | 12554 | 0.9949816791460889 | 9 |
 | experiment | x_co2 | 124 | 0.9919354838709677 | 671 |
@@ -43,7 +44,6 @@ These properties should not be split by random rows because repeated systems can
 | experiment | electrical_conductivity | 705 | 0.8042553191489362 | 319 |
 | experiment | density | 6206 | 0.7982597486303578 | 1844 |
 | experiment | refractive_index | 754 | 0.7970822281167109 | 237 |
-| experiment | solvation | 3611 | 0.7507615618942122 | 32 |
 
 ## System Holdout Test Candidates
 
@@ -68,7 +68,8 @@ These properties should not be split by random rows because repeated systems can
 | --- | --- | --- | --- |
 | experiment | isobaric_coefficient_of_volume_expansion | 25 | 894 |
 | experiment | self_diffusion_coefficient | 36 | 382 |
-| experiment | relative_permittivity | 73 | 947 |
+| experiment | static_relative_permittivity | 44 | 65 |
+| experiment | dynamic_relative_permittivity | 49 | 882 |
 | experiment | equilibrium_pressure | 95 | 2029 |
 | experiment | thermal_conductivity | 112 | 1597 |
 | experiment | x_co2 | 124 | 9683 |
@@ -82,9 +83,9 @@ None.
 - condition_availability: 1
 - coverage: 4
 - normalized_property_violin: 1
-- property_distribution_1d: 49
-- property_distribution_2d: 50
-- system_frequency: 49
+- property_distribution_1d: 50
+- property_distribution_2d: 53
+- system_frequency: 50
 
 Key summary figures:
 - `figures/coverage/property_coverage_all.png`

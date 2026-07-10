@@ -504,6 +504,52 @@ def test_structure_cleaned_ilthermo_file_drops_speed_of_sound_frequency_conditio
     assert df["speed_of_sound_m/s"].tolist() == [1200.0, 1180.0]
 
 
+def test_structure_cleaned_ilthermo_splits_static_and_dynamic_relative_permittivity(tmp_path: Path):
+    from scripts.structure_cleaned_ilthermo import structure_cleaned_ilthermo
+
+    input_dir = tmp_path / "cleaned" / "ilt"
+    output_dir = tmp_path / "cleaned" / "ILThermo"
+    input_dir.mkdir(parents=True)
+    legacy_path = output_dir / "ilt_relative_permittivity_structured.csv"
+    output_dir.mkdir(parents=True)
+    pd.DataFrame({"legacy": [True]}).to_csv(legacy_path, index=False)
+    pd.DataFrame(
+        {
+            "cation": ["C", "CC", "CCC", "CCCC"],
+            "anion": ["[Cl-]", "[Br-]", "[F-]", "[I-]"],
+            "temperature_K": [298.15, 298.15, 298.15, 298.15],
+            "pressure_kPa": [101.325, 101.325, 101.325, 101.325],
+            "frequency_MHz": [0.0, None, 10.0, 100.0],
+            "label": [20.0, 21.0, 22.0, 23.0],
+        }
+    ).to_csv(input_dir / "ilt_relative_permittivity_structured.csv", index=False)
+
+    structure_cleaned_ilthermo(input_dir, output_dir)
+
+    static = pd.read_csv(output_dir / "ilt_static_relative_permittivity_structured.csv")
+    dynamic = pd.read_csv(output_dir / "ilt_dynamic_relative_permittivity_structured.csv")
+    assert list(static.columns) == [
+        "cation",
+        "anion",
+        "temperature_K",
+        "pressure_kPa",
+        "static_relative_permittivity_unitless",
+    ]
+    assert static["static_relative_permittivity_unitless"].tolist() == [20.0, 21.0]
+    assert "frequency_MHz" not in static.columns
+    assert list(dynamic.columns) == [
+        "cation",
+        "anion",
+        "temperature_K",
+        "pressure_kPa",
+        "frequency_MHz",
+        "dynamic_relative_permittivity_unitless",
+    ]
+    assert dynamic["frequency_MHz"].tolist() == [10.0, 100.0]
+    assert dynamic["dynamic_relative_permittivity_unitless"].tolist() == [22.0, 23.0]
+    assert not legacy_path.exists()
+
+
 def test_structure_cleaned_ilthermo_directory_cli(tmp_path: Path):
     import subprocess
     import sys

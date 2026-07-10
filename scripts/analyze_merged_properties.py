@@ -68,7 +68,6 @@ PLOTTING_CONDITION_DEFAULTS = {
     "temperature_K": 298.15,
     "pressure_kPa": 101.325,
 }
-MISSING_BUCKET_CONDITION_COLUMNS = {"frequency_MHz", "wavelength_nm"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -596,14 +595,6 @@ def plot_histogram_with_density(
         ax.plot(centers, smoothed, color="#222222", linewidth=1.2)
 
 
-def missing_bucket_value(observed: pd.Series) -> float:
-    minimum = float(observed.min())
-    maximum = float(observed.max())
-    span = maximum - minimum
-    offset = max(span * 0.05, abs(minimum) * 0.05, 0.1)
-    return minimum - offset
-
-
 def numeric_condition_dimensions(df: pd.DataFrame, present: pd.Series) -> list[dict[str, object]]:
     dimensions: list[dict[str, object]] = []
     for column in NUMERIC_CONDITION_COLUMNS:
@@ -619,29 +610,17 @@ def numeric_condition_dimensions(df: pd.DataFrame, present: pd.Series) -> list[d
             slug = "log10_frequency_mhz"
 
         fill_note = ""
-        missing_tick: dict[str, object] | None = None
         missing_mask = present & series.isna()
         missing_count = int(missing_mask.sum())
         if column in PLOTTING_CONDITION_DEFAULTS and missing_count:
             series = series.copy()
             series.loc[missing_mask] = PLOTTING_CONDITION_DEFAULTS[column]
             fill_note = f"filled: {column}={missing_count}"
-        elif column in MISSING_BUCKET_CONDITION_COLUMNS and missing_count:
-            observed = series.loc[present & series.notna()]
-            if observed.empty:
-                continue
-            sentinel = missing_bucket_value(observed)
-            series = series.copy()
-            series.loc[missing_mask] = sentinel
-            fill_note = f"missing bucket: {column}={missing_count}"
-            missing_tick = {"value": sentinel, "label": "NaN"}
 
         if series.loc[present].notna().any():
             dimension: dict[str, object] = {"label": label, "slug": slug, "series": series}
             if fill_note:
                 dimension["fill_note"] = fill_note
-            if missing_tick is not None:
-                dimension["missing_tick"] = missing_tick
             dimensions.append(dimension)
     return dimensions
 
@@ -783,33 +762,6 @@ def plot_normalized_property_violin(
     save_figure(fig, output_path, dpi)
 
 
-def apply_missing_tick(ax: plt.Axes, axis: str, dimension: dict[str, object]) -> None:
-    missing_tick = dimension.get("missing_tick")
-    if not missing_tick:
-        return
-    value = float(missing_tick["value"])
-    ticks = list(ax.get_xticks() if axis == "x" else ax.get_yticks())
-    if not any(np.isclose(tick, value) for tick in ticks):
-        ticks.append(value)
-    ticks = sorted(ticks)
-    labels = [str(missing_tick["label"]) if np.isclose(tick, value) else f"{tick:g}" for tick in ticks]
-    if axis == "x":
-        ax.set_xticks(ticks)
-        ax.set_xticklabels(labels)
-    else:
-        ax.set_yticks(ticks)
-        ax.set_yticklabels(labels)
-
-
-def fill_notes_for_dimensions(*dimensions: dict[str, object]) -> list[str]:
-    notes: list[str] = []
-    for dimension in dimensions:
-        note = dimension.get("fill_note")
-        if note and str(note) not in notes:
-            notes.append(str(note))
-    return notes
-
-
 def plot_property_distribution_2d(
     plot_df: pd.DataFrame,
     x_dim: dict[str, object],
@@ -852,15 +804,10 @@ def plot_property_distribution_2d(
     ax_main.grid(alpha=0.2)
     ax_histx.grid(axis="y", alpha=0.2)
     ax_histy.grid(axis="x", alpha=0.2)
-    apply_missing_tick(ax_main, "x", x_dim)
-    apply_missing_tick(ax_main, "y", y_dim)
     title = (
         f"{summary_row['bucket']}/{summary_row['property']} distribution: "
         f"{x_dim['label']} vs {y_dim['label']}"
     )
-    notes = fill_notes_for_dimensions(x_dim, y_dim)
-    if notes:
-        title = f"{title}\n{'; '.join(notes)}"
     ax_histx.set_title(title)
     save_figure(fig, output_path, dpi)
 

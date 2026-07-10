@@ -36,6 +36,10 @@ DISCARDED_COLUMNS = {
     "note",
     "source_text",
 }
+STATIC_RELATIVE_PERMITTIVITY_LABEL = "static_relative_permittivity_unitless"
+DYNAMIC_RELATIVE_PERMITTIVITY_LABEL = "dynamic_relative_permittivity_unitless"
+STATIC_RELATIVE_PERMITTIVITY_OUTPUT = "ilt_static_relative_permittivity_structured.csv"
+DYNAMIC_RELATIVE_PERMITTIVITY_OUTPUT = "ilt_dynamic_relative_permittivity_structured.csv"
 
 
 def clean_text(value: object) -> str:
@@ -111,30 +115,73 @@ def drop_liquid_only_phase(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def structure_cleaned_ilthermo_file(input_path: Path, output_path: Path, property_slug: str) -> pd.DataFrame:
+def structure_cleaned_ilthermo_frame(
+    df: pd.DataFrame,
+    property_slug: str,
+    label_column: str | None = None,
+) -> pd.DataFrame:
     spec = ILTHERMO_SPECS[property_slug]
-    df = pd.read_csv(input_path)
     if "label" not in df.columns:
-        raise ValueError(f"{input_path} missing required label column")
+        raise ValueError("missing required label column")
     if property_slug == "electrical_conductivity" and "frequency_MHz" in df.columns:
         df = df[df["frequency_MHz"].isna()]
     if property_slug == "speed_of_sound" and "frequency_MHz" in df.columns:
         df = df.drop(columns=["frequency_MHz"])
 
+    output_label = label_column or spec.label_column
     rows = []
     for _, csv_row in df.iterrows():
         csv_row = csv_row.copy()
         csv_row["label"] = transform_cleaned_label(csv_row["label"], property_slug)
-        rows.append(cleaned_row(csv_row, spec.label_column))
-    out = ordered_frame(rows, [spec.label_column]).drop_duplicates().reset_index(drop=True)
+        rows.append(cleaned_row(csv_row, output_label))
+    out = ordered_frame(rows, [output_label]).drop_duplicates().reset_index(drop=True)
     out = drop_liquid_only_phase(out)
+    return out
+
+
+def structure_cleaned_ilthermo_file(input_path: Path, output_path: Path, property_slug: str) -> pd.DataFrame:
+    df = pd.read_csv(input_path)
+    try:
+        out = structure_cleaned_ilthermo_frame(df, property_slug)
+    except ValueError as exc:
+        if str(exc) == "missing required label column":
+            raise ValueError(f"{input_path} missing required label column") from exc
+        raise
     return write_frame(out, output_path)
+
+
+def structure_relative_permittivity_files(input_path: Path, output_dir: Path) -> None:
+    df = pd.read_csv(input_path)
+    if "frequency_MHz" in df.columns:
+        frequencies = pd.to_numeric(df["frequency_MHz"], errors="coerce")
+        static_mask = frequencies.isna() | frequencies.eq(0)
+    else:
+        static_mask = pd.Series(True, index=df.index)
+
+    static_input = df.loc[static_mask].drop(columns=["frequency_MHz"], errors="ignore")
+    dynamic_input = df.loc[~static_mask].copy()
+    static = structure_cleaned_ilthermo_frame(
+        static_input,
+        "relative_permittivity",
+        STATIC_RELATIVE_PERMITTIVITY_LABEL,
+    )
+    dynamic = structure_cleaned_ilthermo_frame(
+        dynamic_input,
+        "relative_permittivity",
+        DYNAMIC_RELATIVE_PERMITTIVITY_LABEL,
+    )
+    write_frame(static, output_dir / STATIC_RELATIVE_PERMITTIVITY_OUTPUT)
+    write_frame(dynamic, output_dir / DYNAMIC_RELATIVE_PERMITTIVITY_OUTPUT)
 
 
 def structure_cleaned_ilthermo(input_dir: Path, output_dir: Path) -> None:
     for slug, spec in ILTHERMO_SPECS.items():
         input_path = input_dir / spec.output_name
         if not input_path.exists():
+            continue
+        if slug == "relative_permittivity":
+            structure_relative_permittivity_files(input_path, output_dir)
+            (output_dir / spec.output_name).unlink(missing_ok=True)
             continue
         structure_cleaned_ilthermo_file(input_path, output_dir / spec.output_name, slug)
 
