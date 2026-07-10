@@ -481,6 +481,29 @@ def test_structure_cleaned_ilthermo_file_drops_frequency_conditioned_electrical_
     assert df.loc[0, "electrical_conductivity_S/m_log10"] == 2.160168
 
 
+def test_structure_cleaned_ilthermo_file_drops_speed_of_sound_frequency_condition(tmp_path: Path):
+    from scripts.structure_cleaned_ilthermo import structure_cleaned_ilthermo_file
+
+    input_path = tmp_path / "ilt_speed_of_sound_structured.csv"
+    output_path = tmp_path / "out" / "ilt_speed_of_sound_structured.csv"
+    pd.DataFrame(
+        {
+            "cation": ["CC[n+]1ccn(C)c1", "CC[n+]1ccn(C)c1"],
+            "anion": ["F[B-](F)(F)F", "F[B-](F)(F)F"],
+            "temperature_K": [298.15, 308.15],
+            "frequency_MHz": [0.001, None],
+            "label": [1200.0, 1180.0],
+            "standard unit": ["m/s", "m/s"],
+        }
+    ).to_csv(input_path, index=False)
+
+    df = structure_cleaned_ilthermo_file(input_path, output_path, "speed_of_sound")
+
+    assert list(df.columns) == ["cation", "anion", "temperature_K", "speed_of_sound_m/s"]
+    assert len(df) == 2
+    assert df["speed_of_sound_m/s"].tolist() == [1200.0, 1180.0]
+
+
 def test_structure_cleaned_ilthermo_directory_cli(tmp_path: Path):
     import subprocess
     import sys
