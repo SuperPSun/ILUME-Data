@@ -4,3 +4,5 @@ __pycache__/
 
 data/
 trash/
+analysis/figures/property_*/
+analysis/figures/system_frequency/
