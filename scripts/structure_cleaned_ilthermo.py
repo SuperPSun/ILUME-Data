@@ -116,6 +116,8 @@ def structure_cleaned_ilthermo_file(input_path: Path, output_path: Path, propert
     df = pd.read_csv(input_path)
     if "label" not in df.columns:
         raise ValueError(f"{input_path} missing required label column")
+    if property_slug == "electrical_conductivity" and "frequency_MHz" in df.columns:
+        df = df[df["frequency_MHz"].isna()]
 
     rows = []
     for _, csv_row in df.iterrows():
