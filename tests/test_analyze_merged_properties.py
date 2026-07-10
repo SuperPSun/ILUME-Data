@@ -382,13 +382,13 @@ def test_numeric_condition_dimensions_fill_missing_values_for_plotting():
 
     frequency = dimensions["log10_frequency_mhz"]
     assert frequency["series"].isna().sum() == 0
-    assert frequency["missing_tick"]["label"] == "Missing"
+    assert frequency["missing_tick"]["label"] == "NaN"
     assert frequency["missing_tick"]["value"] < 0.0
     assert frequency["fill_note"] == "missing bucket: frequency_MHz=2"
 
     wavelength = dimensions["wavelength_nm"]
     assert wavelength["series"].isna().sum() == 0
-    assert wavelength["missing_tick"]["label"] == "Missing"
+    assert wavelength["missing_tick"]["label"] == "NaN"
     assert wavelength["missing_tick"]["value"] < 589.0
     assert wavelength["fill_note"] == "missing bucket: wavelength_nm=2"
 
