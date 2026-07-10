@@ -186,9 +186,10 @@ def analyze_value_column(
     }
 
 
-def analyze_merged_properties(
+def analyze_property_manifest(
     input_root: Path,
     output_dir: Path,
+    manifest: pd.DataFrame,
     *,
     min_holdout_systems: int = 200,
     test_fraction: float = 0.1,
@@ -200,12 +201,8 @@ def analyze_merged_properties(
 ) -> pd.DataFrame:
     input_root = Path(input_root)
     output_dir = Path(output_dir)
-    manifest_path = input_root / "merged_manifest.csv"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Missing merged manifest: {manifest_path}")
 
     rows: list[dict[str, object]] = []
-    manifest = pd.read_csv(manifest_path)
     for manifest_row in manifest.itertuples(index=False):
         output_file = str(manifest_row.output_file)
         property_label = str(manifest_row.property_label)
@@ -245,6 +242,36 @@ def analyze_merged_properties(
         plot_manifest.to_csv(output_dir / "plot_manifest.csv", index=False)
     write_markdown_report(summary, output_dir / "property_analysis_report.md", plot_manifest)
     return summary
+
+
+def analyze_merged_properties(
+    input_root: Path,
+    output_dir: Path,
+    *,
+    min_holdout_systems: int = 200,
+    test_fraction: float = 0.1,
+    dpi: int = 300,
+    high_coverage_threshold: int = 20000,
+    medium_coverage_threshold: int = 2000,
+    max_condition_scatter_points: int = 50000,
+    skip_plots: bool = False,
+) -> pd.DataFrame:
+    input_root = Path(input_root)
+    manifest_path = input_root / "merged_manifest.csv"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing merged manifest: {manifest_path}")
+    return analyze_property_manifest(
+        input_root,
+        output_dir,
+        pd.read_csv(manifest_path),
+        min_holdout_systems=min_holdout_systems,
+        test_fraction=test_fraction,
+        dpi=dpi,
+        high_coverage_threshold=high_coverage_threshold,
+        medium_coverage_threshold=medium_coverage_threshold,
+        max_condition_scatter_points=max_condition_scatter_points,
+        skip_plots=skip_plots,
+    )
 
 
 def clean_plot_outputs(output_dir: Path) -> None:
@@ -360,6 +387,10 @@ def generate_plots(
         )
 
     availability_rows: list[dict[str, object]] = []
+    normalized_values: dict[str, dict[str, pd.Series]] = {
+        "experiment": {},
+        "simulation": {},
+    }
     summary_by_key = {
         (str(row.output_file), str(row.property_label)): row._asdict()
         for row in summary.itertuples(index=False)
@@ -385,7 +416,33 @@ def generate_plots(
                 dpi=dpi,
                 max_condition_scatter_points=max_condition_scatter_points,
             )
+            normalized = normalize_property_values(df[value_column])
+            if not normalized.empty:
+                bucket = str(summary_row["bucket"])
+                bucket_values = normalized_values.setdefault(bucket, {})
+                normalized_label = f"{bucket}/{summary_row['property']}"
+                if normalized_label in bucket_values:
+                    normalized_label = f"{normalized_label} ({Path(output_file).stem})"
+                bucket_values[normalized_label] = normalized
             availability_rows.append(condition_availability_row(df, value_column, summary_row))
+
+    violin_path = figures_dir / "normalized_distributions" / "property_normalized_violin.png"
+    plot_normalized_property_violin(normalized_values, violin_path, dpi)
+    plot_record(
+        plot_records,
+        figure_type="normalized_property_violin",
+        bucket="all",
+        property_name="normalized_properties",
+        path=violin_path,
+        output_dir=output_dir,
+        data_points=sum(
+            len(values)
+            for bucket_values in normalized_values.values()
+            for values in bucket_values.values()
+        ),
+        unique_systems=int(summary["unique_systems"].sum()) if not summary.empty else 0,
+        coverage="all",
+    )
 
     heatmap_path = figures_dir / "condition_availability" / "property_condition_availability_heatmap.png"
     plot_condition_availability(availability_rows, heatmap_path, dpi)
@@ -508,6 +565,17 @@ def histogram_bin_count(values: pd.Series, *, max_bins: int = 40) -> int:
     return min(max_bins, max(5, unique_values))
 
 
+def normalize_property_values(values: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if numeric.empty:
+        return numeric.astype(float)
+    minimum = float(numeric.min())
+    maximum = float(numeric.max())
+    if maximum == minimum:
+        return pd.Series(0.5, index=numeric.index, dtype=float)
+    return (numeric - minimum) / (maximum - minimum)
+
+
 def plot_histogram_with_density(
     ax: plt.Axes,
     values: pd.Series,
@@ -606,12 +674,13 @@ def plot_property_distributions(
         return outputs
 
     condition_dims = numeric_condition_dimensions(df, present)
-    distribution_dir = figures_dir / "property_distributions" / coverage
+    distribution_1d_dir = figures_dir / "property_distributions_1d" / coverage
+    distribution_2d_dir = figures_dir / "property_distributions_2d" / coverage
+    values = value_series.loc[present]
+    path = unique_path(distribution_1d_dir / f"{base_name}_{value_dim['slug']}.png", used_paths)
+    plot_property_distribution_1d(values, value_dim, summary_row, path, dpi)
+    outputs.append(("property_distribution_1d", path))
     if not condition_dims:
-        values = value_series.loc[present]
-        path = unique_path(distribution_dir / f"{base_name}_{value_dim['slug']}.png", used_paths)
-        plot_property_distribution_1d(values, value_dim, summary_row, path, dpi)
-        outputs.append(("property_distribution_1d", path))
         return outputs
 
     dimensions = [*condition_dims, value_dim]
@@ -625,7 +694,7 @@ def plot_property_distributions(
         ).dropna()
         if plot_df.empty:
             continue
-        path = unique_path(distribution_dir / f"{base_name}_{x_dim['slug']}_{y_dim['slug']}.png", used_paths)
+        path = unique_path(distribution_2d_dir / f"{base_name}_{x_dim['slug']}_{y_dim['slug']}.png", used_paths)
         plot_property_distribution_2d(plot_df, x_dim, y_dim, summary_row, path, dpi)
         outputs.append(("property_distribution_2d", path))
     return outputs
@@ -649,6 +718,68 @@ def plot_property_distribution_1d(
     ax.set_xlabel(str(value_dim["label"]))
     ax.set_ylabel("Frequency")
     ax.grid(axis="y", alpha=0.25)
+    save_figure(fig, output_path, dpi)
+
+
+def plot_normalized_property_violin(
+    normalized_values: dict[str, dict[str, pd.Series]],
+    output_path: Path,
+    dpi: int,
+) -> None:
+    buckets = ("experiment", "simulation")
+    max_properties = max((len(normalized_values.get(bucket, {})) for bucket in buckets), default=1)
+    fig_width = max(16, min(60, 0.5 * max_properties))
+    fig, axes = plt.subplots(2, 1, figsize=(fig_width, 16), squeeze=False)
+
+    for index, bucket in enumerate(buckets):
+        ax = axes[index, 0]
+        bucket_values = normalized_values.get(bucket, {})
+        labels = list(bucket_values)
+        if not labels:
+            ax.text(0.5, 0.5, "No properties to plot", ha="center", va="center", transform=ax.transAxes)
+            ax.set_ylim(0, 1)
+            ax.set_title(bucket.capitalize())
+            continue
+
+        variable_positions: list[int] = []
+        variable_values: list[np.ndarray] = []
+        constant_positions: list[int] = []
+        constant_values: list[float] = []
+        for position, label in enumerate(labels, start=1):
+            values = bucket_values[label].to_numpy(dtype=float)
+            if len(np.unique(values)) > 1:
+                variable_positions.append(position)
+                variable_values.append(values)
+            else:
+                constant_positions.append(position)
+                constant_values.append(float(values[0]))
+
+        if variable_values:
+            parts = ax.violinplot(
+                variable_values,
+                positions=variable_positions,
+                showmeans=False,
+                showmedians=True,
+                showextrema=False,
+            )
+            for body in parts["bodies"]:
+                body.set_facecolor("#34699A")
+                body.set_edgecolor("#1F3F5B")
+                body.set_alpha(0.7)
+            parts["cmedians"].set_color("#222222")
+
+        if constant_positions:
+            ax.scatter(constant_positions, constant_values, color="#D9822B", s=18, zorder=3)
+
+        ax.set_xticks(range(1, len(labels) + 1))
+        ax.set_xticklabels(labels, rotation=70, ha="right", fontsize=8)
+        ax.set_ylim(0, 1)
+        ax.set_title(bucket.capitalize())
+        ax.set_xlabel("Property")
+        ax.set_ylabel("Min-Max normalized value")
+        ax.grid(axis="y", alpha=0.25)
+
+    fig.suptitle("Normalized Property Distributions")
     save_figure(fig, output_path, dpi)
 
 
@@ -939,6 +1070,7 @@ def write_markdown_report(summary: pd.DataFrame, output_path: Path, plot_manifes
                 "Key summary figures:",
                 "- `figures/coverage/property_coverage_all.png`",
                 "- `figures/condition_availability/property_condition_availability_heatmap.png`",
+                "- `figures/normalized_distributions/property_normalized_violin.png`",
             ]
         )
     output_path.write_text("\n".join(lines))
