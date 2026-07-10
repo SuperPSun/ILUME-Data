@@ -21,6 +21,7 @@ WIDE_TABLE_FILES = {"simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF
 PROPERTY_OUTPUT_SLUGS = {"pressure_kPa_log10": "equilibrium_pressure"}
 SOURCE_COLUMNS = {"source", "source_file"}
 MISSING_TOKEN = "__ILUME_MISSING_CONDITION__"
+DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM = 589.0
 UNIT_SUFFIXES = (
     "_10^-9*m^2/s",
     "_J/mol/K",
@@ -252,6 +253,13 @@ def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list
                 property_df = df.loc[df[label].notna(), [*keep_columns, label]].copy()
                 if property_df.empty:
                     continue
+                if label == "refractive_index_unitless":
+                    if "wavelength_nm" not in property_df.columns:
+                        property_df["wavelength_nm"] = DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM
+                    else:
+                        property_df["wavelength_nm"] = property_df["wavelength_nm"].fillna(
+                            DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM
+                        )
                 property_df["source"] = source
                 property_df["source_file"] = path.name
                 properties.setdefault(label, []).append(property_df)
