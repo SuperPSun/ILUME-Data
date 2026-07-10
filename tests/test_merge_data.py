@@ -54,6 +54,29 @@ def test_experiment_sources_merge_by_property_and_aggregate_identical_records(tm
     assert any(result["bucket"] == "experiment" and result["property_label"] == "density_g/cm^3" for result in results)
 
 
+def test_refractive_index_missing_wavelength_defaults_to_sodium_d_line(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    base = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+        "refractive_index_unitless": 1.4,
+    }
+    write_csv(input_root / "ILBERT" / "ILBERT_refractive_index_structured.csv", [base])
+    write_csv(
+        input_root / "ILThermo" / "ilt_refractive_index_structured.csv",
+        [{**base, "wavelength_nm": 450.0, "refractive_index_unitless": 1.5}],
+    )
+
+    merge_data(input_root, output_root)
+
+    out = pd.read_csv(output_root / "experiment" / "refractive_index.csv")
+    assert "wavelength_nm" in out.columns
+    assert set(out["wavelength_nm"]) == {450.0, 589.0}
+    assert out["wavelength_nm"].isna().sum() == 0
+
+
 def test_simulation_stays_separate_from_experiment_for_same_property(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
