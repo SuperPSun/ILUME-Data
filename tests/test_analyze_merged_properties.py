@@ -2,8 +2,15 @@ from pathlib import Path
 
 import matplotlib.axes
 import pandas as pd
+import scripts.analyze_merged_properties as analysis_module
 
-from scripts.analyze_merged_properties import analyze_merged_properties, numeric_condition_dimensions, plot_system_frequency
+from scripts.analyze_merged_properties import (
+    analyze_merged_properties,
+    normalize_property_values,
+    numeric_condition_dimensions,
+    plot_normalized_property_violin,
+    plot_system_frequency,
+)
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -145,6 +152,8 @@ def test_analyze_merged_properties_summarizes_regular_properties(tmp_path: Path)
     plot_manifest = pd.read_csv(output_dir / "plot_manifest.csv")
     assert {
         "coverage",
+        "normalized_property_violin",
+        "property_distribution_1d",
         "property_distribution_2d",
         "system_frequency",
         "condition_availability",
@@ -156,7 +165,7 @@ def test_analyze_merged_properties_summarizes_regular_properties(tmp_path: Path)
     assert (
         output_dir
         / "figures"
-        / "property_distributions"
+        / "property_distributions_2d"
         / "high"
         / "experiment_density_temperature_k_pressure_kpa.png"
     ).exists()
@@ -170,6 +179,10 @@ def test_analyze_merged_properties_summarizes_regular_properties(tmp_path: Path)
         .str.contains("experiment_electrical_conductivity_log10_frequency_mhz_electrical_conductivity_value.png")
         .any()
     )
+    assert plot_manifest["path"].str.contains("experiment_density_density_value.png").any()
+    assert (
+        output_dir / "figures" / "normalized_distributions" / "property_normalized_violin.png"
+    ).exists()
     assert (output_dir / "figures" / "system_frequency" / "high" / "experiment_density.png").exists()
     assert (
         output_dir / "figures" / "condition_availability" / "property_condition_availability_heatmap.png"
@@ -305,7 +318,7 @@ def test_analyze_merged_properties_splits_wide_tables_by_value_column(tmp_path: 
     plot_manifest = pd.read_csv(output_dir / "plot_manifest.csv")
     assert "property_distribution_1d" in set(plot_manifest["figure_type"])
     assert (
-        output_dir / "figures" / "property_distributions" / "low" / "simulation_esp_max_esp_max_value.png"
+        output_dir / "figures" / "property_distributions_1d" / "low" / "simulation_esp_max_esp_max_value.png"
     ).exists()
 
 
@@ -349,13 +362,53 @@ def test_analyze_merged_properties_draws_single_condition_property_distribution(
 
     plot_manifest = pd.read_csv(output_dir / "plot_manifest.csv")
     assert "property_distribution_2d" in set(plot_manifest["figure_type"])
+    assert "property_distribution_1d" in set(plot_manifest["figure_type"])
     assert (
         output_dir
         / "figures"
-        / "property_distributions"
+        / "property_distributions_1d"
+        / "low"
+        / "experiment_surface_tension_surface_tension_value.png"
+    ).exists()
+    assert (
+        output_dir
+        / "figures"
+        / "property_distributions_2d"
         / "low"
         / "experiment_surface_tension_temperature_k_surface_tension_value.png"
     ).exists()
+
+
+def test_normalize_property_values_uses_min_max_and_handles_constant_values():
+    assert normalize_property_values(pd.Series([10.0, 20.0, 30.0])).tolist() == [0.0, 0.5, 1.0]
+    assert normalize_property_values(pd.Series([5.0, 5.0])).tolist() == [0.5, 0.5]
+
+
+def test_normalized_property_violin_uses_experiment_and_simulation_subplots(tmp_path: Path, monkeypatch):
+    captured: dict[str, object] = {}
+    original_subplots = analysis_module.plt.subplots
+
+    def recording_subplots(*args, **kwargs):
+        fig, axes = original_subplots(*args, **kwargs)
+        captured["axes"] = axes
+        return fig, axes
+
+    monkeypatch.setattr(analysis_module.plt, "subplots", recording_subplots)
+
+    plot_normalized_property_violin(
+        {
+            "experiment": {"experiment/density": pd.Series([0.0, 0.5, 1.0])},
+            "simulation": {"simulation/density": pd.Series([0.2, 0.4, 0.8])},
+        },
+        tmp_path / "violin.png",
+        100,
+    )
+
+    axes = captured["axes"].ravel()
+    assert len(axes) == 2
+    assert [axis.get_title() for axis in axes] == ["Experiment", "Simulation"]
+    assert [tuple(axis.get_ylim()) for axis in axes] == [(0.0, 1.0), (0.0, 1.0)]
+    assert not axes[0].get_shared_x_axes().joined(axes[0], axes[1])
 
 
 def test_numeric_condition_dimensions_fill_missing_values_for_plotting():
