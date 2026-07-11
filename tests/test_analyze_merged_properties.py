@@ -8,6 +8,7 @@ from scripts.analyze_merged_properties import (
     analyze_merged_properties,
     normalize_property_values,
     numeric_condition_dimensions,
+    plot_condition_spaces,
     plot_normalized_property_violin,
     plot_system_frequency,
 )
@@ -176,7 +177,7 @@ def test_analyze_merged_properties_summarizes_regular_properties(tmp_path: Path)
     )
     assert (
         plot_manifest["path"]
-        .str.contains("experiment_electrical_conductivity_log10_frequency_mhz_electrical_conductivity_value.png")
+        .str.contains("experiment_electrical_conductivity_frequency_mhz_electrical_conductivity_value.png")
         .any()
     )
     assert plot_manifest["path"].str.contains("experiment_density_density_value.png").any()
@@ -433,8 +434,10 @@ def test_numeric_condition_dimensions_only_fill_temperature_and_pressure_for_plo
     assert dimensions["pressure_kpa"]["series"].iloc[1] == 101.325
     assert dimensions["pressure_kpa"]["fill_note"] == "filled: pressure_kPa=1"
 
-    frequency = dimensions["log10_frequency_mhz"]
-    assert frequency["series"].isna().sum() == 2
+    frequency = dimensions["frequency_mhz"]
+    assert frequency["label"] == "frequency_MHz"
+    assert frequency["series"].isna().sum() == 1
+    assert frequency["series"].dropna().tolist() == [1.0, 0.0, 10.0]
     assert "missing_tick" not in frequency
     assert "fill_note" not in frequency
 
@@ -442,6 +445,35 @@ def test_numeric_condition_dimensions_only_fill_temperature_and_pressure_for_plo
     assert wavelength["series"].isna().sum() == 2
     assert "missing_tick" not in wavelength
     assert "fill_note" not in wavelength
+
+
+def test_plot_condition_spaces_keeps_frequency_in_mhz(tmp_path: Path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    def record_plot(plot_df, x_col, y_col, value_column, y_label, summary_row, output_path, dpi):
+        captured["frequencies"] = plot_df[y_col].tolist()
+        captured["y_label"] = y_label
+
+    monkeypatch.setattr(analysis_module, "plot_condition_scatter", record_plot)
+    outputs = plot_condition_spaces(
+        pd.DataFrame(
+            {
+                "temperature_K": [298.15, 308.15],
+                "frequency_MHz": [1000.0, 2000.0],
+                "dynamic_relative_permittivity_unitless": [10.0, 8.0],
+            }
+        ),
+        "dynamic_relative_permittivity_unitless",
+        {"bucket": "experiment", "property": "dynamic_relative_permittivity"},
+        tmp_path,
+        "experiment_dynamic_relative_permittivity",
+        set(),
+        dpi=80,
+        max_condition_scatter_points=100,
+    )
+
+    assert [kind for kind, _path in outputs] == ["temperature_frequency"]
+    assert captured == {"frequencies": [1000.0, 2000.0], "y_label": "Frequency (MHz)"}
 
 
 def test_system_frequency_uses_linear_x_axis(tmp_path: Path, monkeypatch):
