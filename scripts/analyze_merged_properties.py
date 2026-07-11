@@ -603,11 +603,6 @@ def numeric_condition_dimensions(df: pd.DataFrame, present: pd.Series) -> list[d
         series = pd.to_numeric(df[column], errors="coerce")
         label = column
         slug = axis_slug(column)
-        if column == "frequency_MHz":
-            series = series.where(series > 0).map(lambda value: math.log10(value) if pd.notna(value) else pd.NA)
-            series = pd.to_numeric(series, errors="coerce")
-            label = "log10 frequency_MHz"
-            slug = "log10_frequency_mhz"
 
         fill_note = ""
         missing_mask = present & series.isna()
@@ -886,11 +881,11 @@ def plot_condition_spaces(
 ) -> list[tuple[str, Path]]:
     outputs: list[tuple[str, Path]] = []
     pairs = [
-        ("temperature_pressure", "temperature_K", "pressure_kPa", "Pressure (kPa)", False),
-        ("temperature_frequency", "temperature_K", "frequency_MHz", "log10 Frequency (MHz)", True),
-        ("temperature_wavelength", "temperature_K", "wavelength_nm", "Wavelength (nm)", False),
+        ("temperature_pressure", "temperature_K", "pressure_kPa", "Pressure (kPa)"),
+        ("temperature_frequency", "temperature_K", "frequency_MHz", "Frequency (MHz)"),
+        ("temperature_wavelength", "temperature_K", "wavelength_nm", "Wavelength (nm)"),
     ]
-    for kind, x_col, y_col, y_label, log_y in pairs:
+    for kind, x_col, y_col, y_label in pairs:
         if x_col not in df.columns or y_col not in df.columns:
             continue
         values = pd.to_numeric(df[value_column], errors="coerce")
@@ -901,9 +896,6 @@ def plot_condition_spaces(
                 value_column: values,
             }
         ).dropna()
-        if log_y:
-            plot_df = plot_df[plot_df[y_col] > 0].copy()
-            plot_df[y_col] = plot_df[y_col].map(math.log10)
         if plot_df.empty:
             continue
         if len(plot_df) > max_condition_scatter_points:
