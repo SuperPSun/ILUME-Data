@@ -19,6 +19,7 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
         "heat_capacity_at_vapor_saturation_pressure.csv",
         "enthalpy_of_vaporization_or_sublimation.csv",
         "enthalpy_of_transition_or_fusion.csv",
+        "equilibrium_temperature.csv",
     ):
         (experiment / filename).write_bytes(b"excluded,1\\n")
     retained_simulation = simulation / "heat_of_vaporization.csv"
@@ -41,5 +42,6 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
         "heat_capacity_at_vapor_saturation_pressure.csv",
         "enthalpy_of_vaporization_or_sublimation.csv",
         "enthalpy_of_transition_or_fusion.csv",
+        "equilibrium_temperature.csv",
     ):
         assert not (final_root / "experiment" / filename).exists()
