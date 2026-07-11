@@ -24,6 +24,21 @@ SMILES_COLUMNS = ("cation", "anion", "solute", "solvent", "smiles", "SMILES")
 CONDITION_COLUMNS = ("temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
 NON_LABEL_COLUMNS = {*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS}
 FRACTION_COLUMNS = {"ESP_pos_frac", "ESP_neg_frac", "q_pos_frac"}
+QM_ELEC_HF_FILENAME = "simulated_QM_elec_HF_structured.csv"
+QM_ELEC_HF_COLUMNS = (
+    "SMILES",
+    "ESP_max",
+    "ESP_min",
+    "ESP_std",
+    "ESP_pos_frac",
+    "Dipole",
+    "Quadrupole",
+    "q_max",
+    "q_min",
+    "q_std",
+    "q_pos_frac",
+    "gap_eV",
+)
 
 HARD_THRESHOLDS: dict[str, tuple[float, float]] = {
     "density_g/cm^3": (0.5, 3.0),
@@ -50,7 +65,7 @@ HARD_THRESHOLDS: dict[str, tuple[float, float]] = {
     "thermal_expansion_err_K^-1": (0, 0.005),
     "HOMO_eV": (-20, 10),
     "LUMO_eV": (-20, 10),
-    "gap_eV": (0, 20),
+    "gap_eV": (-30, 30),
     "charge": (-20, 20),
     "solv": (-100, 100),
 }
@@ -156,6 +171,15 @@ def ordered_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 def label_columns(df: pd.DataFrame) -> list[str]:
     return [column for column in df.columns if column not in NON_LABEL_COLUMNS]
+
+
+def filter_supported_qm_labels(df: pd.DataFrame, filename: str) -> tuple[pd.DataFrame, list[str]]:
+    if filename != QM_ELEC_HF_FILENAME:
+        return df, []
+    retained = [column for column in QM_ELEC_HF_COLUMNS if column in df.columns]
+    dropped = [column for column in df.columns if column not in retained]
+    notes = [f"dropped unsupported QM labels: {', '.join(dropped)}"] if dropped else []
+    return df[retained], notes
 
 
 def add_rejections(
@@ -376,6 +400,8 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
     df = coerce_numeric_columns(df)
     active = reject_nonpositive_log_inputs(df, rejected_rows, active)
     df, unit_conversions = standardize_units(df, input_path.name)
+    df, qm_filter_notes = filter_supported_qm_labels(df, input_path.name)
+    unit_conversions.extend(qm_filter_notes)
     labels = label_columns(df)
 
     missing_labels = active & required_label_missing_mask(df, input_path.name, labels)
