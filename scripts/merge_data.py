@@ -19,6 +19,7 @@ NON_LABEL_COLUMNS = set(BASE_COLUMNS)
 ERROR_LABEL_PATTERNS = ("_err", "_error", "stddev", "stderr")
 WIDE_TABLE_FILES = {"simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF"}
 PROPERTY_OUTPUT_SLUGS = {"pressure_kPa_log10": "equilibrium_pressure"}
+SIMULATION_PROPERTY_LABEL_ALIASES = {"solvation_kcal/mol": "transfer_organic_kcal/mol"}
 SOURCE_COLUMNS = {"source", "source_file"}
 MISSING_TOKEN = "__ILUME_MISSING_CONDITION__"
 DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM = 589.0
@@ -66,6 +67,12 @@ def property_slug(label: str) -> str:
 
 def output_slug(label: str) -> str:
     return PROPERTY_OUTPUT_SLUGS.get(label, property_slug(label))
+
+
+def output_label(source: str, label: str) -> str:
+    if source in SIMULATION_SOURCES:
+        return SIMULATION_PROPERTY_LABEL_ALIASES.get(label, label)
+    return label
 
 
 def is_error_label(label: str) -> bool:
@@ -253,6 +260,9 @@ def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list
                 property_df = df.loc[df[label].notna(), [*keep_columns, label]].copy()
                 if property_df.empty:
                     continue
+                target_label = output_label(source, label)
+                if target_label != label:
+                    property_df = property_df.rename(columns={label: target_label})
                 if label == "refractive_index_unitless":
                     if "wavelength_nm" not in property_df.columns:
                         property_df["wavelength_nm"] = DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM
@@ -262,7 +272,7 @@ def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list
                         )
                 property_df["source"] = source
                 property_df["source_file"] = path.name
-                properties.setdefault(label, []).append(property_df)
+                properties.setdefault(target_label, []).append(property_df)
     return properties
 
 
