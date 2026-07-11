@@ -105,6 +105,44 @@ def test_relative_permittivity_labels_merge_into_static_and_dynamic_files(tmp_pa
     assert dynamic.loc[0, "dynamic_relative_permittivity_unitless"] == 8.0
 
 
+def test_simulation_solvation_merges_as_transfer_organic_without_changing_experiment_properties(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    write_csv(
+        input_root / "AIonopedia" / "AIonopedia_solvation_structured.csv",
+        [{"cation": "CC[n+]1ccn(C)c1", "anion": "F[B-](F)(F)F", "solvation_kcal/mol": -4.0}],
+    )
+    write_csv(
+        input_root / "AIonopedia" / "AIonopedia_transfer_organic_structured.csv",
+        [
+            {
+                "cation": "CC[n+]1ccn(C)c1",
+                "anion": "F[B-](F)(F)F",
+                "solute": "CCO",
+                "transfer_organic_kcal/mol": 1.5,
+            }
+        ],
+    )
+    write_csv(
+        input_root / "simulation" / "simulated_combi_qm_solv_structured.csv",
+        [{"smiles": "CCO", "solvation_kcal/mol": -2.5}],
+    )
+
+    merge_data(input_root, output_root)
+
+    simulation = pd.read_csv(output_root / "simulation" / "transfer_organic.csv")
+    assert list(simulation.columns) == ["smiles", "transfer_organic_kcal/mol", "source_list"]
+    assert simulation.loc[0, "transfer_organic_kcal/mol"] == -2.5
+    assert not (output_root / "simulation" / "solvation.csv").exists()
+    assert (output_root / "experiment" / "solvation.csv").exists()
+    assert (output_root / "experiment" / "transfer_organic.csv").exists()
+
+    manifest = pd.read_csv(output_root / "merged_manifest.csv")
+    simulation_rows = manifest[manifest["bucket"].eq("simulation")]
+    assert set(simulation_rows["property_label"]) == {"transfer_organic_kcal/mol"}
+    assert simulation_rows.iloc[0]["output_file"] == "simulation/transfer_organic.csv"
+
+
 def test_simulation_stays_separate_from_experiment_for_same_property(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
