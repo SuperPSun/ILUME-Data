@@ -2,10 +2,10 @@
 
 ## Global Summary
 
-- Analyzed properties: 50
-- Total data points across analyzed properties: 1913874
-- Sum of property-level unique systems: 1617417
-- Properties recommended for system holdout test: 43
+- Analyzed properties: 49
+- Total data points across analyzed properties: 1912140
+- Sum of property-level unique systems: 1616284
+- Properties recommended for system holdout test: 42
 - Properties recommended for grouped CV: 7
 - Properties recommended for leave-one-system-out or descriptive analysis: 0
 
@@ -13,18 +13,18 @@
 
 | bucket | property | data_points | unique_systems | recommended_split |
 | --- | --- | --- | --- | --- |
-| simulation | solvation | 999968 | 999968 | system_holdout_test |
+| simulation | transfer_organic | 999968 | 999968 | system_holdout_test |
 | experiment | density | 98517 | 6206 | system_holdout_test |
 | experiment | viscosity | 45804 | 2750 | system_holdout_test |
 | experiment | solvation | 44400 | 3611 | system_holdout_test |
-| simulation | esp_min | 28213 | 27275 | system_holdout_test |
 | simulation | gap | 28213 | 27275 | system_holdout_test |
-| simulation | esp_std | 28213 | 27275 | system_holdout_test |
+| simulation | esp_min | 28213 | 27275 | system_holdout_test |
 | simulation | esp_abs_mean | 28213 | 27275 | system_holdout_test |
+| simulation | esp_std | 28213 | 27275 | system_holdout_test |
 | simulation | esp_max | 28213 | 27275 | system_holdout_test |
 | simulation | q_max | 28212 | 27274 | system_holdout_test |
-| simulation | q_std | 28212 | 27274 | system_holdout_test |
 | simulation | q_abs_mean | 28212 | 27274 | system_holdout_test |
+| simulation | quadrupole | 28212 | 27274 | system_holdout_test |
 
 ## High Leakage Risk Properties
 
@@ -49,18 +49,18 @@ These properties should not be split by random rows because repeated systems can
 
 | bucket | property | unique_systems | recommended_test_systems |
 | --- | --- | --- | --- |
-| simulation | solvation | 999968 | 99997 |
+| simulation | transfer_organic | 999968 | 99997 |
 | experiment | density | 6206 | 621 |
 | experiment | viscosity | 2750 | 275 |
 | experiment | solvation | 3611 | 362 |
-| simulation | gap | 27275 | 2728 |
 | simulation | esp_min | 27275 | 2728 |
-| simulation | esp_max | 27275 | 2728 |
+| simulation | gap | 27275 | 2728 |
 | simulation | esp_std | 27275 | 2728 |
 | simulation | esp_abs_mean | 27275 | 2728 |
+| simulation | esp_max | 27275 | 2728 |
 | simulation | q_max | 27274 | 2728 |
 | simulation | q_neg_sum | 27274 | 2728 |
-| simulation | q_min | 27274 | 2728 |
+| simulation | quadrupole | 27274 | 2728 |
 
 ## Grouped Cross-Validation Candidates
 
@@ -83,9 +83,9 @@ None.
 - condition_availability: 1
 - coverage: 4
 - normalized_property_violin: 1
-- property_distribution_1d: 50
-- property_distribution_2d: 53
-- system_frequency: 50
+- property_distribution_1d: 49
+- property_distribution_2d: 52
+- system_frequency: 49
 
 Key summary figures:
 - `figures/coverage/property_coverage_all.png`
