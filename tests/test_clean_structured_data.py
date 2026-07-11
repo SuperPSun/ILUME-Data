@@ -291,27 +291,125 @@ def test_unknown_unit_simulation_columns_are_not_iqr_filtered(tmp_path: Path):
     input_path = tmp_path / "simulated_QM_elec_HF_structured.csv"
     output_path = tmp_path / "out.csv"
     rejected_path = tmp_path / "rejected.csv"
-    rows = []
-    for index in range(20):
-        rows.append(
-            {
-                "SMILES": "C" * (index + 1),
-                "ESP_max": float(index % 3),
-                "Dipole": float(index % 4),
-                "q_abs_mean": 0.1,
-                "ESP_pos_frac": 0.5,
-                "Gap": 5.0,
-            }
-        )
-    rows.append({"SMILES": "CCCCCCCCCCCCCCCCCCCCC", "ESP_max": 9999.0, "Dipole": 999.0, "q_abs_mean": 99.0, "ESP_pos_frac": 0.5, "Gap": 5.0})
+    base = {
+        "ESP_abs_mean": 0.2,
+        "ESP_std": 0.3,
+        "ESP_pos_frac": 0.5,
+        "ESP_neg_frac": 0.5,
+        "ESP_pos_mean": 0.4,
+        "ESP_neg_mean": -0.4,
+        "Quadrupole": 1.0,
+        "q_max": 0.5,
+        "q_min": -0.5,
+        "q_abs_mean": 0.1,
+        "q_std": 0.2,
+        "q_pos_sum": 1.0,
+        "q_neg_sum": -1.0,
+        "q_pos_frac": 0.5,
+        "Gap": 5.0,
+    }
+    rows = [
+        {
+            "SMILES": "C" * (index + 1),
+            **base,
+            "ESP_max": float(index % 3),
+            "ESP_min": -float(index % 3),
+            "Dipole": float(index % 4),
+        }
+        for index in range(20)
+    ]
+    rows.append(
+        {
+            "SMILES": "CCCCCCCCCCCCCCCCCCCCC",
+            **base,
+            "ESP_max": 9999.0,
+            "ESP_min": -9999.0,
+            "ESP_abs_mean": 999.0,
+            "ESP_std": 999.0,
+            "ESP_pos_mean": 999.0,
+            "ESP_neg_mean": -999.0,
+            "Dipole": 999.0,
+            "Quadrupole": 999.0,
+            "q_max": 99.0,
+            "q_min": -99.0,
+            "q_abs_mean": 99.0,
+            "q_std": 99.0,
+            "q_pos_sum": 99.0,
+            "q_neg_sum": -99.0,
+        }
+    )
     pd.DataFrame(rows).to_csv(input_path, index=False)
+
+    result = clean_structured_file(input_path, output_path, rejected_path)
+
+    cleaned = pd.read_csv(output_path)
+    assert len(cleaned) == 21
+    assert list(cleaned.columns) == [
+        "SMILES",
+        "ESP_max",
+        "ESP_min",
+        "ESP_std",
+        "ESP_pos_frac",
+        "Dipole",
+        "Quadrupole",
+        "q_max",
+        "q_min",
+        "q_std",
+        "q_pos_frac",
+        "gap_eV",
+    ]
+    assert cleaned.loc[20, "gap_eV"] == 5.0
+    assert cleaned.loc[20, "ESP_max"] == 9999.0
+    removed = {"ESP_pos_mean", "ESP_neg_mean", "ESP_abs_mean", "ESP_neg_frac", "q_abs_mean", "q_pos_sum", "q_neg_sum"}
+    assert removed.isdisjoint(cleaned.columns)
+    assert any("dropped unsupported QM labels" in conversion for conversion in result.unit_conversions)
+    assert not rejected_path.exists()
+
+
+def test_qm_label_filtering_precedes_missing_label_and_threshold_checks(tmp_path: Path):
+    input_path = tmp_path / "simulated_QM_elec_HF_structured.csv"
+    output_path = tmp_path / "out.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    base = {
+        "ESP_max": 1.0,
+        "ESP_min": -1.0,
+        "ESP_std": 0.3,
+        "ESP_pos_frac": 0.5,
+        "Dipole": 2.0,
+        "Quadrupole": 3.0,
+        "q_max": 0.5,
+        "q_min": -0.5,
+        "q_std": 0.2,
+        "q_pos_frac": 0.5,
+        "Gap": 5.0,
+        "q_abs_mean": 0.1,
+    }
+    pd.DataFrame(
+        [
+            {"SMILES": "C", **base},
+            {
+                "SMILES": "CC",
+                **{column: None for column in base if column != "q_abs_mean"},
+                "q_abs_mean": 0.1,
+            },
+            {"SMILES": "CCC", **base, "ESP_pos_frac": 1.1},
+            {"SMILES": "CCCC", **base, "q_pos_frac": -0.1},
+            {"SMILES": "CCCCC", **base, "Gap": 21.0},
+        ]
+    ).to_csv(input_path, index=False)
 
     clean_structured_file(input_path, output_path, rejected_path)
 
     cleaned = pd.read_csv(output_path)
-    assert len(cleaned) == 21
-    assert "gap_eV" in cleaned.columns
-    assert not rejected_path.exists()
+    rejected = pd.read_csv(rejected_path)
+    assert cleaned["SMILES"].tolist() == ["C"]
+    assert rejected["rejection_reason"].value_counts().to_dict() == {"hard_threshold": 3, "missing_label": 1}
+    assert set(rejected["trigger_column"]) == {
+        "ESP_pos_frac",
+        "q_pos_frac",
+        "gap_eV",
+        ",".join(cleaned.columns[1:]),
+    }
 
 
 def test_directory_cleaning_skips_ilthermo_and_constructed_and_writes_reports(tmp_path: Path):
