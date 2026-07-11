@@ -17,6 +17,7 @@ EXCLUDED_EXPERIMENT_FILES = (
     "heat_capacity_at_vapor_saturation_pressure.csv",
     "enthalpy_of_vaporization_or_sublimation.csv",
     "enthalpy_of_transition_or_fusion.csv",
+    "equilibrium_temperature.csv",
 )
 
 
