@@ -24,6 +24,28 @@ SMILES_COLUMNS = ("cation", "anion", "solute", "solvent", "smiles", "SMILES")
 CONDITION_COLUMNS = ("temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
 NON_LABEL_COLUMNS = {*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS}
 FRACTION_COLUMNS = {"ESP_pos_frac", "ESP_neg_frac", "q_pos_frac"}
+BOX_3D_FILENAME = "3d_box_structured.csv"
+BOX_3D_OUTPUT_COLUMNS = (
+    "mol_id",
+    "cation",
+    "anion",
+    "temperature_K",
+    "rdf_ca_peak1_r_A",
+    "rdf_ca_peak1_g",
+    "rdf_ca_coordination1",
+    "rdf_ca_excess_area_A",
+    "rdf_cc_peak1_g",
+    "rdf_cc_excess_area_A",
+    "rdf_aa_peak1_g",
+    "rdf_aa_excess_area_A",
+    "scc_prepeak_present",
+    "scc_prepeak_q_A^-1",
+    "scc_prepeak_height",
+    "scc_prepeak_area_A^-1",
+    "szz_peak_q_A^-1",
+    "szz_peak_height",
+    "szz_peak_area_A^-1",
+)
 QM_ELEC_HF_FILENAME = "simulated_QM_elec_HF_structured.csv"
 QM_ELEC_HF_COLUMNS = (
     "SMILES",
@@ -171,6 +193,22 @@ def ordered_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 def label_columns(df: pd.DataFrame) -> list[str]:
     return [column for column in df.columns if column not in NON_LABEL_COLUMNS]
+
+
+def select_3d_box_columns(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+    if filename != BOX_3D_FILENAME:
+        return df
+    input_columns = [
+        column for column in BOX_3D_OUTPUT_COLUMNS if column != "scc_prepeak_present"
+    ]
+    missing = set(input_columns).difference(df.columns)
+    if missing:
+        raise ValueError(f"{BOX_3D_FILENAME} is missing columns: {sorted(missing)}")
+    out = df[input_columns].copy()
+    out["scc_prepeak_present"] = pd.to_numeric(
+        out["scc_prepeak_q_A^-1"], errors="coerce"
+    ).notna()
+    return out[list(BOX_3D_OUTPUT_COLUMNS)]
 
 
 def filter_supported_qm_labels(df: pd.DataFrame, filename: str) -> tuple[pd.DataFrame, list[str]]:
@@ -366,7 +404,7 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
         rejected_path = output_path.parent.parent / "rejected_rows" / output_path.parent.name / f"{output_path.stem}_rejected.csv"
     rejected_path = Path(rejected_path)
 
-    df = pd.read_csv(input_path)
+    df = select_3d_box_columns(pd.read_csv(input_path), input_path.name)
     input_rows = len(df)
     rejected_rows: list[dict[str, object]] = []
 
