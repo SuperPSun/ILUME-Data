@@ -49,13 +49,13 @@ Output columns are ordered as system identifiers first, experimental conditions 
 Build one-row-per-snapshot structural fingerprints from `box_20260514` with:
 
 ```bash
-python scripts/build_3d_box_features.py --jobs 8
+python scripts/structure_3d_box_features.py --jobs 8
 ```
 
-The final table is written to `data/final/simulation/3d_box.csv`. RDF and structure-factor curves, batch checkpoints, the parameter manifest, and non-OK rows are retained under `data/structured/simulation/3d_box_audit/`. Interrupted runs can continue without recomputing completed batches:
+The structured table is written to `data/structured/simulation/3d_box_structured.csv`. RDF and structure-factor curves, batch checkpoints, the parameter manifest, and non-OK rows are retained under `analysis/3d_box_audit/`. Interrupted runs can continue without recomputing completed batches:
 
 ```bash
-python scripts/build_3d_box_features.py --jobs 8 --resume
+python scripts/structure_3d_box_features.py --jobs 8 --resume
 ```
 
 These values are single-snapshot finite-box fingerprints, not trajectory averages. Columns prefixed with `qc_` describe provenance and calculation quality and should not be used as model inputs by default.
