@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from scripts.build_3d_box_features import build_dataset
+from scripts.structure_3d_box_features import DEFAULT_OUTPUT, build_dataset
 from src.box_features import (
     RDFResult,
     build_reference_topology,
@@ -20,6 +20,10 @@ from src.box_features import (
     parse_pdb_box,
     wrapped_center_of_mass,
 )
+
+
+def test_default_output_is_structured_3d_box_csv():
+    assert DEFAULT_OUTPUT == Path("data/structured/simulation/3d_box_structured.csv").resolve()
 
 
 def pdb_atom(serial: int, name: str, residue: str, residue_id: int, xyz: tuple[float, float, float]) -> str:
