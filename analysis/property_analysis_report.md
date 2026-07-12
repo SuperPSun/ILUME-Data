@@ -2,10 +2,10 @@
 
 ## Global Summary
 
-- Analyzed properties: 42
-- Total data points across analyzed properties: 1722652
-- Sum of property-level unique systems: 1433036
-- Properties recommended for system holdout test: 35
+- Analyzed properties: 57
+- Total data points across analyzed properties: 2080245
+- Sum of property-level unique systems: 1790629
+- Properties recommended for system holdout test: 50
 - Properties recommended for grouped CV: 7
 - Properties recommended for leave-one-system-out or descriptive analysis: 0
 
@@ -17,14 +17,14 @@
 | experiment | density | 98517 | 6206 | system_holdout_test |
 | experiment | viscosity | 45804 | 2750 | system_holdout_test |
 | experiment | solvation | 44400 | 3611 | system_holdout_test |
-| simulation | esp_max | 28217 | 27279 | system_holdout_test |
 | simulation | esp_min | 28217 | 27279 | system_holdout_test |
 | simulation | esp_std | 28217 | 27279 | system_holdout_test |
+| simulation | esp_max | 28217 | 27279 | system_holdout_test |
 | simulation | gap | 28217 | 27279 | system_holdout_test |
-| simulation | quadrupole | 28216 | 27278 | system_holdout_test |
 | simulation | q_std | 28216 | 27278 | system_holdout_test |
-| simulation | q_min | 28216 | 27278 | system_holdout_test |
 | simulation | q_max | 28216 | 27278 | system_holdout_test |
+| simulation | quadrupole | 28216 | 27278 | system_holdout_test |
+| simulation | q_min | 28216 | 27278 | system_holdout_test |
 
 ## High Leakage Risk Properties
 
@@ -53,13 +53,13 @@ These properties should not be split by random rows because repeated systems can
 | experiment | density | 6206 | 621 |
 | experiment | viscosity | 2750 | 275 |
 | experiment | solvation | 3611 | 362 |
-| simulation | esp_std | 27279 | 2728 |
 | simulation | esp_min | 27279 | 2728 |
 | simulation | esp_max | 27279 | 2728 |
+| simulation | esp_std | 27279 | 2728 |
 | simulation | gap | 27279 | 2728 |
-| simulation | q_max | 27278 | 2728 |
 | simulation | q_std | 27278 | 2728 |
 | simulation | quadrupole | 27278 | 2728 |
+| simulation | q_max | 27278 | 2728 |
 | simulation | q_min | 27278 | 2728 |
 
 ## Grouped Cross-Validation Candidates
@@ -83,9 +83,9 @@ None.
 - condition_availability: 1
 - coverage: 4
 - normalized_property_violin: 1
-- property_distribution_1d: 42
-- property_distribution_2d: 52
-- system_frequency: 42
+- property_distribution_1d: 57
+- property_distribution_2d: 67
+- system_frequency: 57
 
 Key summary figures:
 - `figures/coverage/property_coverage_all.png`
