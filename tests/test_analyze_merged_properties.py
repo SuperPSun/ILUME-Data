@@ -296,14 +296,28 @@ def test_analyze_merged_properties_splits_wide_tables_by_value_column(tmp_path: 
     write_csv(
         input_root / "simulation" / "simulated_qm_elec_hf.csv",
         [
-            {"SMILES": "CCO", "ESP_max": 1.0, "ESP_min": -1.0, "gap_eV": 2.0, "source_list": "simulation"},
-            {"SMILES": "CCN", "ESP_max": None, "ESP_min": -2.0, "gap_eV": 3.0, "source_list": "simulation"},
+            {
+                "SMILES": "CCO",
+                "ESP_max": 1.0,
+                "ESP_min": -1.0,
+                "gap_eV": 2.0,
+                "scc_prepeak_present": True,
+                "source_list": "simulation",
+            },
+            {
+                "SMILES": "CCN",
+                "ESP_max": None,
+                "ESP_min": -2.0,
+                "gap_eV": 3.0,
+                "scc_prepeak_present": False,
+                "source_list": "simulation",
+            },
         ],
     )
 
     summary = analyze_merged_properties(input_root, output_dir, min_holdout_systems=200, test_fraction=0.1)
 
-    assert set(summary["property"]) == {"esp_max", "esp_min", "gap"}
+    assert set(summary["property"]) == {"esp_max", "esp_min", "gap", "scc_prepeak_present"}
     esp_max = summary[summary["property"].eq("esp_max")].iloc[0]
     assert esp_max["property_label"] == "ESP_max"
     assert esp_max["rows"] == 2
@@ -315,6 +329,11 @@ def test_analyze_merged_properties_splits_wide_tables_by_value_column(tmp_path: 
     gap = summary[summary["property"].eq("gap")].iloc[0]
     assert gap["data_points"] == 2
     assert gap["unique_systems"] == 2
+
+    prepeak = summary[summary["property"].eq("scc_prepeak_present")].iloc[0]
+    assert prepeak["value_min"] == 0.0
+    assert prepeak["value_mean"] == 0.5
+    assert prepeak["value_max"] == 1.0
 
     plot_manifest = pd.read_csv(output_dir / "plot_manifest.csv")
     assert "property_distribution_1d" in set(plot_manifest["figure_type"])
