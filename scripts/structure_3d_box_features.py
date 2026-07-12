@@ -33,8 +33,8 @@ from raw_prep import canonicalize_smiles, disable_rdkit_logs  # noqa: E402
 
 DEFAULT_BOX_DIR = PROJECT_ROOT / "data" / "raw" / "simulation_data" / "box_20260514"
 DEFAULT_CHARGE_DIR = PROJECT_ROOT / "data" / "raw" / "simulation_data" / "charge_20260514"
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "final" / "simulation" / "3d_box.csv"
-DEFAULT_AUDIT_DIR = PROJECT_ROOT / "data" / "structured" / "simulation" / "3d_box_audit"
+DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "structured" / "simulation" / "3d_box_structured.csv"
+DEFAULT_AUDIT_DIR = PROJECT_ROOT / "analysis" / "3d_box_audit"
 ID_COLUMNS = ("mol_id", "cation", "anion", "temperature_K", "feature_version")
 OUTPUT_COLUMNS = (*ID_COLUMNS, *FEATURE_COLUMNS, *QC_COLUMNS)
 CURVE_SHAPES = {
