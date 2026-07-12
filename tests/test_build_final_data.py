@@ -24,16 +24,26 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
         (experiment / filename).write_bytes(b"excluded,1\\n")
     retained_simulation = simulation / "heat_of_vaporization.csv"
     retained_simulation.write_bytes(b"heat_of_vaporization,1\\n")
+    box_features = simulation / "3d_box.csv"
+    box_features.write_bytes(b"mol_id,rdf_ca_peak1_r_A\\nmol_1,4.1\\n")
+    charge_data_root = tmp_path / "raw" / "simulation_data" / "charge_20260514"
+    charge_data_root.mkdir(parents=True)
+    charge_file = charge_data_root / "mol_0000000.mol2"
+    charge_file.write_bytes(b"charge data")
 
     final_root = tmp_path / "final"
     stale_file = final_root / "experiment" / "stale.csv"
     stale_file.parent.mkdir(parents=True)
     stale_file.write_bytes(b"stale,1\\n")
 
-    build_final_data(merged_root, final_root)
+    build_final_data(merged_root, final_root, charge_data_root)
 
     assert (final_root / "experiment" / "density.csv").read_bytes() == retained_experiment.read_bytes()
     assert (final_root / "simulation" / "heat_of_vaporization.csv").read_bytes() == retained_simulation.read_bytes()
+    assert (final_root / "simulation" / "3d_box.csv").read_bytes() == box_features.read_bytes()
+    assert (
+        final_root / "simulation" / "charge_20260514" / "mol_0000000.mol2"
+    ).read_bytes() == charge_file.read_bytes()
     assert not stale_file.exists()
     for filename in (
         "thermal_diffusivity.csv",
