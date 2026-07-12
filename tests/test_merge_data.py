@@ -222,6 +222,43 @@ def test_qm_elec_hf_file_outputs_one_wide_table_instead_of_split_labels(tmp_path
     assert manifest.iloc[0]["output_file"] == "simulation/simulated_qm_elec_hf.csv"
 
 
+def test_3d_box_file_outputs_one_wide_table(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    row = {
+        "mol_id": "mol_1",
+        "cation": "C[N+](C)(C)C",
+        "anion": "[Cl-]",
+        "temperature_K": 298.15,
+        "rdf_ca_peak1_r_A": 4.1,
+        "rdf_ca_peak1_g": 2.1,
+        "rdf_ca_coordination1": 5.1,
+        "rdf_ca_excess_area_A": 0.8,
+        "rdf_cc_peak1_g": 1.5,
+        "rdf_cc_excess_area_A": 0.3,
+        "rdf_aa_peak1_g": 1.7,
+        "rdf_aa_excess_area_A": 0.5,
+        "scc_prepeak_present": True,
+        "scc_prepeak_q_A^-1": 0.25,
+        "scc_prepeak_height": 1.4,
+        "scc_prepeak_area_A^-1": 0.12,
+        "szz_peak_q_A^-1": 0.7,
+        "szz_peak_height": 1.9,
+        "szz_peak_area_A^-1": 0.2,
+    }
+    write_csv(input_root / "simulation" / "3d_box_structured.csv", [row])
+
+    merge_data(input_root, output_root)
+
+    wide = pd.read_csv(output_root / "simulation" / "3d_box.csv")
+    assert list(wide.columns) == [*row, "source_list"]
+    assert wide.loc[0, "source_list"] == "simulation"
+    assert not (output_root / "simulation" / "rdf_ca_peak1_r_a.csv").exists()
+    manifest = pd.read_csv(output_root / "merged_manifest.csv")
+    assert manifest.iloc[0]["property_label"] == "3d_box"
+    assert manifest.iloc[0]["output_file"] == "simulation/3d_box.csv"
+
+
 def test_same_key_different_label_values_remain_separate_rows(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
