@@ -45,3 +45,24 @@ def test_analyze_final_properties_scans_final_files_without_manifest(tmp_path: P
     assert (output_dir / "figures" / "normalized_distributions" / "property_normalized_violin.png").exists()
     manifest = pd.read_csv(output_dir / "plot_manifest.csv")
     assert "normalized_property_violin" in set(manifest["figure_type"])
+
+
+def test_analyze_final_properties_handles_boolean_values(tmp_path: Path):
+    input_root = tmp_path / "final"
+    output_dir = tmp_path / "analysis"
+    write_csv(
+        input_root / "simulation" / "3d_box.csv",
+        [
+            {"SMILES": "CCO", "scc_prepeak_present": True, "source_list": "simulation"},
+            {"SMILES": "CCN", "scc_prepeak_present": False, "source_list": "simulation"},
+        ],
+    )
+
+    summary = analyze_final_properties(input_root, output_dir)
+
+    row = summary.iloc[0]
+    assert row["property"] == "scc_prepeak_present"
+    assert row["value_min"] == 0.0
+    assert row["value_mean"] == 0.5
+    assert row["value_max"] == 1.0
+    assert (output_dir / "plot_manifest.csv").exists()
