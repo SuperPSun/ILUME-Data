@@ -17,7 +17,10 @@ METADATA_COLUMNS = ("standard_state_note",)
 BASE_COLUMNS = (*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS, *METADATA_COLUMNS)
 NON_LABEL_COLUMNS = set(BASE_COLUMNS)
 ERROR_LABEL_PATTERNS = ("_err", "_error", "stddev", "stderr")
-WIDE_TABLE_FILES = {"simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF"}
+WIDE_TABLE_FILES = {
+    "3d_box_structured.csv": "3d_box",
+    "simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF",
+}
 PROPERTY_OUTPUT_SLUGS = {"pressure_kPa_log10": "equilibrium_pressure"}
 SIMULATION_PROPERTY_LABEL_ALIASES = {"solvation_kcal/mol": "transfer_organic_kcal/mol"}
 SOURCE_COLUMNS = {"source", "source_file"}
