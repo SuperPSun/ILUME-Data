@@ -9,6 +9,9 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CHARGE_DATA_ROOT = (
+    PROJECT_ROOT / "data" / "raw" / "simulation_data" / "charge_20260514"
+)
 BUCKETS = ("experiment", "simulation")
 EXCLUDED_EXPERIMENT_FILES = (
     "thermal_diffusivity.csv",
@@ -21,16 +24,25 @@ EXCLUDED_EXPERIMENT_FILES = (
 )
 
 
-def build_final_data(input_root: Path, output_root: Path) -> None:
+def build_final_data(
+    input_root: Path,
+    output_root: Path,
+    charge_data_root: Path = CHARGE_DATA_ROOT,
+) -> None:
     """Rebuild ``output_root`` from merged data while omitting excluded experiments."""
     input_root = Path(input_root)
     output_root = Path(output_root)
+    charge_data_root = Path(charge_data_root)
     output_root.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
         staged_root = Path(temporary_dir) / output_root.name
         for bucket in BUCKETS:
             shutil.copytree(input_root / bucket, staged_root / bucket)
+        shutil.copytree(
+            charge_data_root,
+            staged_root / "simulation" / charge_data_root.name,
+        )
         for filename in EXCLUDED_EXPERIMENT_FILES:
             (staged_root / "experiment" / filename).unlink()
 
