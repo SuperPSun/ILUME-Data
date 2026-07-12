@@ -106,6 +106,13 @@ def source_count(df: pd.DataFrame) -> int:
     return len(sources)
 
 
+def numeric_property_values(values: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+    if pd.api.types.is_bool_dtype(numeric.dtype):
+        return numeric.astype(float)
+    return numeric
+
+
 def recommendation(unique_systems: int, min_holdout_systems: int, test_fraction: float) -> tuple[str, int]:
     if unique_systems >= min_holdout_systems:
         return "system_holdout_test", max(1, math.ceil(unique_systems * test_fraction))
@@ -123,7 +130,7 @@ def analyze_value_column(
     min_holdout_systems: int,
     test_fraction: float,
 ) -> dict[str, object]:
-    values = pd.to_numeric(df[value_column], errors="coerce")
+    values = numeric_property_values(df[value_column])
     present = values.notna()
     rows_with_values = df.loc[present].copy()
     identifier_columns = [column for column in IDENTIFIER_COLUMNS if column in rows_with_values.columns]
@@ -565,7 +572,7 @@ def histogram_bin_count(values: pd.Series, *, max_bins: int = 40) -> int:
 
 
 def normalize_property_values(values: pd.Series) -> pd.Series:
-    numeric = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    numeric = numeric_property_values(values).replace([np.inf, -np.inf], np.nan).dropna()
     if numeric.empty:
         return numeric.astype(float)
     minimum = float(numeric.min())
@@ -625,7 +632,7 @@ def value_dimension(df: pd.DataFrame, value_column: str, summary_row: dict[str, 
     return {
         "label": str(summary_row["property_label"]),
         "slug": f"{axis_slug(property_name)}_value",
-        "series": pd.to_numeric(df[value_column], errors="coerce"),
+        "series": numeric_property_values(df[value_column]),
     }
 
 
@@ -808,7 +815,7 @@ def plot_property_distribution_2d(
 
 
 def system_frequency(df: pd.DataFrame, value_column: str) -> pd.Series:
-    values = pd.to_numeric(df[value_column], errors="coerce")
+    values = numeric_property_values(df[value_column])
     rows = df.loc[values.notna()]
     identifier_columns = [column for column in IDENTIFIER_COLUMNS if column in rows.columns]
     if not identifier_columns or rows.empty:
@@ -835,7 +842,7 @@ def plot_system_frequency(system_counts: pd.Series, summary_row: dict[str, objec
 
 
 def condition_availability_row(df: pd.DataFrame, value_column: str, summary_row: dict[str, object]) -> dict[str, object]:
-    values = pd.to_numeric(df[value_column], errors="coerce")
+    values = numeric_property_values(df[value_column])
     present = values.notna()
     denominator = int(present.sum())
     row = {"label": f"{summary_row['bucket']}/{summary_row['property']}"}
@@ -888,7 +895,7 @@ def plot_condition_spaces(
     for kind, x_col, y_col, y_label in pairs:
         if x_col not in df.columns or y_col not in df.columns:
             continue
-        values = pd.to_numeric(df[value_column], errors="coerce")
+        values = numeric_property_values(df[value_column])
         plot_df = pd.DataFrame(
             {
                 x_col: pd.to_numeric(df[x_col], errors="coerce"),
