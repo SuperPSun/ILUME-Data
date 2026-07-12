@@ -3,6 +3,7 @@ from pathlib import Path
 import pandas as pd
 
 from scripts.clean_structured_data import (
+    BOX_3D_OUTPUT_COLUMNS,
     clean_non_ilthermo_structured,
     clean_structured_file,
 )
@@ -171,6 +172,59 @@ def test_units_are_unified_for_simulation_and_viscosity(tmp_path: Path):
     viscosity = pd.read_csv(viscosity_output)
     assert list(viscosity.columns) == ["cation", "anion", "temperature_K", "viscosity_mPa*s_log10"]
     assert viscosity.loc[0, "viscosity_mPa*s_log10"] == 2.0
+
+
+def test_3d_box_is_selected_and_cleaned_with_prepeak_presence(tmp_path: Path):
+    input_root = tmp_path / "structured"
+    output_root = tmp_path / "cleaned"
+    input_path = input_root / "simulation" / "3d_box_structured.csv"
+    input_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "mol_id": ["mol_1", "mol_2"],
+            "cation": ["C[N+](C)(C)C", "C[N+](C)(C)C"],
+            "anion": ["[Cl-]", "[Cl-]"],
+            "temperature_K": [298.15, 308.15],
+            "rdf_ca_peak1_r_A": [4.1, 4.2],
+            "rdf_ca_peak1_g": [2.1, 2.2],
+            "rdf_ca_coordination1": [5.1, 5.2],
+            "rdf_ca_excess_area_A": [0.8, 0.9],
+            "rdf_cc_peak1_g": [1.5, 1.6],
+            "rdf_cc_excess_area_A": [0.3, 0.4],
+            "rdf_aa_peak1_g": [1.7, 1.8],
+            "rdf_aa_excess_area_A": [0.5, 0.6],
+            "scc_prepeak_q_A^-1": [0.25, None],
+            "scc_prepeak_height": [1.4, None],
+            "scc_prepeak_area_A^-1": [0.12, None],
+            "szz_peak_q_A^-1": [0.7, 0.8],
+            "szz_peak_height": [1.9, 2.0],
+            "szz_peak_area_A^-1": [0.2, 0.3],
+            "qc_status": ["ok", "partial"],
+        }
+    ).to_csv(input_path, index=False)
+
+    results = clean_non_ilthermo_structured(input_root, output_root, sources=["simulation"])
+
+    output_path = output_root / "simulation" / "3d_box_structured.csv"
+    cleaned = pd.read_csv(output_path)
+    assert len(results) == 1
+    assert list(cleaned.columns) == list(BOX_3D_OUTPUT_COLUMNS)
+    assert cleaned["scc_prepeak_present"].tolist() == [True, False]
+    assert "qc_status" not in cleaned.columns
+    assert (output_root / "cleaning_report.csv").exists()
+
+
+def test_3d_box_cleaning_reports_missing_required_columns(tmp_path: Path):
+    input_path = tmp_path / "3d_box_structured.csv"
+    pd.DataFrame({"mol_id": ["mol_1"]}).to_csv(input_path, index=False)
+
+    try:
+        clean_structured_file(input_path, tmp_path / "out.csv")
+    except ValueError as error:
+        assert "3d_box_structured.csv is missing columns" in str(error)
+        assert "rdf_ca_peak1_r_A" in str(error)
+    else:
+        raise AssertionError("expected missing 3d_box columns to raise ValueError")
 
 
 def test_log_or_linear_label_choices_are_applied(tmp_path: Path):
@@ -394,7 +448,7 @@ def test_qm_label_filtering_precedes_missing_label_and_threshold_checks(tmp_path
             },
             {"SMILES": "CCC", **base, "ESP_pos_frac": 1.1},
             {"SMILES": "CCCC", **base, "q_pos_frac": -0.1},
-            {"SMILES": "CCCCC", **base, "Gap": 21.0},
+            {"SMILES": "CCCCC", **base, "Gap": 31.0},
         ]
     ).to_csv(input_path, index=False)
 
