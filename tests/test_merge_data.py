@@ -18,6 +18,8 @@ def test_property_slug_uses_stable_filename_rules():
     assert property_slug("pEC50") == "pec50"
     assert property_slug("partition_log10") == "partition"
     assert property_slug("HOMO_eV") == "homo"
+    assert property_slug("anion_HOMO_eV") == "anion_homo"
+    assert property_slug("cation_LUMO_eV") == "cation_lumo"
     assert property_slug("x_CO2_unitless") == "x_co2"
     assert property_slug("simulated_QM_elec_HF") == "simulated_qm_elec_hf"
 
@@ -212,12 +214,16 @@ def test_simulation_stays_separate_from_experiment_for_same_property(tmp_path: P
     assert not (output_root / "simulation" / "density_err.csv").exists()
 
 
-def test_multi_label_simulation_file_is_split_and_error_labels_are_dropped(tmp_path: Path):
+def test_single_ion_orbitals_are_split_by_ion_and_error_labels_are_dropped(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
     write_csv(
         input_root / "simulation" / "simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv",
         [{"anion": "F[B-](F)(F)F", "HOMO_eV": -1.0, "LUMO_eV": 2.0, "gap_eV": 3.0}],
+    )
+    write_csv(
+        input_root / "simulation" / "simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv",
+        [{"cation": "CC[n+]1ccn(C)c1", "HOMO_eV": -9.0, "LUMO_eV": -4.0, "gap_eV": 5.0}],
     )
     write_csv(
         input_root / "simulation" / "simulated_heat_capacity_structured.csv",
@@ -234,9 +240,42 @@ def test_multi_label_simulation_file_is_split_and_error_labels_are_dropped(tmp_p
 
     merge_data(input_root, output_root)
 
-    assert (output_root / "simulation" / "homo.csv").exists()
-    assert (output_root / "simulation" / "lumo.csv").exists()
-    assert (output_root / "simulation" / "gap.csv").exists()
+    simulation_root = output_root / "simulation"
+    anion_homo = pd.read_csv(simulation_root / "anion_homo.csv")
+    anion_lumo = pd.read_csv(simulation_root / "anion_lumo.csv")
+    cation_homo = pd.read_csv(simulation_root / "cation_homo.csv")
+    cation_lumo = pd.read_csv(simulation_root / "cation_lumo.csv")
+    assert list(anion_homo.columns) == ["anion", "anion_HOMO_eV", "source_list"]
+    assert list(anion_lumo.columns) == ["anion", "anion_LUMO_eV", "source_list"]
+    assert list(cation_homo.columns) == ["cation", "cation_HOMO_eV", "source_list"]
+    assert list(cation_lumo.columns) == ["cation", "cation_LUMO_eV", "source_list"]
+    assert anion_homo.loc[0, "anion_HOMO_eV"] == -1.0
+    assert anion_lumo.loc[0, "anion_LUMO_eV"] == 2.0
+    assert cation_homo.loc[0, "cation_HOMO_eV"] == -9.0
+    assert cation_lumo.loc[0, "cation_LUMO_eV"] == -4.0
+    assert not (simulation_root / "homo.csv").exists()
+    assert not (simulation_root / "lumo.csv").exists()
+    assert not (simulation_root / "gap.csv").exists()
+
+    manifest = pd.read_csv(output_root / "merged_manifest.csv")
+    orbital_rows = manifest[manifest["property_label"].isin(
+        {"anion_HOMO_eV", "anion_LUMO_eV", "cation_HOMO_eV", "cation_LUMO_eV"}
+    )]
+    assert dict(zip(orbital_rows["property_label"], orbital_rows["output_file"])) == {
+        "anion_HOMO_eV": "simulation/anion_homo.csv",
+        "anion_LUMO_eV": "simulation/anion_lumo.csv",
+        "cation_HOMO_eV": "simulation/cation_homo.csv",
+        "cation_LUMO_eV": "simulation/cation_lumo.csv",
+    }
+    assert set(orbital_rows["input_rows"]) == {1}
+    assert set(orbital_rows["output_rows"]) == {1}
+    assert set(orbital_rows.loc[orbital_rows["property_label"].str.startswith("anion_"), "input_files"]) == {
+        "simulation/simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv"
+    }
+    assert set(orbital_rows.loc[orbital_rows["property_label"].str.startswith("cation_"), "input_files"]) == {
+        "simulation/simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv"
+    }
+
     heat_capacity = pd.read_csv(output_root / "simulation" / "heat_capacity.csv")
     assert list(heat_capacity.columns) == [
         "cation",
@@ -265,6 +304,7 @@ def test_qm_elec_hf_file_outputs_one_wide_table_instead_of_split_labels(tmp_path
     assert list(wide.columns) == ["SMILES", "ESP_max", "ESP_min", "gap_eV", "source_list"]
     assert len(wide) == 2
     assert wide["ESP_max"].isna().sum() == 1
+    assert set(wide["gap_eV"]) == {2.0, 3.0}
     assert not (output_root / "simulation" / "esp_max.csv").exists()
     assert not (output_root / "simulation" / "esp_min.csv").exists()
     assert not (output_root / "simulation" / "gap.csv").exists()
