@@ -22,7 +22,10 @@ WIDE_TABLE_FILES = {
     "simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF",
 }
 PROPERTY_OUTPUT_SLUGS = {"pressure_kPa_log10": "equilibrium_pressure"}
-SIMULATION_PROPERTY_LABEL_ALIASES = {"solvation_kcal/mol": "transfer_organic_kcal/mol"}
+PROPERTY_LABEL_ALIASES = {
+    ("after_AIonopedia", "partition_log10"): "transfer_kcal/mol",
+    ("simulation", "solvation_kcal/mol"): "transfer_organic_kcal/mol",
+}
 SOURCE_COLUMNS = {"source", "source_file"}
 MISSING_TOKEN = "__ILUME_MISSING_CONDITION__"
 DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM = 589.0
@@ -73,9 +76,7 @@ def output_slug(label: str) -> str:
 
 
 def output_label(source: str, label: str) -> str:
-    if source in SIMULATION_SOURCES:
-        return SIMULATION_PROPERTY_LABEL_ALIASES.get(label, label)
-    return label
+    return PROPERTY_LABEL_ALIASES.get((source, label), label)
 
 
 def is_error_label(label: str) -> bool:
