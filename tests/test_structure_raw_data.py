@@ -83,7 +83,7 @@ def test_structure_after_aionopedia_density_converts_g_l(tmp_path: Path):
     assert df.loc[0, "density_g/cm^3"] == 1.343
 
 
-def test_after_aionopedia_part_uses_log10_label(tmp_path: Path):
+def test_after_aionopedia_part_uses_transfer_label(tmp_path: Path):
     input_path = tmp_path / "updated_data_part"
     output_path = tmp_path / "part_structured.csv"
     pd.DataFrame(
@@ -99,8 +99,8 @@ def test_after_aionopedia_part_uses_log10_label(tmp_path: Path):
 
     df = structure_after_aionopedia_file(input_path, output_path, "part")
 
-    assert list(df.columns) == ["cation", "anion", "solute", "temperature_K", "partition_log10"]
-    assert df.loc[0, "partition_log10"] == -0.15961
+    assert list(df.columns) == ["cation", "anion", "solute", "temperature_K", "transfer_kcal/mol"]
+    assert df.loc[0, "transfer_kcal/mol"] == -0.15961
 
 
 def test_aionopedia_solvation_and_transfer_use_kcal_mol_labels(tmp_path: Path):
