@@ -54,6 +54,58 @@ def test_experiment_sources_merge_by_property_and_aggregate_identical_records(tm
     assert any(result["bucket"] == "experiment" and result["property_label"] == "density_g/cm^3" for result in results)
 
 
+def test_after_aionopedia_part_merges_with_transfer_and_preserves_different_values(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    duplicate = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "solute": "CCO",
+        "temperature_K": 298.15,
+    }
+    revised = {
+        "cation": "CCCC[n+]1ccn(C)c1",
+        "anion": "N#C[N-]C#N",
+        "solute": "C1COCCO1",
+        "temperature_K": 298.15,
+    }
+    write_csv(
+        input_root / "AIonopedia" / "AIonopedia_transfer_structured.csv",
+        [
+            {**duplicate, "transfer_kcal/mol": 1.25},
+            {**revised, "transfer_kcal/mol": 2.0},
+        ],
+    )
+    write_csv(
+        input_root / "after_AIonopedia" / "after_AIonopedia_part_structured.csv",
+        [
+            {**duplicate, "partition_log10": 1.25},
+            {**revised, "partition_log10": 2.5},
+        ],
+    )
+
+    merge_data(input_root, output_root)
+
+    transfer = pd.read_csv(output_root / "experiment" / "transfer.csv")
+    assert len(transfer) == 3
+    assert set(transfer["transfer_kcal/mol"]) == {1.25, 2.0, 2.5}
+    assert transfer.loc[transfer["transfer_kcal/mol"].eq(1.25), "source_list"].item() == (
+        "AIonopedia; after_AIonopedia"
+    )
+    assert transfer.loc[transfer["transfer_kcal/mol"].eq(2.0), "source_list"].item() == "AIonopedia"
+    assert transfer.loc[transfer["transfer_kcal/mol"].eq(2.5), "source_list"].item() == "after_AIonopedia"
+    assert not (output_root / "experiment" / "partition.csv").exists()
+
+    manifest = pd.read_csv(output_root / "merged_manifest.csv")
+    row = manifest[manifest["property_label"].eq("transfer_kcal/mol")].iloc[0]
+    assert row["input_files"] == (
+        "AIonopedia/AIonopedia_transfer_structured.csv; "
+        "after_AIonopedia/after_AIonopedia_part_structured.csv"
+    )
+    assert row["input_rows"] == 4
+    assert row["output_rows"] == 3
+
+
 def test_refractive_index_missing_wavelength_defaults_to_sodium_d_line(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
