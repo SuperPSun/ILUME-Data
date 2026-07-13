@@ -21,6 +21,11 @@ WIDE_TABLE_FILES = {
     "3d_box_structured.csv": "3d_box",
     "simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF",
 }
+SINGLE_ION_ORBITAL_FILES = {
+    "simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv": "anion",
+    "simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv": "cation",
+}
+SINGLE_ION_ORBITAL_LABELS = {"HOMO_eV", "LUMO_eV"}
 PROPERTY_OUTPUT_SLUGS = {"pressure_kPa_log10": "equilibrium_pressure"}
 PROPERTY_LABEL_ALIASES = {
     ("after_AIonopedia", "partition_log10"): "transfer_kcal/mol",
@@ -259,12 +264,17 @@ def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list
                 wide_df["source_file"] = path.name
                 properties.setdefault(wide_key, []).append(wide_df)
                 continue
+            ion_prefix = SINGLE_ION_ORBITAL_FILES.get(path.name)
             for label in label_columns(df):
+                if ion_prefix is not None and label == "gap_eV":
+                    continue
                 keep_columns = [column for column in BASE_COLUMNS if column in df.columns]
                 property_df = df.loc[df[label].notna(), [*keep_columns, label]].copy()
                 if property_df.empty:
                     continue
                 target_label = output_label(source, label)
+                if ion_prefix is not None and label in SINGLE_ION_ORBITAL_LABELS:
+                    target_label = f"{ion_prefix}_{label}"
                 if target_label != label:
                     property_df = property_df.rename(columns={label: target_label})
                 if label == "refractive_index_unitless":
