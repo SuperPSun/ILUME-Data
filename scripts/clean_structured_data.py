@@ -33,18 +33,18 @@ BOX_3D_OUTPUT_COLUMNS = (
     "rdf_ca_peak1_r_A",
     "rdf_ca_peak1_g",
     "rdf_ca_coordination1",
-    "rdf_ca_excess_area_A",
+#    "rdf_ca_excess_area_A",
     "rdf_cc_peak1_g",
-    "rdf_cc_excess_area_A",
+#    "rdf_cc_excess_area_A",
     "rdf_aa_peak1_g",
-    "rdf_aa_excess_area_A",
+#    "rdf_aa_excess_area_A",
     "scc_prepeak_present",
     "scc_prepeak_q_A^-1",
     "scc_prepeak_height",
-    "scc_prepeak_area_A^-1",
+#    "scc_prepeak_area_A^-1",
     "szz_peak_q_A^-1",
     "szz_peak_height",
-    "szz_peak_area_A^-1",
+#    "szz_peak_area_A^-1",
 )
 QM_ELEC_HF_FILENAME = "simulated_QM_elec_HF_structured.csv"
 QM_ELEC_HF_COLUMNS = (
