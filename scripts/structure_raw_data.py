@@ -146,7 +146,7 @@ AFTER_AIONOPEDIA_SPECS = {
         "after_AIonopedia_melting_point_structured.csv",
         "melting_point_K",
     ),
-    "part": ("updated_data_part", "after_AIonopedia_part_structured.csv", "partition_log10"),
+    "part": ("updated_data_part", "after_AIonopedia_part_structured.csv", "transfer_kcal/mol"),
     "solv": ("updated_data_solv", "after_AIonopedia_solv_structured.csv", "solvation_kcal/mol"),
     "surface_tension": (
         "updated_data_surface_tension",
