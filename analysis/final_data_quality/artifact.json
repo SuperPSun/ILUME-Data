@@ -1,0 +1,353 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "ILUME final CSV 数据质量审计",
+    "description": "对 data/final 中 33 个 CSV 的可复现技术审计；按要求排除 MOL2 文件。",
+    "generatedAt": "2026-07-16T14:33:54+08:00",
+    "cards": [
+      {
+        "id": "dataset_scale",
+        "description": "本次审计覆盖的 CSV 总行数与文件数。",
+        "dataset": "headline_metrics",
+        "sourceId": "headline_metrics_sql",
+        "metrics": [
+          {"label": "审计记录", "field": "total_rows", "format": "number"},
+          {"label": "CSV 文件", "field": "csv_files", "format": "number"}
+        ]
+      },
+      {
+        "id": "ion_role_failures",
+        "description": "RDKit 净形式电荷不符合 cation/anion 角色的实验记录。",
+        "dataset": "headline_metrics",
+        "sourceId": "headline_metrics_sql",
+        "metrics": [
+          {"label": "离子角色异常", "field": "invalid_ion_role_rows", "format": "number"},
+          {"label": "cation = anion", "field": "same_ion_rows", "format": "number"}
+        ]
+      },
+      {
+        "id": "neutral_charge_loss",
+        "description": "原始 charge 映射中的中性分子未进入 charge.csv。",
+        "dataset": "headline_metrics",
+        "sourceId": "headline_metrics_sql",
+        "metrics": [
+          {"label": "缺失中性电荷行", "field": "neutral_charge_rows_lost", "format": "number"},
+          {"label": "charge.csv 覆盖率", "field": "charge_csv_coverage", "format": "percent"}
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "grain_conflict_chart",
+        "title": "同一输入对应多标签的记录占比",
+        "subtitle": "按系统标识与实验条件分组；展示占比最高的 10 个单属性表",
+        "showDescription": true,
+        "intent": "comparison",
+        "question": "哪些属性表最容易让同一模型输入对应多个目标值？",
+        "rationale": "横向条形图适合比较长文件名和单一占比指标。",
+        "comparisonContext": {
+          "denominator": "各 CSV 的全部记录",
+          "grain": "系统标识列 + 实验条件列",
+          "unit": "记录占比"
+        },
+        "type": "horizontalBar",
+        "dataset": "grain_conflicts",
+        "sourceId": "grain_conflicts_sql",
+        "encodings": {
+          "x": {"field": "property", "type": "nominal", "label": "属性表"},
+          "y": {"field": "affected_rate", "type": "quantitative", "label": "受影响记录占比", "format": "percent"},
+          "tooltip": [
+            {"field": "affected_rows", "type": "quantitative", "label": "受影响记录"},
+            {"field": "conflict_groups", "type": "quantitative", "label": "冲突组"},
+            {"field": "total_rows", "type": "quantitative", "label": "总记录"},
+            {"field": "max_range", "type": "quantitative", "label": "组内最大极差"}
+          ]
+        },
+        "valueFormat": "percent",
+        "layout": "full",
+        "labels": {"values": "all"},
+        "palette": {"kind": "sequential", "name": "blue"},
+        "settings": {"orientation": "horizontal", "sort": "descending", "showValues": true},
+        "surface": {"surface": "export", "showControls": false, "viewMode": "visualization"}
+      }
+    ],
+    "tables": [
+      {
+        "id": "issue_table",
+        "title": "需要处理的数据质量问题",
+        "subtitle": "按修复优先级排序；数量均来自已执行审计",
+        "showDescription": true,
+        "dataset": "issues",
+        "sourceId": "issues_sql",
+        "defaultSort": {"field": "priority", "direction": "asc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "priority", "label": "优先级", "format": "number"},
+          {"field": "severity", "label": "严重度", "type": "text"},
+          {"field": "finding", "label": "问题", "type": "text"},
+          {"field": "evidence", "label": "证据", "type": "text"},
+          {"field": "risk", "label": "影响", "type": "text"},
+          {"field": "confidence", "label": "置信度", "type": "text"}
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "audit_notebook",
+        "label": "final CSV 可复现审计",
+        "path": "analysis/final_data_quality/final_data_quality_audit.ipynb",
+        "query": {
+          "language": "python",
+          "query": "from pathlib import Path\nfrom analysis.final_data_quality.audit import run_audit\naudit = run_audit(Path('.'))",
+          "description": "读取 data/final 的 33 个 CSV，并对必要的原始 simulation CSV 做零值保真核对。",
+          "filters": ["排除所有 MOL2 文件", "不修改源数据"],
+          "metric_definitions": [
+            "离子角色异常：cation 的净形式电荷 <= 0，或 anion 的净形式电荷 >= 0。",
+            "候选粒度冲突：系统标识列和实验条件列相同、标签值不同的记录组。"
+          ],
+          "tables_used": ["data/final/**/*.csv", "data/raw/simulation_data/*.csv"]
+        }
+      },
+      {
+        "id": "headline_metrics_sql",
+        "label": "审计头部指标快照",
+        "path": "analysis/final_data_quality/final_data_quality_audit.ipynb",
+        "query": {
+          "engine": "duckdb",
+          "language": "sql",
+          "sql": "SELECT 1453746::BIGINT AS total_rows, 33::INTEGER AS csv_files, 1143::INTEGER AS invalid_ion_role_rows, 978::INTEGER AS same_ion_rows, 20206::INTEGER AS neutral_charge_rows_lost, 0.2837598355::DOUBLE AS charge_csv_coverage",
+          "description": "从已执行 notebook 输出保存报告头部指标。",
+          "metric_definitions": ["charge_csv_coverage = 8006 / 28214"]
+        }
+      },
+      {
+        "id": "grain_conflicts_sql",
+        "label": "候选粒度冲突快照",
+        "path": "analysis/final_data_quality/final_data_quality_audit.ipynb",
+        "query": {
+          "engine": "duckdb",
+          "language": "sql",
+          "sql": "SELECT * FROM (VALUES ('solvation','experiment/solvation.csv',44299,20517,41035,0.9263188785,0.004156473), ('melting point','experiment/melting_point.csv',4709,737,1913,0.4062433638,265.1), ('viscosity','experiment/viscosity.csv',44529,4027,12289,0.2759774529,1.4867530407), ('density','experiment/density.csv',97952,7761,24675,0.2519090983,0.35617), ('self diffusion','experiment/self_diffusion_coefficient.csv',382,42,87,0.2277486911,0.5740312677), ('surface tension','experiment/surface_tension.csv',11666,960,2311,0.1980970341,65.48), ('refractive index','experiment/refractive_index.csv',10761,793,2131,0.1980299229,0.044), ('static permittivity','experiment/static_relative_permittivity.csv',65,5,12,0.1846153846,6.6), ('speed of sound','experiment/speed_of_sound.csv',6819,412,1088,0.1595541868,37.3), ('heat capacity','experiment/heat_capacity.csv',23584,1354,3469,0.1470912483,228.0)) AS t(property,file,total_rows,conflict_groups,affected_rows,affected_rate,max_range)",
+          "description": "保存冲突占比最高的 10 个单属性表。",
+          "filters": ["候选粒度为系统标识列与实验条件列", "仅保留候选粒度重复组"]
+        }
+      },
+      {
+        "id": "issues_sql",
+        "label": "数据质量问题快照",
+        "path": "analysis/final_data_quality/final_data_quality_audit.ipynb",
+        "query": {
+          "engine": "duckdb",
+          "language": "sql",
+          "sql": "SELECT * FROM (VALUES (1,'Critical','离子对身份损坏','14 个实验表有 1,143 行角色异常；978 行 cation = anion','模型输入代表错误或不存在的离子液体系统','高'), (2,'Critical','合法零值被当作缺失','20,206 条中性 charge 未进入 charge.csv；QM 有 6,801 个缺失标签单元；32 条零溶剂化标签被删除','类别选择偏差、标签缺失和样本删除','高'), (3,'High','solvation 近似重复未合并','20,517 个冲突组，影响 41,035 行（92.63%）；最大极差仅 0.004156 kcal/mol','重复加权、行级切分泄漏、评估过于乐观','高'), (4,'High','QM 重复 SMILES 缺少粒度键','737 组、1,675 行；每个 SMILES 最多 24 行；gap 极差最大 3.419 eV','无法解释、选择或聚合重复计算','高'), (5,'Medium','原始 mapping 被重新带入 final','mapping.csv 含 2 条 RDKit 无法解析的 SMILES、203 条非 canonical 记录','字符串 join 失败，且与已清洗 charge.csv 的有效性标准不一致','高'), (6,'Medium','条件与发布元数据不完整','6 个实验表缺压力，最高 44.61%；final 无生成时间和合并/拒绝 manifest','条件处理不透明，异常值与来源难以追溯','中')) AS t(priority,severity,finding,evidence,risk,confidence)",
+          "description": "保存经过人工解释和严重度分级的数据质量发现。"
+        }
+      },
+      {
+        "id": "numeric_parser",
+        "label": "数值解析实现",
+        "path": "scripts/structure_raw_data.py",
+        "query": {
+          "language": "python",
+          "description": "to_float 使用 value or empty-string，导致数值 0 被当作缺失。"
+        }
+      },
+      {
+        "id": "ion_parser",
+        "label": "离子拆分实现",
+        "path": "src/raw_prep.py",
+        "query": {
+          "language": "python",
+          "description": "split_cation_anion 依据 SMILES 字符串是否包含正负号选择片段，而非片段净形式电荷。"
+        }
+      },
+      {
+        "id": "final_builder",
+        "label": "final 数据构建实现",
+        "path": "scripts/build_final_data.py",
+        "query": {
+          "language": "python",
+          "description": "final 构建直接复制 merged 属性表和原始 charge 目录，未执行新的质量门禁。"
+        }
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# ILUME final CSV 数据质量审计"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "body": "## 技术摘要\n\n**结论：当前 final CSV 不建议原样作为最终训练集发布。** 审计确认了两个会系统性改变数据含义的上游缺陷：离子角色误判，以及合法数值 `0` 被转成缺失。前者使 1,143 条实验记录的 cation/anion 净电荷角色不成立，其中 978 条甚至 `cation == anion`；后者删除了 charge 数据中的全部 20,206 条中性样本，并把 QM 零值变成缺失。\n\n积极的一面是，33 个 CSV、合计 1,453,746 条记录中没有整行精确重复，也没有 `inf/-inf` 数值。修复解析逻辑并全量重建后，这套数据仍有较好的可恢复性。"
+      },
+      {
+        "id": "headline_metrics_block",
+        "type": "metric-strip",
+        "cardIds": ["dataset_scale", "ion_role_failures", "neutral_charge_loss"]
+      },
+      {
+        "id": "critical_findings",
+        "type": "markdown",
+        "body": "## 两个解析缺陷已经改变 final 的标签与系统身份\n\n**离子拆分缺陷是系统身份级问题。** 当前实现按 SMILES 字符串中是否出现 `+` 或 `-` 选片段；硝酸根、叠氮基等单个片段内部同时含正负形式电荷标记时，可能被同时选为 cation 与 anion。受影响记录横跨 14 个实验表，最高占比出现在 `melting_point.csv`（5.27%）。\n\n**零值丢失会造成强烈选择偏差。** `to_float` 对数值使用 `value or \"\"`，所以整数/浮点零变成空值。除 20,206 条中性 charge 样本外，QM 表累计有 6,801 个标签缺失单元，其中 `ESP_pos_frac` 缺失 6,749 个；另有 32 条零溶剂化标签被当作 missing label 删除。"
+      },
+      {
+        "id": "issue_table_block",
+        "type": "table",
+        "tableId": "issue_table"
+      },
+      {
+        "id": "grain_conflict_narrative",
+        "type": "markdown",
+        "body": "## 同一输入对应多标签，需要区分近似重复与真实复现实验\n\n下图按每个属性表自身的记录数计算冲突占比。**`solvation.csv` 最突出：41,035 条记录（92.63%）落在 20,517 个冲突组中，但所有组内标签极差都不超过 0.004156 kcal/mol。** 这更像来源间精度差异，而不是有意义的复现实验差异；当前全局绝对容差 `5e-7` 太小。若按行随机划分，会把几乎相同的输入和标签同时放入训练与测试。"
+      },
+      {
+        "id": "grain_conflict_chart_block",
+        "type": "chart",
+        "chartId": "grain_conflict_chart"
+      },
+      {
+        "id": "qm_finding",
+        "type": "markdown",
+        "body": "## QM 表缺少区分重复计算的粒度键\n\n`simulated_qm_elec_hf.csv` 中有 737 个重复 SMILES 组、涉及 1,675 行（5.94%），单个 SMILES 最多 24 行。重复组的 `gap_eV` 极差中位数为 0.097 eV，最大为 3.419 eV，但表中没有 `mol_id`、构象号或计算批次用于解释差异；另外有 2 行负 `gap_eV`。这些记录不一定都错误，但当前粒度无法让下游选择或聚合。"
+      },
+      {
+        "id": "scope_definitions",
+        "type": "markdown",
+        "body": "## 范围、粒度与完整性定义\n\n本次范围严格限定为 `data/final` 下的 33 个 CSV；按用户要求，所有 MOL2 文件及其内部结构均未纳入结论。单属性表的候选粒度定义为现有系统标识列（如 cation、anion、solute、solvent、mol_id）与现有实验条件列的组合。\n\n压力缺失集中在 6 个实验表：`viscosity` 44.61%、`heat_capacity` 43.88%、`refractive_index` 27.32%、`electrical_conductivity` 20.30%、`density` 19.55%、`thermal_conductivity` 0.81%。这可能是来源真实缺失，不应擅自填成常压；模型与文档必须显式说明处理方法。"
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "body": "## 审计方法可从 notebook 完整复跑\n\n检查包括：文件/行/列盘点、整行重复、候选粒度冲突、缺失标签与条件、非有限数值、RDKit SMILES 解析与净形式电荷、QM 交叉字段规则、charge 映射覆盖，以及 raw-to-final 零值保真。所有代码已在 companion notebook 中从头到尾执行通过。"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## 限制、不确定性与稳健性说明\n\n- 数据没有生成时间、实验时间或版本字段，因此无法做新鲜度、历史漂移或回填检测。\n- `source_list` 只到来源级别，final 目录没有随附 `merged_manifest.csv`、拒绝原因摘要或逐行原始记录引用，限制了异常值追溯。\n- 164 条电导率和 47 条黏度记录超出非 ILThermo 清洗阈值，但它们全部来自 ILThermo，且原始值在低温/高压条件下有物理可能性；本报告把它们列为筛选政策不一致，而不是直接判定为错误。\n- 51 条 simulation transfer 值低于 -50 kcal/mol；该属性在清洗阶段按 solvation 的 -100 至 100 范围通过、随后才改名为 transfer，需由领域规则确认应采用哪套范围。"
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## 建议按依赖顺序修复并重建\n\n1. 将 `to_float` 改为显式判断 `None/NaN/空字符串`，保留数值零，并为 charge、QM fractions/dipole、solvation 零值写回归测试。\n2. 以 RDKit 片段净形式电荷拆分离子；要求 cation 净电荷 > 0、anion < 0、二者不同，对多价/歧义片段进入拒绝报告。\n3. 从 raw 重新执行 structure → clean → merge → final，全量跑质量门禁，避免只在现有 final 上打补丁。\n4. 为 solvation 使用属性感知的近似值合并容差或明确来源优先级；其他多标签组保留 replicate/source-file 键，并按系统分组切分训练集。\n5. 为 QM 表加入 `mol_id`、构象或计算批次键；恢复零值后再决定聚合规则。\n6. 将 manifest、清洗/拒绝摘要、版本与生成时间一起发布到 final。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 仍需确认的领域决策\n\n- 同一系统与条件下的多来源测量，目标是保留全部复现实验、按来源择优，还是聚合成单一训练标签？\n- `simulation/transfer_organic.csv` 表示有机溶剂中的溶剂化自由能，还是两个标准态之间的转移自由能？这决定命名、单位说明和有效范围。\n- QM 同一 SMILES 的多行是否对应不同构象或重复计算？如果是，需要补充可追踪键而不是直接去重。"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-07-16T14:33:54+08:00",
+    "status": "ready",
+    "datasets": {
+      "headline_metrics": [
+        {
+          "total_rows": 1453746,
+          "csv_files": 33,
+          "invalid_ion_role_rows": 1143,
+          "same_ion_rows": 978,
+          "neutral_charge_rows_lost": 20206,
+          "charge_csv_coverage": 0.2837598355
+        }
+      ],
+      "grain_conflicts": [
+        {"property": "solvation", "file": "experiment/solvation.csv", "total_rows": 44299, "conflict_groups": 20517, "affected_rows": 41035, "affected_rate": 0.9263188785, "max_range": 0.004156473},
+        {"property": "melting point", "file": "experiment/melting_point.csv", "total_rows": 4709, "conflict_groups": 737, "affected_rows": 1913, "affected_rate": 0.4062433638, "max_range": 265.1},
+        {"property": "viscosity", "file": "experiment/viscosity.csv", "total_rows": 44529, "conflict_groups": 4027, "affected_rows": 12289, "affected_rate": 0.2759774529, "max_range": 1.4867530407},
+        {"property": "density", "file": "experiment/density.csv", "total_rows": 97952, "conflict_groups": 7761, "affected_rows": 24675, "affected_rate": 0.2519090983, "max_range": 0.35617},
+        {"property": "self diffusion", "file": "experiment/self_diffusion_coefficient.csv", "total_rows": 382, "conflict_groups": 42, "affected_rows": 87, "affected_rate": 0.2277486911, "max_range": 0.5740312677},
+        {"property": "surface tension", "file": "experiment/surface_tension.csv", "total_rows": 11666, "conflict_groups": 960, "affected_rows": 2311, "affected_rate": 0.1980970341, "max_range": 65.48},
+        {"property": "refractive index", "file": "experiment/refractive_index.csv", "total_rows": 10761, "conflict_groups": 793, "affected_rows": 2131, "affected_rate": 0.1980299229, "max_range": 0.044},
+        {"property": "static permittivity", "file": "experiment/static_relative_permittivity.csv", "total_rows": 65, "conflict_groups": 5, "affected_rows": 12, "affected_rate": 0.1846153846, "max_range": 6.6},
+        {"property": "speed of sound", "file": "experiment/speed_of_sound.csv", "total_rows": 6819, "conflict_groups": 412, "affected_rows": 1088, "affected_rate": 0.1595541868, "max_range": 37.3},
+        {"property": "heat capacity", "file": "experiment/heat_capacity.csv", "total_rows": 23584, "conflict_groups": 1354, "affected_rows": 3469, "affected_rate": 0.1470912483, "max_range": 228.0}
+      ],
+      "issues": [
+        {"priority": 1, "severity": "Critical", "finding": "离子对身份损坏", "evidence": "14 个实验表有 1,143 行角色异常；978 行 cation = anion", "risk": "模型输入代表错误或不存在的离子液体系统", "confidence": "高"},
+        {"priority": 2, "severity": "Critical", "finding": "合法零值被当作缺失", "evidence": "20,206 条中性 charge 未进入 charge.csv；QM 有 6,801 个缺失标签单元；32 条零溶剂化标签被删除", "risk": "类别选择偏差、标签缺失和样本删除", "confidence": "高"},
+        {"priority": 3, "severity": "High", "finding": "solvation 近似重复未合并", "evidence": "20,517 个冲突组，影响 41,035 行（92.63%）；最大极差仅 0.004156 kcal/mol", "risk": "重复加权、行级切分泄漏、评估过于乐观", "confidence": "高"},
+        {"priority": 4, "severity": "High", "finding": "QM 重复 SMILES 缺少粒度键", "evidence": "737 组、1,675 行；每个 SMILES 最多 24 行；gap 极差最大 3.419 eV", "risk": "无法解释、选择或聚合重复计算", "confidence": "高"},
+        {"priority": 5, "severity": "Medium", "finding": "原始 mapping 被重新带入 final", "evidence": "mapping.csv 含 2 条 RDKit 无法解析的 SMILES、203 条非 canonical 记录", "risk": "字符串 join 失败，且与已清洗 charge.csv 的有效性标准不一致", "confidence": "高"},
+        {"priority": 6, "severity": "Medium", "finding": "条件与发布元数据不完整", "evidence": "6 个实验表缺压力，最高 44.61%；final 无生成时间和合并/拒绝 manifest", "risk": "条件处理不透明，异常值与来源难以追溯", "confidence": "中"}
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "audit_notebook",
+      "label": "final CSV 可复现审计",
+      "path": "analysis/final_data_quality/final_data_quality_audit.ipynb",
+      "query": {
+        "language": "python",
+        "query": "from pathlib import Path\nfrom analysis.final_data_quality.audit import run_audit\naudit = run_audit(Path('.'))",
+        "description": "读取 data/final 的 33 个 CSV，并对必要的原始 simulation CSV 做零值保真核对。",
+        "filters": ["排除所有 MOL2 文件", "不修改源数据"],
+        "metric_definitions": [
+          "离子角色异常：cation 的净形式电荷 <= 0，或 anion 的净形式电荷 >= 0。",
+          "候选粒度冲突：系统标识列和实验条件列相同、标签值不同的记录组。"
+        ],
+        "tables_used": ["data/final/**/*.csv", "data/raw/simulation_data/*.csv"]
+      }
+    },
+    {
+      "id": "headline_metrics_sql",
+      "label": "审计头部指标快照",
+      "path": "analysis/final_data_quality/final_data_quality_audit.ipynb",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "sql": "SELECT 1453746::BIGINT AS total_rows, 33::INTEGER AS csv_files, 1143::INTEGER AS invalid_ion_role_rows, 978::INTEGER AS same_ion_rows, 20206::INTEGER AS neutral_charge_rows_lost, 0.2837598355::DOUBLE AS charge_csv_coverage",
+        "description": "从已执行 notebook 输出保存报告头部指标。",
+        "metric_definitions": ["charge_csv_coverage = 8006 / 28214"]
+      }
+    },
+    {
+      "id": "grain_conflicts_sql",
+      "label": "候选粒度冲突快照",
+      "path": "analysis/final_data_quality/final_data_quality_audit.ipynb",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "sql": "SELECT * FROM (VALUES ('solvation','experiment/solvation.csv',44299,20517,41035,0.9263188785,0.004156473), ('melting point','experiment/melting_point.csv',4709,737,1913,0.4062433638,265.1), ('viscosity','experiment/viscosity.csv',44529,4027,12289,0.2759774529,1.4867530407), ('density','experiment/density.csv',97952,7761,24675,0.2519090983,0.35617), ('self diffusion','experiment/self_diffusion_coefficient.csv',382,42,87,0.2277486911,0.5740312677), ('surface tension','experiment/surface_tension.csv',11666,960,2311,0.1980970341,65.48), ('refractive index','experiment/refractive_index.csv',10761,793,2131,0.1980299229,0.044), ('static permittivity','experiment/static_relative_permittivity.csv',65,5,12,0.1846153846,6.6), ('speed of sound','experiment/speed_of_sound.csv',6819,412,1088,0.1595541868,37.3), ('heat capacity','experiment/heat_capacity.csv',23584,1354,3469,0.1470912483,228.0)) AS t(property,file,total_rows,conflict_groups,affected_rows,affected_rate,max_range)",
+        "description": "保存冲突占比最高的 10 个单属性表。",
+        "filters": ["候选粒度为系统标识列与实验条件列", "仅保留候选粒度重复组"]
+      }
+    },
+    {
+      "id": "issues_sql",
+      "label": "数据质量问题快照",
+      "path": "analysis/final_data_quality/final_data_quality_audit.ipynb",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "sql": "SELECT * FROM (VALUES (1,'Critical','离子对身份损坏','14 个实验表有 1,143 行角色异常；978 行 cation = anion','模型输入代表错误或不存在的离子液体系统','高'), (2,'Critical','合法零值被当作缺失','20,206 条中性 charge 未进入 charge.csv；QM 有 6,801 个缺失标签单元；32 条零溶剂化标签被删除','类别选择偏差、标签缺失和样本删除','高'), (3,'High','solvation 近似重复未合并','20,517 个冲突组，影响 41,035 行（92.63%）；最大极差仅 0.004156 kcal/mol','重复加权、行级切分泄漏、评估过于乐观','高'), (4,'High','QM 重复 SMILES 缺少粒度键','737 组、1,675 行；每个 SMILES 最多 24 行；gap 极差最大 3.419 eV','无法解释、选择或聚合重复计算','高'), (5,'Medium','原始 mapping 被重新带入 final','mapping.csv 含 2 条 RDKit 无法解析的 SMILES、203 条非 canonical 记录','字符串 join 失败，且与已清洗 charge.csv 的有效性标准不一致','高'), (6,'Medium','条件与发布元数据不完整','6 个实验表缺压力，最高 44.61%；final 无生成时间和合并/拒绝 manifest','条件处理不透明，异常值与来源难以追溯','中')) AS t(priority,severity,finding,evidence,risk,confidence)",
+        "description": "保存经过人工解释和严重度分级的数据质量发现。"
+      }
+    },
+    {
+      "id": "numeric_parser",
+      "label": "数值解析实现",
+      "path": "scripts/structure_raw_data.py",
+      "query": {"language": "python", "description": "to_float 使用 value or empty-string，导致数值 0 被当作缺失。"}
+    },
+    {
+      "id": "ion_parser",
+      "label": "离子拆分实现",
+      "path": "src/raw_prep.py",
+      "query": {"language": "python", "description": "split_cation_anion 依据 SMILES 字符串是否包含正负号选择片段，而非片段净形式电荷。"}
+    },
+    {
+      "id": "final_builder",
+      "label": "final 数据构建实现",
+      "path": "scripts/build_final_data.py",
+      "query": {"language": "python", "description": "final 构建直接复制 merged 属性表和原始 charge 目录，未执行新的质量门禁。"}
+    }
+  ]
+}
