@@ -171,6 +171,109 @@ def test_scalar_properties_fold_close_values_without_crossing_conditions_or_tole
     assert set(chain["source_list"]) == {"AIonopedia; ILBERT", "after_AIonopedia"}
 
 
+def test_close_value_exclusions_are_saved_for_audit_and_stale_files_are_removed(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    base = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+    }
+    aionopedia_path = input_root / "AIonopedia" / "AIonopedia_density_structured.csv"
+    ilbert_path = input_root / "ILBERT" / "ILBERT_density_structured.csv"
+    write_csv(aionopedia_path, [{**base, "density_g/cm^3": 1.25}])
+    write_csv(ilbert_path, [{**base, "density_g/cm^3": 1.2500005}])
+
+    merge_data(input_root, output_root)
+
+    rejected_path = (
+        output_root
+        / "rejected_rows"
+        / "experiment"
+        / "density_approximate_values_rejected.csv"
+    )
+    rejected = pd.read_csv(rejected_path)
+    assert list(rejected.columns) == [
+        "cation",
+        "anion",
+        "temperature_K",
+        "density_g/cm^3",
+        "retained_value",
+        "absolute_difference",
+        "source",
+        "source_file",
+    ]
+    assert len(rejected) == 1
+    assert rejected.loc[0, "density_g/cm^3"] == 1.25
+    assert rejected.loc[0, "retained_value"] == 1.2500005
+    assert rejected.loc[0, "absolute_difference"] == pytest.approx(5e-7)
+    assert rejected.loc[0, "source"] == "AIonopedia"
+    assert rejected.loc[0, "source_file"] == "AIonopedia_density_structured.csv"
+
+    write_csv(ilbert_path, [{**base, "density_g/cm^3": 1.3}])
+    merge_data(input_root, output_root)
+
+    assert not (output_root / "rejected_rows").exists()
+
+
+def test_same_system_condition_rows_are_saved_before_value_collapsing(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    base = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+    }
+    paths = {
+        "AIonopedia": input_root / "AIonopedia" / "AIonopedia_density_structured.csv",
+        "ILBERT": input_root / "ILBERT" / "ILBERT_density_structured.csv",
+        "ILThermo": input_root / "ILThermo" / "ilt_density_structured.csv",
+        "after_AIonopedia": (
+            input_root / "after_AIonopedia" / "after_AIonopedia_density_structured.csv"
+        ),
+    }
+    write_csv(
+        paths["AIonopedia"],
+        [
+            {**base, "density_g/cm^3": 1.2},
+            {**base, "temperature_K": 308.15, "density_g/cm^3": 1.4},
+        ],
+    )
+    write_csv(paths["ILBERT"], [{**base, "density_g/cm^3": 1.2000004}])
+    write_csv(paths["ILThermo"], [{**base, "density_g/cm^3": 1.2}])
+    write_csv(paths["after_AIonopedia"], [{**base, "density_g/cm^3": 1.3}])
+
+    merge_data(input_root, output_root)
+
+    matching_path = output_root / "same_system_condition_rows" / "experiment" / "density.csv"
+    matching = pd.read_csv(matching_path)
+    assert list(matching.columns) == [
+        "cation",
+        "anion",
+        "temperature_K",
+        "density_g/cm^3",
+        "matching_entry_count",
+        "source",
+        "source_file",
+    ]
+    assert len(matching) == 4
+    assert matching["temperature_K"].eq(298.15).all()
+    assert matching["matching_entry_count"].eq(4).all()
+    assert set(matching["density_g/cm^3"]) == {1.2, 1.2000004, 1.3}
+    assert set(matching["source"]) == {
+        "AIonopedia",
+        "ILBERT",
+        "ILThermo",
+        "after_AIonopedia",
+    }
+
+    for source in ("ILBERT", "ILThermo", "after_AIonopedia"):
+        paths[source].unlink()
+    merge_data(input_root, output_root)
+
+    assert not (output_root / "same_system_condition_rows").exists()
+
+
 def test_refractive_index_missing_wavelength_defaults_to_sodium_d_line(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
