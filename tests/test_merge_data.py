@@ -56,7 +56,7 @@ def test_experiment_sources_merge_by_property_and_aggregate_identical_records(tm
     assert any(result["bucket"] == "experiment" and result["property_label"] == "density_g/cm^3" for result in results)
 
 
-def test_after_aionopedia_part_merges_with_transfer_and_preserves_different_values(tmp_path: Path):
+def test_after_aionopedia_part_folds_precision_difference_and_preserves_material_difference(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
     duplicate = {
@@ -81,7 +81,7 @@ def test_after_aionopedia_part_merges_with_transfer_and_preserves_different_valu
     write_csv(
         input_root / "after_AIonopedia" / "after_AIonopedia_part_structured.csv",
         [
-            {**duplicate, "partition_log10": 1.25},
+            {**duplicate, "partition_log10": 1.2500005},
             {**revised, "partition_log10": 2.5},
         ],
     )
@@ -90,8 +90,8 @@ def test_after_aionopedia_part_merges_with_transfer_and_preserves_different_valu
 
     transfer = pd.read_csv(output_root / "experiment" / "transfer.csv")
     assert len(transfer) == 3
-    assert set(transfer["transfer_kcal/mol"]) == {1.25, 2.0, 2.5}
-    assert transfer.loc[transfer["transfer_kcal/mol"].eq(1.25), "source_list"].item() == (
+    assert set(transfer["transfer_kcal/mol"]) == {1.2500005, 2.0, 2.5}
+    assert transfer.loc[transfer["transfer_kcal/mol"].eq(1.2500005), "source_list"].item() == (
         "AIonopedia; after_AIonopedia"
     )
     assert transfer.loc[transfer["transfer_kcal/mol"].eq(2.0), "source_list"].item() == "AIonopedia"
@@ -106,6 +106,69 @@ def test_after_aionopedia_part_merges_with_transfer_and_preserves_different_valu
     )
     assert row["input_rows"] == 4
     assert row["output_rows"] == 3
+
+
+def test_scalar_properties_fold_close_values_without_crossing_conditions_or_tolerance(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+
+    def row(case: str, value: float, temperature: float = 298.15) -> dict[str, object]:
+        return {
+            "cation": f"{case}[N+](C)(C)C",
+            "anion": "[Cl-]",
+            "temperature_K": temperature,
+            "density_g/cm^3": value,
+        }
+
+    write_csv(
+        input_root / "AIonopedia" / "AIonopedia_density_structured.csv",
+        [
+            row("boundary", 1.25),
+            row("above", 1.25),
+            row("condition", 1.25),
+            row("artifact", 1.1206),
+            row("chain", 1.0),
+        ],
+    )
+    write_csv(
+        input_root / "ILBERT" / "ILBERT_density_structured.csv",
+        [
+            row("boundary", 1.2500005),
+            row("above", 1.2500006),
+            row("condition", 1.2500004, temperature=308.15),
+            row("chain", 1.0000004),
+        ],
+    )
+    write_csv(
+        input_root / "after_AIonopedia" / "after_AIonopedia_density_structured.csv",
+        [
+            row("artifact", 1.1205999999999998),
+            row("chain", 1.0000008),
+        ],
+    )
+
+    merge_data(input_root, output_root)
+
+    density = pd.read_csv(output_root / "experiment" / "density.csv")
+    assert len(density) == 8
+
+    boundary = density[density["cation"].str.startswith("boundary")]
+    assert boundary["density_g/cm^3"].tolist() == [1.2500005]
+    assert boundary["source_list"].item() == "AIonopedia; ILBERT"
+
+    above = density[density["cation"].str.startswith("above")]
+    assert set(above["density_g/cm^3"]) == {1.25, 1.2500006}
+
+    condition = density[density["cation"].str.startswith("condition")]
+    assert set(condition["temperature_K"]) == {298.15, 308.15}
+
+    artifact = density[density["cation"].str.startswith("artifact")]
+    assert artifact["density_g/cm^3"].tolist() == [1.1206]
+    assert artifact["source_list"].item() == "AIonopedia; after_AIonopedia"
+
+    chain = density[density["cation"].str.startswith("chain")]
+    assert set(chain["density_g/cm^3"]) == {1.0000004, 1.0000008}
+    assert set(chain["source_list"]) == {"AIonopedia; ILBERT", "after_AIonopedia"}
 
 
 def test_refractive_index_missing_wavelength_defaults_to_sodium_d_line(tmp_path: Path):
@@ -294,6 +357,7 @@ def test_qm_elec_hf_file_outputs_one_wide_table_instead_of_split_labels(tmp_path
         input_root / "simulation" / "simulated_QM_elec_HF_structured.csv",
         [
             {"SMILES": "CCO", "ESP_max": 1.0, "ESP_min": -1.0, "gap_eV": 2.0},
+            {"SMILES": "CCO", "ESP_max": 1.0000004, "ESP_min": -1.0, "gap_eV": 2.0},
             {"SMILES": "CCN", "ESP_max": None, "ESP_min": -2.0, "gap_eV": 3.0},
         ],
     )
@@ -302,8 +366,9 @@ def test_qm_elec_hf_file_outputs_one_wide_table_instead_of_split_labels(tmp_path
 
     wide = pd.read_csv(output_root / "simulation" / "simulated_qm_elec_hf.csv")
     assert list(wide.columns) == ["SMILES", "ESP_max", "ESP_min", "gap_eV", "source_list"]
-    assert len(wide) == 2
+    assert len(wide) == 3
     assert wide["ESP_max"].isna().sum() == 1
+    assert set(wide.loc[wide["SMILES"].eq("CCO"), "ESP_max"]) == {1.0, 1.0000004}
     assert set(wide["gap_eV"]) == {2.0, 3.0}
     assert not (output_root / "simulation" / "esp_max.csv").exists()
     assert not (output_root / "simulation" / "esp_min.csv").exists()
