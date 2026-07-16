@@ -22,6 +22,7 @@ EXCLUDED_EXPERIMENT_FILES = (
     "enthalpy_of_transition_or_fusion.csv",
     "equilibrium_temperature.csv",
 )
+EXCLUDED_SIMULATION_FILES = ("3d_box.csv",)
 
 
 def build_final_data(
@@ -29,7 +30,7 @@ def build_final_data(
     output_root: Path,
     charge_data_root: Path = CHARGE_DATA_ROOT,
 ) -> None:
-    """Rebuild ``output_root`` from merged data while omitting excluded experiments."""
+    """Rebuild ``output_root`` from merged data while omitting excluded files."""
     input_root = Path(input_root)
     output_root = Path(output_root)
     charge_data_root = Path(charge_data_root)
@@ -45,6 +46,8 @@ def build_final_data(
         )
         for filename in EXCLUDED_EXPERIMENT_FILES:
             (staged_root / "experiment" / filename).unlink()
+        for filename in EXCLUDED_SIMULATION_FILES:
+            (staged_root / "simulation" / filename).unlink(missing_ok=True)
 
         if output_root.exists():
             shutil.rmtree(output_root)
