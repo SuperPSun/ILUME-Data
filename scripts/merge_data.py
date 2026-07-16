@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import re
 import shutil
 from pathlib import Path
@@ -34,6 +35,8 @@ PROPERTY_LABEL_ALIASES = {
 SOURCE_COLUMNS = {"source", "source_file"}
 MISSING_TOKEN = "__ILUME_MISSING_CONDITION__"
 DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM = 589.0
+SCALAR_VALUE_ABSOLUTE_TOLERANCE = Decimal("5e-7")
+FLOAT_SIGNIFICANT_DIGITS = 15
 UNIT_SUFFIXES = (
     "_10^-9*m^2/s",
     "_J/mol/K",
@@ -204,9 +207,64 @@ def direct_property_frame(df: pd.DataFrame, label: str) -> pd.DataFrame:
     return out[output_columns(out, label)]
 
 
+def decimal_value(value: object) -> Decimal | None:
+    try:
+        decimal = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return decimal if decimal.is_finite() else None
+
+
+def meaningful_precision(value: object) -> int:
+    decimal = Decimal(format(float(value), f".{FLOAT_SIGNIFICANT_DIGITS}g")).normalize()
+    return len(decimal.as_tuple().digits)
+
+
+def collapse_close_property_values(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    key_columns = [column for column in BASE_COLUMNS if column in df.columns]
+    if not key_columns:
+        return df
+    candidates = df[df.duplicated(subset=key_columns, keep=False)]
+    if candidates.empty:
+        return df
+
+    collapsed = df.copy()
+
+    def collapse_cluster(cluster: list[tuple[object, Decimal]]) -> None:
+        if len(cluster) < 2:
+            return
+        representative_index = max(
+            (index for index, _value in cluster),
+            key=lambda index: (meaningful_precision(collapsed.at[index, label]), -int(index)),
+        )
+        collapsed.loc[[index for index, _value in cluster], label] = collapsed.at[representative_index, label]
+
+    for _key, group in candidates.groupby(key_columns, dropna=False, sort=False):
+        numeric_values = [
+            (index, decimal)
+            for index, value in group[label].items()
+            if (decimal := decimal_value(value)) is not None
+        ]
+        numeric_values.sort(key=lambda item: item[1])
+        cluster: list[tuple[object, Decimal]] = []
+        cluster_min: Decimal | None = None
+        for item in numeric_values:
+            if cluster_min is None or item[1] - cluster_min <= SCALAR_VALUE_ABSOLUTE_TOLERANCE:
+                cluster.append(item)
+                if cluster_min is None:
+                    cluster_min = item[1]
+                continue
+            collapse_cluster(cluster)
+            cluster = [item]
+            cluster_min = item[1]
+        collapse_cluster(cluster)
+    return collapsed
+
+
 def aggregate_property(rows: list[pd.DataFrame], label: str) -> pd.DataFrame:
     combined = pd.concat(rows, ignore_index=True)
     combined = collapse_condition_subsets(combined, [label])
+    combined = collapse_close_property_values(combined, label)
     grouping_columns = [column for column in BASE_COLUMNS if column in combined.columns]
     grouping_columns.append(label)
     if not combined.duplicated(subset=grouping_columns).any():
