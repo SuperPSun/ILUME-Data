@@ -17,6 +17,8 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from raw_prep import net_formal_charge  # noqa: E402
+
 DEFAULT_SOURCES = ("AIonopedia", "ILBERT", "after_AIonopedia", "simulation")
 EXCLUDED_SOURCES = {"ILThermo"}
 IDENTIFIER_COLUMNS = ("cation", "anion", "solute", "solvent", "smiles", "SMILES", "mol_id")
@@ -434,6 +436,32 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
         if missing.any():
             add_rejections(rejected_rows, df, missing, "missing_identifier", column, "")
             active = active & ~missing
+
+    ion_values = {
+        str(value)
+        for column in ("cation", "anion")
+        if column in df.columns
+        for value in df.loc[active, column].dropna().unique()
+    }
+    ion_charge_cache = {value: net_formal_charge(value) for value in ion_values}
+    for column, expected_sign in (("cation", 1), ("anion", -1)):
+        if column not in df.columns:
+            continue
+        charges = df[column].map(
+            lambda value: ion_charge_cache.get(str(value)) if not pd.isna(value) else None
+        )
+        wrong_sign = charges.le(0) if expected_sign > 0 else charges.ge(0)
+        invalid_role = active & charges.notna() & wrong_sign
+        if invalid_role.any():
+            add_rejections(
+                rejected_rows,
+                df,
+                invalid_role,
+                "invalid_ion_role",
+                column,
+                charges,
+            )
+            active = active & ~invalid_role
 
     df = coerce_numeric_columns(df)
     active = reject_nonpositive_log_inputs(df, rejected_rows, active)

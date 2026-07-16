@@ -341,6 +341,29 @@ def test_empty_charge_is_kept_but_out_of_range_charge_is_rejected(tmp_path: Path
     assert rejected.loc[0, "rejection_reason"] == "hard_threshold"
 
 
+def test_invalid_ion_roles_are_rejected_and_multifragment_roles_are_kept(tmp_path: Path):
+    input_path = tmp_path / "AIonopedia_density_structured.csv"
+    output_path = tmp_path / "out.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    pd.DataFrame(
+        {
+            "cation": ["CC[n+]1ccn(C)c1", "[Ca+2]"],
+            "anion": ["N#[C][Au+][C]#N", "[Cl-].[Cl-]"],
+            "density_g/cm^3": [1.1, 1.2],
+        }
+    ).to_csv(input_path, index=False)
+
+    result = clean_structured_file(input_path, output_path, rejected_path)
+
+    cleaned = pd.read_csv(output_path)
+    rejected = pd.read_csv(rejected_path)
+    assert result.rejected_rows == 1
+    assert cleaned[["cation", "anion"]].iloc[0].tolist() == ["[Ca+2]", "[Cl-].[Cl-]"]
+    assert rejected.loc[0, "rejection_reason"] == "invalid_ion_role"
+    assert rejected.loc[0, "trigger_column"] == "anion"
+    assert rejected.loc[0, "trigger_value"] == 1
+
+
 def test_unknown_unit_simulation_columns_are_not_iqr_filtered(tmp_path: Path):
     input_path = tmp_path / "simulated_QM_elec_HF_structured.csv"
     output_path = tmp_path / "out.csv"

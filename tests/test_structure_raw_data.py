@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from raw_prep import canonicalize_smiles, split_cation_anion, to_g_cm3, to_kpa
+from raw_prep import canonicalize_smiles, parse_ion_pair_identity, split_cation_anion, to_g_cm3, to_kpa
 from scripts.structure_raw_data import (
     parse_aionopedia_prompt,
     split_ion_pair,
@@ -11,6 +11,7 @@ from scripts.structure_raw_data import (
     structure_ilbert_file,
     structure_ilthermo_file,
     structure_simulation,
+    to_float,
 )
 
 
@@ -19,6 +20,36 @@ def test_split_cation_anion_and_canonicalize_smiles():
 
     assert canonicalize_smiles(cation) == "CC[n+]1ccn(C)c1"
     assert canonicalize_smiles(anion) == "F[B-](F)(F)F"
+
+
+def test_split_cation_anion_uses_fragment_net_charge_and_preserves_stoichiometry():
+    cation, anion = split_cation_anion("O=[N+]([O-])[O-].CC[n+]1ccn(C)c1")
+
+    assert canonicalize_smiles(cation) == "CC[n+]1ccn(C)c1"
+    assert canonicalize_smiles(anion) == "O=[N+]([O-])[O-]"
+
+    cation, anion = split_cation_anion("[Cl-].[Ca+2].[Cl-]")
+
+    assert canonicalize_smiles(cation) == "[Ca+2]"
+    assert canonicalize_smiles(anion) == "[Cl-].[Cl-]"
+
+
+def test_parse_ion_pair_identity_reports_ambiguous_or_invalid_pairs():
+    assert parse_ion_pair_identity("CC[n+]1ccn(C)c1.[Cl-].O").error == "neutral_fragment"
+    assert parse_ion_pair_identity("CC[n+]1ccn(C)c1.[Ca+2]").error == "missing_charge_role"
+    assert parse_ion_pair_identity("CC[n+]1ccn(C)c1.[Cl-].[Cl-]").error == "charge_imbalance"
+    assert parse_ion_pair_identity("CC[n+]1ccn(C)c1.not-a-smiles").error == "invalid_smiles"
+
+
+def test_to_float_preserves_zero_and_rejects_only_missing_or_invalid_values():
+    assert to_float(0) == 0.0
+    assert to_float(0.0) == 0.0
+    assert to_float(-0.0) == -0.0
+    assert to_float("0") == 0.0
+    assert to_float(None) is None
+    assert to_float(float("nan")) is None
+    assert to_float("") is None
+    assert to_float("not-a-number") is None
 
 
 def test_pressure_and_density_unit_conversions():
@@ -322,6 +353,7 @@ def test_structure_simulation_mappings_preserve_mol_id(tmp_path: Path):
     assert list(charge.columns) == ["mol_id", "SMILES", "charge"]
     assert box.loc[0, "mol_id"] == "mol_0000001"
     assert charge.loc[0, "mol_id"] == "mol_0000002"
+    assert charge.loc[0, "charge"] == 0
 
 
 def test_structure_cleaned_ilthermo_file_renames_label_and_drops_intermediate_columns(tmp_path: Path):
@@ -353,9 +385,41 @@ def test_structure_cleaned_ilthermo_file_renames_label_and_drops_intermediate_co
     df = structure_cleaned_ilthermo_file(input_path, output_path, "density")
 
     assert list(df.columns) == ["cation", "anion", "temperature_K", "pressure_kPa", "density_g/cm^3"]
-    assert df.loc[0, "cation"] == "CC[N+](C)(C)C"
-    assert df.loc[0, "anion"] == "CC(=O)[O-]"
+    assert df.loc[0, "cation"] == "CC[n+]1ccn(C)c1"
+    assert df.loc[0, "anion"] == "F[B-](F)(F)F"
     assert df.loc[0, "density_g/cm^3"] == 1.252
+
+
+def test_structure_cleaned_ilthermo_repairs_ions_from_source_text_and_audits_failures(tmp_path: Path):
+    from scripts.structure_cleaned_ilthermo import structure_cleaned_ilthermo_file
+
+    input_path = tmp_path / "ilt_density_structured.csv"
+    output_path = tmp_path / "out" / "ilt_density_structured.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    pd.DataFrame(
+        {
+            "cation": ["O=[N+]([O-])[O-]", "CC[n+]1ccn(C)c1"],
+            "anion": ["O=[N+]([O-])[O-]", "[Cl-]"],
+            "label": [1.1, 1.2],
+            "source_text": [
+                "smiles:O=[N+]([O-])[O-].CC[n+]1ccn(C)c1 Specific density, kg/m3:1100",
+                "smiles:CC[n+]1ccn(C)c1.[Cl-].O Specific density, kg/m3:1200",
+            ],
+        }
+    ).to_csv(input_path, index=False)
+
+    df = structure_cleaned_ilthermo_file(
+        input_path,
+        output_path,
+        "density",
+        rejected_path=rejected_path,
+    )
+
+    assert len(df) == 1
+    assert df.loc[0, "cation"] == "CC[n+]1ccn(C)c1"
+    assert df.loc[0, "anion"] == "O=[N+]([O-])[O-]"
+    rejected = pd.read_csv(rejected_path)
+    assert rejected.loc[0, "rejection_reason"] == "neutral_fragment"
     for column in ["property_name", "property_unit", "property_value", "standard unit", "parse_error", "source_text"]:
         assert column not in df.columns
 
@@ -515,7 +579,12 @@ def test_structure_cleaned_ilthermo_splits_static_and_dynamic_relative_permittiv
     pd.DataFrame({"legacy": [True]}).to_csv(legacy_path, index=False)
     pd.DataFrame(
         {
-            "cation": ["C", "CC", "CCC", "CCCC"],
+            "cation": [
+                "C[N+](C)(C)C",
+                "CC[N+](C)(C)C",
+                "CCC[N+](C)(C)C",
+                "CCCC[N+](C)(C)C",
+            ],
             "anion": ["[Cl-]", "[Br-]", "[F-]", "[I-]"],
             "temperature_K": [298.15, 298.15, 298.15, 298.15],
             "pressure_kPa": [101.325, 101.325, 101.325, 101.325],

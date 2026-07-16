@@ -46,7 +46,9 @@ META_COLUMNS = ["phase", "standard_state_note"]
 
 
 def to_float(value: object) -> float | None:
-    text = str(value or "").strip()
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
     if not text or text.lower() == "nan":
         return None
     try:
@@ -632,7 +634,13 @@ def canonicalize_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     df = df.copy()
     for column in columns:
         if column in df.columns:
-            df[column] = df[column].map(clean_smiles)
+            cache = {
+                str(value): clean_smiles(value)
+                for value in df[column].dropna().unique()
+            }
+            df[column] = df[column].map(
+                lambda value: "" if pd.isna(value) else cache[str(value)]
+            )
     return df
 
 

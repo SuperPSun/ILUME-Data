@@ -10,8 +10,13 @@ from pathlib import Path
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from raw_prep import net_formal_charge, parse_ion_pair_identity  # noqa: E402
 
 from scripts.structure_raw_data import (  # noqa: E402
     CONDITION_COLUMNS,
@@ -40,6 +45,7 @@ STATIC_RELATIVE_PERMITTIVITY_LABEL = "static_relative_permittivity_unitless"
 DYNAMIC_RELATIVE_PERMITTIVITY_LABEL = "dynamic_relative_permittivity_unitless"
 STATIC_RELATIVE_PERMITTIVITY_OUTPUT = "ilt_static_relative_permittivity_structured.csv"
 DYNAMIC_RELATIVE_PERMITTIVITY_OUTPUT = "ilt_dynamic_relative_permittivity_structured.csv"
+SOURCE_SMILES_RE = re.compile(r"^\s*smiles\s*:\s*(\S+)", flags=re.IGNORECASE)
 
 
 def clean_text(value: object) -> str:
@@ -98,6 +104,30 @@ def cleaned_row(row: pd.Series, label_column: str) -> dict[str, object]:
     return output
 
 
+def validated_ion_pair(row: pd.Series) -> tuple[str, str, str | None]:
+    source_text = clean_text(row.get("source_text"))
+    source_match = SOURCE_SMILES_RE.search(source_text)
+    if source_match:
+        identity = parse_ion_pair_identity(source_match.group(1))
+        if identity.error:
+            return "", "", identity.error
+        cation = clean_smiles(identity.cation)
+        anion = clean_smiles(identity.anion)
+    else:
+        cation = clean_smiles(row.get("cation"))
+        anion = clean_smiles(row.get("anion"))
+
+    if not cation or not anion:
+        return "", "", "missing_identifier"
+    cation_charge = net_formal_charge(cation)
+    anion_charge = net_formal_charge(anion)
+    if cation_charge is None or anion_charge is None:
+        return "", "", "invalid_smiles"
+    if cation_charge <= 0 or anion_charge >= 0:
+        return "", "", "invalid_ion_role"
+    return cation, anion, None
+
+
 def transform_cleaned_label(value: object, property_slug: str) -> object:
     if property_slug != "self_diffusion_coefficient":
         return value
@@ -119,6 +149,7 @@ def structure_cleaned_ilthermo_frame(
     df: pd.DataFrame,
     property_slug: str,
     label_column: str | None = None,
+    rejected_rows: list[dict[str, object]] | None = None,
 ) -> pd.DataFrame:
     spec = ILTHERMO_SPECS[property_slug]
     if "label" not in df.columns:
@@ -130,8 +161,21 @@ def structure_cleaned_ilthermo_frame(
 
     output_label = label_column or spec.label_column
     rows = []
-    for _, csv_row in df.iterrows():
+    for row_index, csv_row in df.iterrows():
         csv_row = csv_row.copy()
+        cation, anion, rejection_reason = validated_ion_pair(csv_row)
+        if rejection_reason:
+            if rejected_rows is not None:
+                rejected = {
+                    "row_index": row_index,
+                    "rejection_reason": rejection_reason,
+                    "trigger_column": "cation,anion",
+                }
+                rejected.update(csv_row.to_dict())
+                rejected_rows.append(rejected)
+            continue
+        csv_row["cation"] = cation
+        csv_row["anion"] = anion
         csv_row["label"] = transform_cleaned_label(csv_row["label"], property_slug)
         rows.append(cleaned_row(csv_row, output_label))
     out = ordered_frame(rows, [output_label]).drop_duplicates().reset_index(drop=True)
@@ -139,19 +183,44 @@ def structure_cleaned_ilthermo_frame(
     return out
 
 
-def structure_cleaned_ilthermo_file(input_path: Path, output_path: Path, property_slug: str) -> pd.DataFrame:
+def write_rejected_rows(rejected_rows: list[dict[str, object]], rejected_path: Path) -> None:
+    if rejected_rows:
+        rejected_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rejected_rows).to_csv(rejected_path, index=False)
+    elif rejected_path.exists():
+        rejected_path.unlink()
+
+
+def default_rejected_path(output_path: Path) -> Path:
+    return (
+        output_path.parent.parent
+        / "rejected_rows"
+        / output_path.parent.name
+        / f"{output_path.stem}_rejected.csv"
+    )
+
+
+def structure_cleaned_ilthermo_file(
+    input_path: Path,
+    output_path: Path,
+    property_slug: str,
+    rejected_path: Path | None = None,
+) -> pd.DataFrame:
     df = pd.read_csv(input_path)
+    rejected_rows: list[dict[str, object]] = []
     try:
-        out = structure_cleaned_ilthermo_frame(df, property_slug)
+        out = structure_cleaned_ilthermo_frame(df, property_slug, rejected_rows=rejected_rows)
     except ValueError as exc:
         if str(exc) == "missing required label column":
             raise ValueError(f"{input_path} missing required label column") from exc
         raise
+    write_rejected_rows(rejected_rows, Path(rejected_path) if rejected_path else default_rejected_path(output_path))
     return write_frame(out, output_path)
 
 
 def structure_relative_permittivity_files(input_path: Path, output_dir: Path) -> None:
     df = pd.read_csv(input_path)
+    rejected_rows: list[dict[str, object]] = []
     if "frequency_MHz" in df.columns:
         frequencies = pd.to_numeric(df["frequency_MHz"], errors="coerce")
         static_mask = frequencies.isna() | frequencies.eq(0)
@@ -164,14 +233,18 @@ def structure_relative_permittivity_files(input_path: Path, output_dir: Path) ->
         static_input,
         "relative_permittivity",
         STATIC_RELATIVE_PERMITTIVITY_LABEL,
+        rejected_rows,
     )
     dynamic = structure_cleaned_ilthermo_frame(
         dynamic_input,
         "relative_permittivity",
         DYNAMIC_RELATIVE_PERMITTIVITY_LABEL,
+        rejected_rows,
     )
     write_frame(static, output_dir / STATIC_RELATIVE_PERMITTIVITY_OUTPUT)
     write_frame(dynamic, output_dir / DYNAMIC_RELATIVE_PERMITTIVITY_OUTPUT)
+    rejected_path = default_rejected_path(output_dir / "ilt_relative_permittivity_structured.csv")
+    write_rejected_rows(rejected_rows, rejected_path)
 
 
 def structure_cleaned_ilthermo(input_dir: Path, output_dir: Path) -> None:

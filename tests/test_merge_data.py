@@ -216,6 +216,57 @@ def test_close_value_exclusions_are_saved_for_audit_and_stale_files_are_removed(
     assert not (output_root / "rejected_rows").exists()
 
 
+def test_solvation_revision_pairs_keep_nearest_aionopedia_value(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    base = {
+        "cation": "CCCC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "solute": "O=C=O",
+        "temperature_K": 298.15,
+    }
+    outside = {**base, "temperature_K": 308.15}
+    write_csv(
+        input_root / "AIonopedia" / "AIonopedia_solvation_structured.csv",
+        [
+            {**base, "solvation_kcal/mol": -0.507},
+            {**base, "solvation_kcal/mol": -0.505462},
+            {**outside, "solvation_kcal/mol": -1.0},
+        ],
+    )
+    write_csv(
+        input_root / "after_AIonopedia" / "after_AIonopedia_solv_structured.csv",
+        [
+            {**base, "solvation_kcal/mol": -0.507472},
+            {**outside, "solvation_kcal/mol": -1.006},
+        ],
+    )
+
+    merge_data(input_root, output_root)
+
+    solvation = pd.read_csv(output_root / "experiment" / "solvation.csv")
+    paired = solvation[solvation["temperature_K"].eq(298.15)]
+    assert set(paired["solvation_kcal/mol"]) == {-0.507, -0.505462}
+    assert paired.loc[paired["solvation_kcal/mol"].eq(-0.507), "source_list"].item() == (
+        "AIonopedia; after_AIonopedia"
+    )
+    assert set(solvation.loc[solvation["temperature_K"].eq(308.15), "solvation_kcal/mol"]) == {
+        -1.0,
+        -1.006,
+    }
+
+    rejected = pd.read_csv(
+        output_root
+        / "rejected_rows"
+        / "experiment"
+        / "solvation_approximate_values_rejected.csv"
+    )
+    assert len(rejected) == 1
+    assert rejected.loc[0, "solvation_kcal/mol"] == -0.507472
+    assert rejected.loc[0, "retained_value"] == -0.507
+    assert rejected.loc[0, "source"] == "after_AIonopedia"
+
+
 def test_same_system_condition_rows_are_saved_before_value_collapsing(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
@@ -459,9 +510,12 @@ def test_qm_elec_hf_file_outputs_one_wide_table_instead_of_split_labels(tmp_path
     write_csv(
         input_root / "simulation" / "simulated_QM_elec_HF_structured.csv",
         [
-            {"SMILES": "CCO", "ESP_max": 1.0, "ESP_min": -1.0, "gap_eV": 2.0},
-            {"SMILES": "CCO", "ESP_max": 1.0000004, "ESP_min": -1.0, "gap_eV": 2.0},
-            {"SMILES": "CCN", "ESP_max": None, "ESP_min": -2.0, "gap_eV": 3.0},
+            {"SMILES": "CCO", "ESP_max": 0.0, "ESP_min": -1.0, "gap_eV": 2.0},
+            {"SMILES": "CCO", "ESP_max": 2.0, "ESP_min": -3.0, "gap_eV": 4.0},
+            {"SMILES": "CCN", "ESP_max": 0.0, "ESP_min": None, "gap_eV": 1.0},
+            {"SMILES": "CCN", "ESP_max": 4.0, "ESP_min": -2.0, "gap_eV": 3.0},
+            {"SMILES": "CCN", "ESP_max": 10.0, "ESP_min": -4.0, "gap_eV": 5.0},
+            {"SMILES": "CCC", "ESP_max": 7.0, "ESP_min": -7.0, "gap_eV": 6.0},
         ],
     )
 
@@ -470,9 +524,12 @@ def test_qm_elec_hf_file_outputs_one_wide_table_instead_of_split_labels(tmp_path
     wide = pd.read_csv(output_root / "simulation" / "simulated_qm_elec_hf.csv")
     assert list(wide.columns) == ["SMILES", "ESP_max", "ESP_min", "gap_eV", "source_list"]
     assert len(wide) == 3
-    assert wide["ESP_max"].isna().sum() == 1
-    assert set(wide.loc[wide["SMILES"].eq("CCO"), "ESP_max"]) == {1.0, 1.0000004}
-    assert set(wide["gap_eV"]) == {2.0, 3.0}
+    assert wide["SMILES"].is_unique
+    cco = wide[wide["SMILES"].eq("CCO")].iloc[0]
+    assert cco[["ESP_max", "ESP_min", "gap_eV"]].tolist() == [1.0, -2.0, 3.0]
+    ccn = wide[wide["SMILES"].eq("CCN")].iloc[0]
+    assert ccn[["ESP_max", "ESP_min", "gap_eV"]].tolist() == [4.0, -3.0, 3.0]
+    assert set(wide["source_list"]) == {"simulation"}
     assert not (output_root / "simulation" / "esp_max.csv").exists()
     assert not (output_root / "simulation" / "esp_min.csv").exists()
     assert not (output_root / "simulation" / "gap.csv").exists()

@@ -11,6 +11,7 @@ import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from rdkit import Chem, RDLogger
@@ -29,6 +30,15 @@ class ILThermoPropertySpec:
     slug: str
     input_filename: str
     output_filename: str
+
+
+@dataclass(frozen=True)
+class IonPairIdentity:
+    """Hold a charge-partitioned ion pair and any parsing failure reason."""
+
+    cation: str | None
+    anion: str | None
+    error: str | None = None
 
 
 PROPERTY_SPECS = (
@@ -170,18 +180,54 @@ def default_energetics_csv(project_root_path: Path) -> Path:
     return project_root_path / "data" / "raw" / "ILThermo" / "pure_compound_enthalpy.csv"
 
 
-def split_cation_anion(raw_chem_text: str | None) -> tuple[str | None, str | None]:
-    """Split a paired SMILES field into cation and anion fragments."""
+@lru_cache(maxsize=None)
+def net_formal_charge(smiles: str | None) -> int | None:
+    """Return the molecular net formal charge, or ``None`` for invalid SMILES."""
 
-    if not raw_chem_text:
-        return None, None
-    chem = raw_chem_text.strip()
-    if chem.startswith("smiles:"):
-        chem = chem[len("smiles:") :]
-    parts = [part for part in chem.split(".") if part]
-    cation = next((part for part in parts if "+" in part), parts[0] if parts else None)
-    anion = next((part for part in parts if "-" in part), parts[1] if len(parts) > 1 else None)
-    return cation, anion
+    text = (smiles or "").strip()
+    if not text:
+        return None
+    mol = Chem.MolFromSmiles(text)
+    if mol is None:
+        return None
+    return sum(atom.GetFormalCharge() for atom in mol.GetAtoms())
+
+
+@lru_cache(maxsize=None)
+def parse_ion_pair_identity(raw_chem_text: str | None) -> IonPairIdentity:
+    """Partition a charge-balanced, dot-separated SMILES into ionic roles."""
+
+    chem = (raw_chem_text or "").strip()
+    if not chem:
+        return IonPairIdentity(None, None, "missing")
+    chem = re.sub(r"^smiles\s*:\s*", "", chem, count=1, flags=re.IGNORECASE)
+    parts = [part.strip() for part in chem.split(".") if part.strip()]
+    if not parts:
+        return IonPairIdentity(None, None, "missing")
+
+    charged_parts: list[tuple[str, int]] = []
+    for part in parts:
+        charge = net_formal_charge(part)
+        if charge is None:
+            return IonPairIdentity(None, None, "invalid_smiles")
+        if charge == 0:
+            return IonPairIdentity(None, None, "neutral_fragment")
+        charged_parts.append((part, charge))
+
+    positive = [part for part, charge in charged_parts if charge > 0]
+    negative = [part for part, charge in charged_parts if charge < 0]
+    if not positive or not negative:
+        return IonPairIdentity(None, None, "missing_charge_role")
+    if sum(charge for _part, charge in charged_parts) != 0:
+        return IonPairIdentity(None, None, "charge_imbalance")
+    return IonPairIdentity(".".join(positive), ".".join(negative))
+
+
+def split_cation_anion(raw_chem_text: str | None) -> tuple[str | None, str | None]:
+    """Split a paired SMILES field into charge-validated ionic roles."""
+
+    identity = parse_ion_pair_identity(raw_chem_text)
+    return identity.cation, identity.anion
 
 
 def normalize_unit(unit: str | None) -> str | None:

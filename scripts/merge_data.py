@@ -36,6 +36,7 @@ SOURCE_COLUMNS = {"source", "source_file"}
 MISSING_TOKEN = "__ILUME_MISSING_CONDITION__"
 DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM = 589.0
 SCALAR_VALUE_ABSOLUTE_TOLERANCE = Decimal("5e-7")
+SOLVATION_REVISION_PAIR_TOLERANCE = Decimal("0.005")
 FLOAT_SIGNIFICANT_DIGITS = 15
 UNIT_SUFFIXES = (
     "_10^-9*m^2/s",
@@ -243,16 +244,78 @@ def meaningful_precision(value: object) -> int:
     return len(decimal.as_tuple().digits)
 
 
-def collapse_close_property_values(df: pd.DataFrame, label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    key_columns = [column for column in BASE_COLUMNS if column in df.columns]
-    exclusion_columns = [
-        *key_columns,
+def approximate_exclusion_columns(df: pd.DataFrame, label: str) -> list[str]:
+    return [
+        *[column for column in BASE_COLUMNS if column in df.columns],
         label,
         "retained_value",
         "absolute_difference",
         "source",
         "source_file",
     ]
+
+
+def collapse_solvation_revision_pairs(
+    df: pd.DataFrame,
+    label: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fold nearest after-AIonopedia revisions onto retained AIonopedia values."""
+
+    key_columns = [column for column in BASE_COLUMNS if column in df.columns]
+    exclusion_columns = approximate_exclusion_columns(df, label)
+    if not key_columns:
+        return df, pd.DataFrame(columns=exclusion_columns)
+
+    candidates = df[df.duplicated(subset=key_columns, keep=False)]
+    if candidates.empty:
+        return df, pd.DataFrame(columns=exclusion_columns)
+
+    collapsed = df.copy()
+    exclusion_rows: list[dict[str, object]] = []
+    for _key, group in candidates.groupby(key_columns, dropna=False, sort=False):
+        aionopedia_indices = group.index[group["source"].eq("AIonopedia")].tolist()
+        revised_indices = group.index[group["source"].eq("after_AIonopedia")].tolist()
+        possible_pairs: list[tuple[Decimal, int, int]] = []
+        for aionopedia_index in aionopedia_indices:
+            aionopedia_value = decimal_value(group.at[aionopedia_index, label])
+            if aionopedia_value is None:
+                continue
+            for revised_index in revised_indices:
+                revised_value = decimal_value(group.at[revised_index, label])
+                if revised_value is None:
+                    continue
+                difference = abs(aionopedia_value - revised_value)
+                if difference <= SOLVATION_REVISION_PAIR_TOLERANCE:
+                    possible_pairs.append((difference, int(aionopedia_index), int(revised_index)))
+
+        used_aionopedia: set[int] = set()
+        used_revised: set[int] = set()
+        for difference, aionopedia_index, revised_index in sorted(possible_pairs):
+            if aionopedia_index in used_aionopedia or revised_index in used_revised:
+                continue
+            retained_value = collapsed.at[aionopedia_index, label]
+            revised_value = collapsed.at[revised_index, label]
+            if decimal_value(retained_value) != decimal_value(revised_value):
+                exclusion_rows.append(
+                    {
+                        **{column: collapsed.at[revised_index, column] for column in key_columns},
+                        label: revised_value,
+                        "retained_value": retained_value,
+                        "absolute_difference": difference,
+                        "source": collapsed.at[revised_index, "source"],
+                        "source_file": collapsed.at[revised_index, "source_file"],
+                    }
+                )
+            collapsed.at[revised_index, label] = retained_value
+            used_aionopedia.add(aionopedia_index)
+            used_revised.add(revised_index)
+
+    return collapsed, pd.DataFrame(exclusion_rows, columns=exclusion_columns)
+
+
+def collapse_close_property_values(df: pd.DataFrame, label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    key_columns = [column for column in BASE_COLUMNS if column in df.columns]
+    exclusion_columns = approximate_exclusion_columns(df, label)
     if not key_columns:
         return df, pd.DataFrame(columns=exclusion_columns)
     candidates = df[df.duplicated(subset=key_columns, keep=False)]
@@ -312,7 +375,14 @@ def aggregate_property(rows: list[pd.DataFrame], label: str) -> tuple[pd.DataFra
     combined = pd.concat(rows, ignore_index=True)
     matching_rows = same_system_condition_rows(combined, [label])
     combined = collapse_condition_subsets(combined, [label])
+    revision_exclusions = pd.DataFrame(columns=approximate_exclusion_columns(combined, label))
+    if label == "solvation_kcal/mol":
+        combined, revision_exclusions = collapse_solvation_revision_pairs(combined, label)
     combined, close_value_exclusions = collapse_close_property_values(combined, label)
+    close_value_exclusions = pd.concat(
+        [revision_exclusions, close_value_exclusions],
+        ignore_index=True,
+    )
     grouping_columns = [column for column in BASE_COLUMNS if column in combined.columns]
     grouping_columns.append(label)
     if not combined.duplicated(subset=grouping_columns).any():
@@ -353,6 +423,31 @@ def aggregate_wide_table(rows: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd.Dat
     columns = wide_output_columns(aggregated, labels)
     merged = aggregated[columns].sort_values(columns).reset_index(drop=True)
     return merged, matching_rows
+
+
+def aggregate_qm_elec_hf(rows: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    combined = pd.concat(rows, ignore_index=True)
+    labels = [
+        column
+        for column in combined.columns
+        if column not in NON_LABEL_COLUMNS and column not in SOURCE_COLUMNS and not is_error_label(column)
+    ]
+    matching_rows = same_system_condition_rows(combined, labels)
+    if "SMILES" not in combined.columns:
+        raise ValueError("simulated_QM_elec_HF requires an SMILES column")
+
+    numeric = combined[["SMILES", *labels]].copy()
+    for label in labels:
+        numeric[label] = pd.to_numeric(numeric[label], errors="coerce")
+    medians = numeric.groupby("SMILES", dropna=False, sort=False)[labels].median().reset_index()
+    sources = (
+        combined.groupby("SMILES", dropna=False, sort=False)
+        .agg(source_list=("source", join_source_values))
+        .reset_index()
+    )
+    aggregated = medians.merge(sources, on="SMILES", how="left", validate="one_to_one")
+    columns = wide_output_columns(aggregated, labels)
+    return aggregated[columns].sort_values("SMILES").reset_index(drop=True), matching_rows
 
 
 def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list[pd.DataFrame]]:
@@ -423,7 +518,10 @@ def write_bucket(
     manifest_rows: list[dict[str, object]] = []
     output_labels: dict[str, str] = {}
     for label, rows in sorted(properties.items()):
-        if label in set(WIDE_TABLE_FILES.values()):
+        if label == "simulated_QM_elec_HF":
+            merged, matching_rows = aggregate_qm_elec_hf(rows)
+            close_value_exclusions = pd.DataFrame()
+        elif label in set(WIDE_TABLE_FILES.values()):
             merged, matching_rows = aggregate_wide_table(rows)
             close_value_exclusions = pd.DataFrame()
         else:
