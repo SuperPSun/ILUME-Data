@@ -40,7 +40,7 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
 
     assert (final_root / "experiment" / "density.csv").read_bytes() == retained_experiment.read_bytes()
     assert (final_root / "simulation" / "heat_of_vaporization.csv").read_bytes() == retained_simulation.read_bytes()
-    assert (final_root / "simulation" / "3d_box.csv").read_bytes() == box_features.read_bytes()
+    assert not (final_root / "simulation" / "3d_box.csv").exists()
     assert (
         final_root / "simulation" / "charge_20260514" / "mol_0000000.mol2"
     ).read_bytes() == charge_file.read_bytes()
