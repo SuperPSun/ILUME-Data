@@ -207,6 +207,29 @@ def direct_property_frame(df: pd.DataFrame, label: str) -> pd.DataFrame:
     return out[output_columns(out, label)]
 
 
+def same_system_condition_rows(df: pd.DataFrame, value_columns: list[str]) -> pd.DataFrame:
+    key_columns = [column for column in BASE_COLUMNS if column in df.columns]
+    output_columns = [
+        *key_columns,
+        *value_columns,
+        "matching_entry_count",
+        "source",
+        "source_file",
+    ]
+    if not key_columns:
+        return pd.DataFrame(columns=output_columns)
+
+    group_sizes = df.groupby(key_columns, dropna=False, sort=False)[key_columns[0]].transform("size")
+    matching = df.loc[
+        group_sizes.gt(1),
+        [*key_columns, *value_columns, "source", "source_file"],
+    ].copy()
+    if matching.empty:
+        return pd.DataFrame(columns=output_columns)
+    matching["matching_entry_count"] = group_sizes[group_sizes.gt(1)].to_numpy()
+    return matching[output_columns].sort_values(key_columns, kind="stable", na_position="first").reset_index(drop=True)
+
+
 def decimal_value(value: object) -> Decimal | None:
     try:
         decimal = Decimal(str(value))
@@ -220,15 +243,24 @@ def meaningful_precision(value: object) -> int:
     return len(decimal.as_tuple().digits)
 
 
-def collapse_close_property_values(df: pd.DataFrame, label: str) -> pd.DataFrame:
+def collapse_close_property_values(df: pd.DataFrame, label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     key_columns = [column for column in BASE_COLUMNS if column in df.columns]
+    exclusion_columns = [
+        *key_columns,
+        label,
+        "retained_value",
+        "absolute_difference",
+        "source",
+        "source_file",
+    ]
     if not key_columns:
-        return df
+        return df, pd.DataFrame(columns=exclusion_columns)
     candidates = df[df.duplicated(subset=key_columns, keep=False)]
     if candidates.empty:
-        return df
+        return df, pd.DataFrame(columns=exclusion_columns)
 
     collapsed = df.copy()
+    exclusion_rows: list[dict[str, object]] = []
 
     def collapse_cluster(cluster: list[tuple[object, Decimal]]) -> None:
         if len(cluster) < 2:
@@ -237,7 +269,22 @@ def collapse_close_property_values(df: pd.DataFrame, label: str) -> pd.DataFrame
             (index for index, _value in cluster),
             key=lambda index: (meaningful_precision(collapsed.at[index, label]), -int(index)),
         )
-        collapsed.loc[[index for index, _value in cluster], label] = collapsed.at[representative_index, label]
+        representative_value = collapsed.at[representative_index, label]
+        representative_decimal = next(value for index, value in cluster if index == representative_index)
+        for index, value in cluster:
+            if value == representative_decimal:
+                continue
+            exclusion_rows.append(
+                {
+                    **{column: collapsed.at[index, column] for column in key_columns},
+                    label: collapsed.at[index, label],
+                    "retained_value": representative_value,
+                    "absolute_difference": abs(value - representative_decimal),
+                    "source": collapsed.at[index, "source"],
+                    "source_file": collapsed.at[index, "source_file"],
+                }
+            )
+        collapsed.loc[[index for index, _value in cluster], label] = representative_value
 
     for _key, group in candidates.groupby(key_columns, dropna=False, sort=False):
         numeric_values = [
@@ -258,22 +305,24 @@ def collapse_close_property_values(df: pd.DataFrame, label: str) -> pd.DataFrame
             cluster = [item]
             cluster_min = item[1]
         collapse_cluster(cluster)
-    return collapsed
+    return collapsed, pd.DataFrame(exclusion_rows, columns=exclusion_columns)
 
 
-def aggregate_property(rows: list[pd.DataFrame], label: str) -> pd.DataFrame:
+def aggregate_property(rows: list[pd.DataFrame], label: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     combined = pd.concat(rows, ignore_index=True)
+    matching_rows = same_system_condition_rows(combined, [label])
     combined = collapse_condition_subsets(combined, [label])
-    combined = collapse_close_property_values(combined, label)
+    combined, close_value_exclusions = collapse_close_property_values(combined, label)
     grouping_columns = [column for column in BASE_COLUMNS if column in combined.columns]
     grouping_columns.append(label)
     if not combined.duplicated(subset=grouping_columns).any():
-        return direct_property_frame(combined, label).reset_index(drop=True)
+        return direct_property_frame(combined, label).reset_index(drop=True), close_value_exclusions, matching_rows
     if combined["source"].nunique(dropna=False) == 1 and combined["source_file"].nunique(dropna=False) == 1:
         source = str(combined["source"].iloc[0])
         aggregated = combined[grouping_columns].drop_duplicates().copy()
         aggregated["source_list"] = source
-        return aggregated[output_columns(aggregated, label)].sort_values(output_columns(aggregated, label)).reset_index(drop=True)
+        merged = aggregated[output_columns(aggregated, label)].sort_values(output_columns(aggregated, label)).reset_index(drop=True)
+        return merged, close_value_exclusions, matching_rows
     aggregated = (
         combined.groupby(grouping_columns, dropna=False)
         .agg(
@@ -281,16 +330,18 @@ def aggregate_property(rows: list[pd.DataFrame], label: str) -> pd.DataFrame:
         )
         .reset_index()
     )
-    return aggregated[output_columns(aggregated, label)].sort_values(output_columns(aggregated, label)).reset_index(drop=True)
+    merged = aggregated[output_columns(aggregated, label)].sort_values(output_columns(aggregated, label)).reset_index(drop=True)
+    return merged, close_value_exclusions, matching_rows
 
 
-def aggregate_wide_table(rows: list[pd.DataFrame]) -> pd.DataFrame:
+def aggregate_wide_table(rows: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:
     combined = pd.concat(rows, ignore_index=True)
     labels = [
         column
         for column in combined.columns
         if column not in NON_LABEL_COLUMNS and column not in SOURCE_COLUMNS and not is_error_label(column)
     ]
+    matching_rows = same_system_condition_rows(combined, labels)
     combined = collapse_condition_subsets(combined, labels)
     grouping_columns = [column for column in BASE_COLUMNS if column in combined.columns]
     grouping_columns.extend(labels)
@@ -300,7 +351,8 @@ def aggregate_wide_table(rows: list[pd.DataFrame]) -> pd.DataFrame:
         .reset_index()
     )
     columns = wide_output_columns(aggregated, labels)
-    return aggregated[columns].sort_values(columns).reset_index(drop=True)
+    merged = aggregated[columns].sort_values(columns).reset_index(drop=True)
+    return merged, matching_rows
 
 
 def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list[pd.DataFrame]]:
@@ -349,7 +401,7 @@ def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list
 
 
 def clean_output_root(output_root: Path) -> None:
-    for subdir in ("experiment", "simulation"):
+    for subdir in ("experiment", "simulation", "rejected_rows", "same_system_condition_rows"):
         path = output_root / subdir
         if path.exists():
             shutil.rmtree(path)
@@ -372,9 +424,10 @@ def write_bucket(
     output_labels: dict[str, str] = {}
     for label, rows in sorted(properties.items()):
         if label in set(WIDE_TABLE_FILES.values()):
-            merged = aggregate_wide_table(rows)
+            merged, matching_rows = aggregate_wide_table(rows)
+            close_value_exclusions = pd.DataFrame()
         else:
-            merged = aggregate_property(rows, label)
+            merged, close_value_exclusions, matching_rows = aggregate_property(rows, label)
         output_name = f"{output_slug(label)}.csv"
         previous_label = output_labels.get(output_name)
         if previous_label is not None and previous_label != label:
@@ -385,6 +438,15 @@ def write_bucket(
         output_labels[output_name] = label
         output_path = bucket_dir / output_name
         merged.to_csv(output_path, index=False)
+        if not close_value_exclusions.empty:
+            rejected_dir = output_root / "rejected_rows" / bucket
+            rejected_dir.mkdir(parents=True, exist_ok=True)
+            rejected_name = f"{output_slug(label)}_approximate_values_rejected.csv"
+            close_value_exclusions.to_csv(rejected_dir / rejected_name, index=False)
+        if not matching_rows.empty:
+            matching_dir = output_root / "same_system_condition_rows" / bucket
+            matching_dir.mkdir(parents=True, exist_ok=True)
+            matching_rows.to_csv(matching_dir / output_name, index=False)
         input_files = sorted(
             {f"{str(row['source'].iloc[0])}/{str(row['source_file'].iloc[0])}" for row in rows}
         )
