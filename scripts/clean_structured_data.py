@@ -17,7 +17,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from raw_prep import net_formal_charge  # noqa: E402
+from raw_prep import net_formal_charge, reconcile_smiles_charge  # noqa: E402
 
 DEFAULT_SOURCES = ("AIonopedia", "ILBERT", "after_AIonopedia", "simulation")
 EXCLUDED_SOURCES = {"ILThermo"}
@@ -49,6 +49,7 @@ BOX_3D_OUTPUT_COLUMNS = (
 #    "szz_peak_area_A^-1",
 )
 QM_ELEC_HF_FILENAME = "simulated_QM_elec_HF_structured.csv"
+CHARGE_MAPPING_FILENAME = "simulated_charge_20260514_mapping_structured.csv"
 # The QM source stores q_pos_sum + q_neg_sum on a verified 3× charge scale.
 QM_CHARGE_MULTIPLIER = 3.0
 QM_CHARGE_ABSOLUTE_TOLERANCE = 1e-4
@@ -128,11 +129,13 @@ class CleanResult:
     input_rows: int
     output_rows: int
     rejected_rows: int
+    repaired_rows: int = 0
     rejection_counts: dict[str, int] = field(default_factory=dict)
     unit_conversions: list[str] = field(default_factory=list)
     conflict_key_groups: int = 0
     output_path: str = ""
     rejected_path: str = ""
+    repaired_path: str = ""
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -141,11 +144,13 @@ class CleanResult:
             "input_rows": self.input_rows,
             "output_rows": self.output_rows,
             "rejected_rows": self.rejected_rows,
+            "repaired_rows": self.repaired_rows,
             "rejection_counts": "; ".join(f"{key}={value}" for key, value in sorted(self.rejection_counts.items())),
             "unit_conversions": "; ".join(self.unit_conversions),
             "conflict_key_groups": self.conflict_key_groups,
             "output_path": self.output_path,
             "rejected_path": self.rejected_path,
+            "repaired_path": self.repaired_path,
         }
 
 
@@ -347,12 +352,7 @@ def standardize_units(df: pd.DataFrame, filename: str) -> tuple[pd.DataFrame, li
 def required_label_missing_mask(df: pd.DataFrame, filename: str, labels: list[str]) -> pd.Series:
     if not labels:
         return pd.Series(False, index=df.index)
-    required_labels = labels.copy()
-    if filename == "simulated_charge_20260514_mapping_structured.csv":
-        required_labels = [column for column in required_labels if column != "charge"]
-    if not required_labels:
-        return pd.Series(False, index=df.index)
-    return df[required_labels].isna().all(axis=1)
+    return df[labels].isna().all(axis=1)
 
 
 def apply_hard_thresholds(
@@ -408,44 +408,109 @@ def hard_threshold_violation(column: str, value: object, filename: str = "") -> 
     return column == "charge" and not math.isclose(numeric, round(numeric), abs_tol=1e-9)
 
 
-def reject_qm_charge_mismatches(
+def reconcile_charge_states(
     df: pd.DataFrame,
     filename: str,
     rejected_rows: list[dict[str, object]],
     active: pd.Series,
-) -> pd.Series:
-    if filename != QM_ELEC_HF_FILENAME:
-        return active
+) -> tuple[pd.DataFrame, pd.Series, list[dict[str, object]]]:
+    if filename not in {CHARGE_MAPPING_FILENAME, QM_ELEC_HF_FILENAME}:
+        return df, active, []
 
-    required = {"SMILES", "q_pos_sum", "q_neg_sum"}
-    missing = required.difference(df.columns)
-    if missing:
-        raise ValueError(f"{QM_ELEC_HF_FILENAME} is missing columns: {sorted(missing)}")
+    out = df.copy()
+    lower_charge, upper_charge = HARD_THRESHOLDS["charge"]
+    if filename == CHARGE_MAPPING_FILENAME:
+        required = {"SMILES", "charge"}
+        missing = required.difference(out.columns)
+        if missing:
+            raise ValueError(f"{CHARGE_MAPPING_FILENAME} is missing columns: {sorted(missing)}")
+        target_values = pd.to_numeric(out["charge"], errors="coerce")
+        target_charges = target_values.round()
+        valid_target = (
+            target_values.notna()
+            & (target_values - target_charges).abs().le(1e-9)
+            & target_charges.between(lower_charge, upper_charge)
+        )
+        invalid_target = active & ~valid_target
+        if invalid_target.any():
+            add_rejections(
+                rejected_rows,
+                out,
+                invalid_target,
+                "invalid_target_charge",
+                "charge",
+                target_values,
+            )
+            active = active & ~invalid_target
+        target_source = "charge"
+        trigger_column = "charge"
+    else:
+        required = {"SMILES", "q_pos_sum", "q_neg_sum"}
+        missing = required.difference(out.columns)
+        if missing:
+            raise ValueError(f"{QM_ELEC_HF_FILENAME} is missing columns: {sorted(missing)}")
+        target_values = pd.to_numeric(out["q_pos_sum"], errors="coerce") + pd.to_numeric(
+            out["q_neg_sum"], errors="coerce"
+        )
+        target_charges = (target_values / QM_CHARGE_MULTIPLIER).round()
+        valid_target = (
+            target_values.notna()
+            & (target_values - target_charges * QM_CHARGE_MULTIPLIER)
+            .abs()
+            .le(QM_CHARGE_ABSOLUTE_TOLERANCE)
+            & target_charges.between(lower_charge, upper_charge)
+        )
+        invalid_target = active & ~valid_target
+        if invalid_target.any():
+            add_rejections(
+                rejected_rows,
+                out,
+                invalid_target,
+                "invalid_qm_charge",
+                "q_pos_sum+q_neg_sum",
+                target_values,
+            )
+            active = active & ~invalid_target
+        target_source = "q_pos_sum+q_neg_sum"
+        trigger_column = target_source
 
-    q_sum = pd.to_numeric(df["q_pos_sum"], errors="coerce") + pd.to_numeric(
-        df["q_neg_sum"], errors="coerce"
-    )
-    formal_charge = df["SMILES"].map(
-        lambda value: net_formal_charge(value) if not pd.isna(value) else None
-    )
-    expected = pd.to_numeric(formal_charge, errors="coerce") * QM_CHARGE_MULTIPLIER
-    comparable = q_sum.notna() & expected.notna()
-    mismatch = (
-        active
-        & comparable
-        & (q_sum - expected).abs().gt(QM_CHARGE_ABSOLUTE_TOLERANCE)
-    )
-    if mismatch.any():
+    repaired_rows: list[dict[str, object]] = []
+    for index in out.index[active]:
+        original_smiles = str(out.at[index, "SMILES"])
+        target_charge = int(target_charges.at[index])
+        repair = reconcile_smiles_charge(original_smiles, target_charge)
+        if repair.status == "repaired":
+            out.at[index, "SMILES"] = repair.corrected_smiles
+            repaired_rows.append(
+                {
+                    "row_index": index,
+                    "mol_id": out.at[index, "mol_id"] if "mol_id" in out.columns else pd.NA,
+                    "original_smiles": original_smiles,
+                    "corrected_smiles": repair.corrected_smiles,
+                    "original_formal_charge": repair.original_charge,
+                    "target_charge": repair.target_charge,
+                    "charge_delta": repair.target_charge - repair.original_charge,
+                    "target_source": target_source,
+                    "target_value": target_values.at[index],
+                    "repair_steps": "; ".join(repair.operations),
+                }
+            )
+            continue
+        if repair.status == "unchanged":
+            continue
+
+        mask = pd.Series(False, index=out.index)
+        mask.at[index] = True
         add_rejections(
             rejected_rows,
-            df,
-            mismatch,
-            "qm_charge_mismatch",
-            "q_pos_sum+q_neg_sum",
-            q_sum,
+            out,
+            mask,
+            repair.status,
+            trigger_column,
+            target_values,
         )
-        active = active & ~mismatch
-    return active
+        active.at[index] = False
+    return out, active, repaired_rows
 
 
 def reject_nonpositive_log_inputs(
@@ -477,7 +542,12 @@ def count_conflict_key_groups(df: pd.DataFrame, labels: list[str]) -> int:
     return int(grouped.gt(1).any(axis=1).sum())
 
 
-def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Path | None = None) -> CleanResult:
+def clean_structured_file(
+    input_path: Path,
+    output_path: Path,
+    rejected_path: Path | None = None,
+    repaired_path: Path | None = None,
+) -> CleanResult:
     RDLogger.DisableLog("rdApp.error")
     RDLogger.DisableLog("rdApp.warning")
     input_path = Path(input_path)
@@ -485,6 +555,14 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
     if rejected_path is None:
         rejected_path = output_path.parent.parent / "rejected_rows" / output_path.parent.name / f"{output_path.stem}_rejected.csv"
     rejected_path = Path(rejected_path)
+    if repaired_path is None:
+        repaired_path = (
+            output_path.parent.parent
+            / "repaired_rows"
+            / output_path.parent.name
+            / f"{output_path.stem}_charge_state_repairs.csv"
+        )
+    repaired_path = Path(repaired_path)
 
     df = select_3d_box_columns(pd.read_csv(input_path), input_path.name)
     input_rows = len(df)
@@ -544,7 +622,7 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
             active = active & ~invalid_role
 
     df = coerce_numeric_columns(df)
-    active = reject_qm_charge_mismatches(
+    df, active, repaired_rows = reconcile_charge_states(
         df,
         input_path.name,
         rejected_rows,
@@ -578,6 +656,12 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
     elif rejected_path.exists():
         rejected_path.unlink()
 
+    if repaired_rows:
+        repaired_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(repaired_rows).to_csv(repaired_path, index=False)
+    elif repaired_path.exists():
+        repaired_path.unlink()
+
     rejection_counts = dict(Counter(row["rejection_reason"] for row in rejected_rows))
     return CleanResult(
         source=source_from_path(input_path),
@@ -585,11 +669,13 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
         input_rows=input_rows,
         output_rows=len(cleaned),
         rejected_rows=len(rejected_rows),
+        repaired_rows=len(repaired_rows),
         rejection_counts=rejection_counts,
         unit_conversions=unit_conversions,
         conflict_key_groups=count_conflict_key_groups(cleaned, labels),
         output_path=str(output_path),
         rejected_path=str(rejected_path) if rejected_rows else "",
+        repaired_path=str(repaired_path) if repaired_rows else "",
     )
 
 
@@ -606,6 +692,7 @@ def write_reports(results: list[CleanResult], output_root: Path) -> None:
                 f"- Input rows: {result.input_rows}",
                 f"- Output rows: {result.output_rows}",
                 f"- Rejected rows: {result.rejected_rows}",
+                f"- Charge-state repairs: {result.repaired_rows}",
                 f"- Conflict key groups retained: {result.conflict_key_groups}",
                 f"- Unit conversions: {'; '.join(result.unit_conversions) if result.unit_conversions else 'none'}",
             ]
@@ -633,6 +720,8 @@ def write_reports(results: list[CleanResult], output_root: Path) -> None:
                 if column in rejected.columns
             ]
             lines.extend(["", markdown_table(rejected[display_columns]), ""])
+        if result.repaired_path:
+            lines.append(f"- Full charge-state repairs CSV: `{result.repaired_path}`")
         lines.append("")
     (output_root / "cleaning_report.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -667,7 +756,20 @@ def clean_non_ilthermo_structured(
         for input_path in sorted(source_dir.glob("*_structured.csv")):
             output_path = output_root / source / input_path.name
             rejected_path = output_root / "rejected_rows" / source / f"{input_path.stem}_rejected.csv"
-            results.append(clean_structured_file(input_path, output_path, rejected_path))
+            repaired_path = (
+                output_root
+                / "repaired_rows"
+                / source
+                / f"{input_path.stem}_charge_state_repairs.csv"
+            )
+            results.append(
+                clean_structured_file(
+                    input_path,
+                    output_path,
+                    rejected_path,
+                    repaired_path,
+                )
+            )
     write_reports(results, output_root)
     return results
 
@@ -684,7 +786,10 @@ def main() -> None:
     args = parse_args()
     results = clean_non_ilthermo_structured(args.input_root, args.output_root, args.sources)
     for result in results:
-        print(f"cleaned={result.output_path} rows={result.output_rows} rejected={result.rejected_rows}")
+        print(
+            f"cleaned={result.output_path} rows={result.output_rows} "
+            f"rejected={result.rejected_rows} repaired={result.repaired_rows}"
+        )
 
 
 if __name__ == "__main__":
