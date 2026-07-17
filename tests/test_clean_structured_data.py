@@ -320,7 +320,7 @@ def test_simulation_property_columns_are_renamed(tmp_path: Path):
     ]
 
 
-def test_empty_charge_is_kept_but_out_of_range_charge_is_rejected(tmp_path: Path):
+def test_empty_and_out_of_range_charge_targets_are_rejected(tmp_path: Path):
     input_path = tmp_path / "simulated_charge_20260514_mapping_structured.csv"
     output_path = tmp_path / "out.csv"
     rejected_path = tmp_path / "rejected.csv"
@@ -334,11 +334,12 @@ def test_empty_charge_is_kept_but_out_of_range_charge_is_rejected(tmp_path: Path
 
     clean_structured_file(input_path, output_path, rejected_path)
 
-    cleaned = pd.read_csv(output_path)
     rejected = pd.read_csv(rejected_path)
-    assert len(cleaned) == 1
-    assert pd.isna(cleaned.loc[0, "charge"])
-    assert rejected.loc[0, "rejection_reason"] == "hard_threshold"
+    assert pd.read_csv(output_path).empty
+    assert rejected["rejection_reason"].tolist() == [
+        "invalid_target_charge",
+        "invalid_target_charge",
+    ]
 
 
 def test_noninteger_charge_is_rejected(tmp_path: Path):
@@ -358,8 +359,46 @@ def test_noninteger_charge_is_rejected(tmp_path: Path):
     cleaned = pd.read_csv(output_path)
     rejected = pd.read_csv(rejected_path)
     assert cleaned["mol_id"].tolist() == ["mol_1"]
-    assert rejected.loc[0, "rejection_reason"] == "hard_threshold"
+    assert rejected.loc[0, "rejection_reason"] == "invalid_target_charge"
     assert rejected.loc[0, "trigger_column"] == "charge"
+
+
+def test_charge_mapping_repairs_smiles_to_label_and_writes_audit(tmp_path: Path):
+    input_path = tmp_path / "simulated_charge_20260514_mapping_structured.csv"
+    output_path = tmp_path / "out.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    repaired_path = tmp_path / "repaired.csv"
+    phospholipid = (
+        "CCCCCCCCCCCCCCCCCC(=O)OCC(COP(=O)(O)OCCN)"
+        "OC(=O)CCCCCCCCCCCCCCCCC"
+    )
+    pd.DataFrame(
+        {
+            "mol_id": ["mol_0022092", "mol_unrepairable"],
+            "SMILES": [phospholipid, "Cc1cc(C)[n+](C)n1-c1ccccc1"],
+            "charge": [-1, 0],
+        }
+    ).to_csv(input_path, index=False)
+
+    result = clean_structured_file(
+        input_path,
+        output_path,
+        rejected_path,
+        repaired_path=repaired_path,
+    )
+
+    cleaned = pd.read_csv(output_path)
+    repaired = pd.read_csv(repaired_path)
+    rejected = pd.read_csv(rejected_path)
+    assert cleaned["mol_id"].tolist() == ["mol_0022092"]
+    assert "[O-]" in cleaned.loc[0, "SMILES"]
+    assert cleaned.loc[0, "charge"] == -1
+    assert result.repaired_rows == 1
+    assert result.repaired_path == str(repaired_path)
+    assert repaired.loc[0, "mol_id"] == "mol_0022092"
+    assert repaired.loc[0, "target_source"] == "charge"
+    assert repaired.loc[0, "target_charge"] == -1
+    assert rejected.loc[0, "rejection_reason"] == "unrepairable_charge_state"
 
 
 def test_invalid_ion_roles_are_rejected_and_multifragment_roles_are_kept(tmp_path: Path):
@@ -491,6 +530,8 @@ def test_qm_label_filtering_precedes_missing_label_and_threshold_checks(tmp_path
                 "SMILES": "CC",
                 **{column: None for column in base if column != "q_abs_mean"},
                 "q_abs_mean": 0.1,
+                "q_pos_sum": 1.0,
+                "q_neg_sum": -1.0,
             },
             {"SMILES": "CCC", **base, "ESP_pos_frac": 1.1},
             {"SMILES": "CCCC", **base, "q_pos_frac": -0.1},
@@ -512,10 +553,11 @@ def test_qm_label_filtering_precedes_missing_label_and_threshold_checks(tmp_path
     }
 
 
-def test_qm_charge_sum_must_match_three_times_smiles_formal_charge(tmp_path: Path):
+def test_qm_charge_sum_repairs_smiles_and_rejects_only_unrepairable_state(tmp_path: Path):
     input_path = tmp_path / "simulated_QM_elec_HF_structured.csv"
     output_path = tmp_path / "out.csv"
     rejected_path = tmp_path / "rejected.csv"
+    repaired_path = tmp_path / "repaired.csv"
     base = {
         "ESP_max": 1.0,
         "ESP_min": -1.0,
@@ -535,18 +577,53 @@ def test_qm_charge_sum_must_match_three_times_smiles_formal_charge(tmp_path: Pat
             {"SMILES": "CCN", **base, "q_pos_sum": 1.0, "q_neg_sum": -4.0},
             {"SMILES": "[NH4+]", **base, "q_pos_sum": 4.0, "q_neg_sum": -1.00001},
             {"SMILES": "[Cl-]", **base, "q_pos_sum": 1.0, "q_neg_sum": -4.0},
+            {
+                "SMILES": "Cc1cc(C)[n+](C)n1-c1ccccc1",
+                **base,
+                "q_pos_sum": 1.0,
+                "q_neg_sum": -1.0,
+            },
         ]
+    ).to_csv(input_path, index=False)
+
+    result = clean_structured_file(
+        input_path,
+        output_path,
+        rejected_path,
+        repaired_path=repaired_path,
+    )
+
+    cleaned = pd.read_csv(output_path)
+    repaired = pd.read_csv(repaired_path)
+    rejected = pd.read_csv(rejected_path)
+    assert len(cleaned) == 4
+    assert "CCN" not in set(cleaned["SMILES"])
+    assert repaired.loc[0, "original_smiles"] == "CCN"
+    assert repaired.loc[0, "target_charge"] == -1
+    assert repaired.loc[0, "target_source"] == "q_pos_sum+q_neg_sum"
+    assert result.rejection_counts == {"unrepairable_charge_state": 1}
+    assert rejected.loc[0, "SMILES"] == "Cc1cc(C)[n+](C)n1-c1ccccc1"
+    assert rejected.loc[0, "rejection_reason"] == "unrepairable_charge_state"
+    assert rejected.loc[0, "trigger_column"] == "q_pos_sum+q_neg_sum"
+
+
+def test_qm_invalid_computed_charge_is_rejected(tmp_path: Path):
+    input_path = tmp_path / "simulated_QM_elec_HF_structured.csv"
+    output_path = tmp_path / "out.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    pd.DataFrame(
+        {
+            "SMILES": ["CCO", "CCN"],
+            "ESP_max": [1.0, 1.0],
+            "q_pos_sum": [None, 1.0],
+            "q_neg_sum": [None, -1.5],
+        }
     ).to_csv(input_path, index=False)
 
     result = clean_structured_file(input_path, output_path, rejected_path)
 
-    cleaned = pd.read_csv(output_path)
-    rejected = pd.read_csv(rejected_path)
-    assert cleaned["SMILES"].tolist() == ["CCO", "[NH4+]", "[Cl-]"]
-    assert result.rejection_counts == {"qm_charge_mismatch": 1}
-    assert rejected.loc[0, "SMILES"] == "CCN"
-    assert rejected.loc[0, "rejection_reason"] == "qm_charge_mismatch"
-    assert rejected.loc[0, "trigger_column"] == "q_pos_sum+q_neg_sum"
+    assert pd.read_csv(output_path).empty
+    assert result.rejection_counts == {"invalid_qm_charge": 2}
 
 
 def test_revised_hard_thresholds_keep_valid_extremes_and_reject_impossible_values(tmp_path: Path):
