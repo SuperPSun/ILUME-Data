@@ -2,7 +2,15 @@ from pathlib import Path
 
 import pandas as pd
 
-from raw_prep import canonicalize_smiles, parse_ion_pair_identity, split_cation_anion, to_g_cm3, to_kpa
+from raw_prep import (
+    canonicalize_smiles,
+    net_formal_charge,
+    parse_ion_pair_identity,
+    reconcile_smiles_charge,
+    split_cation_anion,
+    to_g_cm3,
+    to_kpa,
+)
 from scripts.structure_raw_data import (
     parse_aionopedia_prompt,
     split_ion_pair,
@@ -37,8 +45,56 @@ def test_split_cation_anion_uses_fragment_net_charge_and_preserves_stoichiometry
 def test_parse_ion_pair_identity_reports_ambiguous_or_invalid_pairs():
     assert parse_ion_pair_identity("CC[n+]1ccn(C)c1.[Cl-].O").error == "neutral_fragment"
     assert parse_ion_pair_identity("CC[n+]1ccn(C)c1.[Ca+2]").error == "missing_charge_role"
-    assert parse_ion_pair_identity("CC[n+]1ccn(C)c1.[Cl-].[Cl-]").error == "charge_imbalance"
     assert parse_ion_pair_identity("CC[n+]1ccn(C)c1.not-a-smiles").error == "invalid_smiles"
+
+
+def test_parse_ion_pair_identity_keeps_charge_imbalanced_ionic_roles():
+    identity = parse_ion_pair_identity("CC[n+]1ccn(C)c1.[Cl-].[Cl-]")
+
+    assert identity.error is None
+    assert identity.cation == "CC[n+]1ccn(C)c1"
+    assert identity.anion == "[Cl-].[Cl-]"
+
+
+def test_reconcile_smiles_charge_uses_deterministic_proton_transfers():
+    carboxylate = reconcile_smiles_charge("O=C(O)CC(=O)O", -2)
+    diammonium = reconcile_smiles_charge("NCCN", 2)
+    repeated = reconcile_smiles_charge("O=C(O)CC(=O)O", -2)
+
+    assert carboxylate.status == "repaired"
+    assert net_formal_charge(carboxylate.corrected_smiles) == -2
+    assert carboxylate.operations == repeated.operations
+    assert carboxylate.corrected_smiles == repeated.corrected_smiles
+    assert diammonium.status == "repaired"
+    assert net_formal_charge(diammonium.corrected_smiles) == 2
+    assert len(carboxylate.operations) == 2
+    assert len(diammonium.operations) == 2
+
+
+def test_reconcile_smiles_charge_repairs_phosphate_and_heteroatom_sites():
+    phospholipid = (
+        "CCCCCCCCCCCCCCCCCC(=O)OCC(COP(=O)(O)OCCN)"
+        "OC(=O)CCCCCCCCCCCCCCCCC"
+    )
+    phosphate = reconcile_smiles_charge(phospholipid, -1)
+    amine = reconcile_smiles_charge("CCN", 1)
+    aromatic_nh = reconcile_smiles_charge("c1nn[nH]n1", -1)
+
+    assert phosphate.status == "repaired"
+    assert "P(=O)([O-])" in phosphate.corrected_smiles
+    assert net_formal_charge(phosphate.corrected_smiles) == -1
+    assert amine.corrected_smiles == "CC[NH3+]"
+    assert net_formal_charge(aromatic_nh.corrected_smiles) == -1
+
+
+def test_reconcile_smiles_charge_rejects_invalid_or_unrepairable_states():
+    quaternary = reconcile_smiles_charge("Cc1cc(C)[n+](C)n1-c1ccccc1", 0)
+
+    assert quaternary.status == "unrepairable_charge_state"
+    assert quaternary.corrected_smiles is None
+    assert reconcile_smiles_charge("not-a-smiles", 0).status == "invalid_smiles"
+    assert reconcile_smiles_charge("CCO", -0.5).status == "invalid_target_charge"
+    assert reconcile_smiles_charge("CCO", None).status == "invalid_target_charge"
 
 
 def test_to_float_preserves_zero_and_rejects_only_missing_or_invalid_values():
