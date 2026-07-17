@@ -18,6 +18,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from raw_prep import net_formal_charge, parse_ion_pair_identity  # noqa: E402
 
+from scripts.clean_structured_data import hard_threshold_violation  # noqa: E402
 from scripts.structure_raw_data import (  # noqa: E402
     CONDITION_COLUMNS,
     ILTHERMO_SPECS,
@@ -176,7 +177,19 @@ def structure_cleaned_ilthermo_frame(
             continue
         csv_row["cation"] = cation
         csv_row["anion"] = anion
-        csv_row["label"] = transform_cleaned_label(csv_row["label"], property_slug)
+        label_value = transform_cleaned_label(csv_row["label"], property_slug)
+        if hard_threshold_violation(output_label, label_value):
+            if rejected_rows is not None:
+                rejected = {
+                    "row_index": row_index,
+                    "rejection_reason": "hard_threshold",
+                    "trigger_column": output_label,
+                    "trigger_value": label_value,
+                }
+                rejected.update(csv_row.to_dict())
+                rejected_rows.append(rejected)
+            continue
+        csv_row["label"] = label_value
         rows.append(cleaned_row(csv_row, output_label))
     out = ordered_frame(rows, [output_label]).drop_duplicates().reset_index(drop=True)
     out = drop_liquid_only_phase(out)
