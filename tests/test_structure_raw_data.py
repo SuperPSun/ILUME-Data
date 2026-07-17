@@ -452,6 +452,33 @@ def test_structure_cleaned_ilthermo_file_log_transforms_self_diffusion(tmp_path:
     assert df.loc[0, "self_diffusion_coefficient_10^-9*m^2/s_log10"] == -2.0
 
 
+def test_structure_cleaned_ilthermo_applies_revised_hard_thresholds(tmp_path: Path):
+    from scripts.structure_cleaned_ilthermo import structure_cleaned_ilthermo_file
+
+    input_path = tmp_path / "ilt_density_structured.csv"
+    output_path = tmp_path / "out" / "ilt_density_structured.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    pd.DataFrame(
+        {
+            "cation": ["CC[n+]1ccn(C)c1", "CCC[n+]1ccn(C)c1"],
+            "anion": ["F[B-](F)(F)F", "F[B-](F)(F)F"],
+            "label": [5.0, 0.0],
+        }
+    ).to_csv(input_path, index=False)
+
+    df = structure_cleaned_ilthermo_file(
+        input_path,
+        output_path,
+        "density",
+        rejected_path=rejected_path,
+    )
+
+    assert df["density_g/cm^3"].tolist() == [5.0]
+    rejected = pd.read_csv(rejected_path)
+    assert rejected.loc[0, "rejection_reason"] == "hard_threshold"
+    assert rejected.loc[0, "trigger_column"] == "density_g/cm^3"
+
+
 def test_structure_cleaned_ilthermo_file_extracts_energetics_phase_from_note_and_source_text(tmp_path: Path):
     from scripts.structure_cleaned_ilthermo import structure_cleaned_ilthermo_file
 
