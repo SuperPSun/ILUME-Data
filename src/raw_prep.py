@@ -41,6 +41,21 @@ class IonPairIdentity:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class ChargeStateRepair:
+    """Describe a deterministic proton-transfer correction of one SMILES."""
+
+    original_smiles: str
+    corrected_smiles: str | None
+    original_charge: int | None
+    target_charge: int | None
+    status: str
+    operations: tuple[str, ...] = ()
+
+
+PROTON_TRANSFER_ATOMIC_NUMBERS = frozenset({7, 8, 15, 16})
+
+
 PROPERTY_SPECS = (
     ILThermoPropertySpec("density", "ilt_density_data.txt", "ilt_density_structured.csv"),
     ILThermoPropertySpec(
@@ -193,9 +208,181 @@ def net_formal_charge(smiles: str | None) -> int | None:
     return sum(atom.GetFormalCharge() for atom in mol.GetAtoms())
 
 
+def _integer_charge(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or not math.isclose(numeric, round(numeric), abs_tol=1e-9):
+        return None
+    return int(round(numeric))
+
+
+def _proton_transfer_priority(atom: Chem.Atom, direction: int) -> int:
+    atomic_number = atom.GetAtomicNum()
+    formal_charge = atom.GetFormalCharge()
+    if direction < 0:
+        if formal_charge > 0:
+            return 0
+        return 1 if atomic_number in {8, 15, 16} else 2
+    if formal_charge < 0:
+        return 0
+    return 1 if atomic_number == 7 else 2
+
+
+def _best_proton_transfer(
+    mol: Chem.Mol,
+    direction: int,
+) -> tuple[Chem.Mol, str, str] | None:
+    ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=True))
+    current_charge = sum(atom.GetFormalCharge() for atom in mol.GetAtoms())
+    candidates: list[tuple[tuple[int, int, str], Chem.Mol, str, str]] = []
+
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() not in PROTON_TRANSFER_ATOMIC_NUMBERS:
+            continue
+        total_hydrogens = atom.GetTotalNumHs()
+        if direction < 0 and total_hydrogens <= 0:
+            continue
+
+        editable = Chem.RWMol(mol)
+        candidate_atom = editable.GetAtomWithIdx(atom.GetIdx())
+        if direction < 0:
+            explicit_hydrogens = candidate_atom.GetNumExplicitHs()
+            if explicit_hydrogens > 0:
+                candidate_atom.SetNumExplicitHs(explicit_hydrogens - 1)
+            else:
+                candidate_atom.SetNoImplicit(True)
+                candidate_atom.SetNumExplicitHs(total_hydrogens - 1)
+            candidate_atom.SetFormalCharge(candidate_atom.GetFormalCharge() - 1)
+            operation_name = "deprotonate"
+        else:
+            candidate_atom.SetNoImplicit(True)
+            candidate_atom.SetNumExplicitHs(total_hydrogens + 1)
+            candidate_atom.SetFormalCharge(candidate_atom.GetFormalCharge() + 1)
+            operation_name = "protonate"
+
+        candidate = editable.GetMol()
+        try:
+            Chem.SanitizeMol(candidate)
+        except Exception:
+            continue
+        candidate_charge = sum(item.GetFormalCharge() for item in candidate.GetAtoms())
+        if candidate_charge != current_charge + direction:
+            continue
+
+        candidate_smiles = Chem.MolToSmiles(
+            candidate,
+            canonical=True,
+            isomericSmiles=True,
+        )
+        operation = f"{operation_name}:{atom.GetSymbol()}@{atom.GetIdx()}"
+        priority = (
+            _proton_transfer_priority(atom, direction),
+            ranks[atom.GetIdx()],
+            candidate_smiles,
+        )
+        candidates.append((priority, candidate, candidate_smiles, operation))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    _priority, candidate, candidate_smiles, operation = candidates[0]
+    return candidate, candidate_smiles, operation
+
+
+@lru_cache(maxsize=None)
+def _reconcile_valid_smiles_charge(
+    canonical_smiles: str,
+    target_charge: int,
+) -> ChargeStateRepair:
+    mol = Chem.MolFromSmiles(canonical_smiles)
+    if mol is None:
+        return ChargeStateRepair(
+            canonical_smiles,
+            None,
+            None,
+            target_charge,
+            "invalid_smiles",
+        )
+
+    original_charge = sum(atom.GetFormalCharge() for atom in mol.GetAtoms())
+    if original_charge == target_charge:
+        return ChargeStateRepair(
+            canonical_smiles,
+            canonical_smiles,
+            original_charge,
+            target_charge,
+            "unchanged",
+        )
+
+    operations: list[str] = []
+    current_charge = original_charge
+    current_smiles = canonical_smiles
+    while current_charge != target_charge:
+        direction = 1 if target_charge > current_charge else -1
+        transfer = _best_proton_transfer(mol, direction)
+        if transfer is None:
+            return ChargeStateRepair(
+                canonical_smiles,
+                None,
+                original_charge,
+                target_charge,
+                "unrepairable_charge_state",
+            )
+        mol, current_smiles, operation = transfer
+        operations.append(operation)
+        current_charge += direction
+
+    return ChargeStateRepair(
+        canonical_smiles,
+        current_smiles,
+        original_charge,
+        target_charge,
+        "repaired",
+        tuple(operations),
+    )
+
+
+def reconcile_smiles_charge(
+    smiles: str | None,
+    target_charge: object,
+) -> ChargeStateRepair:
+    """Match a SMILES to an integer charge using only N/O/P/S proton transfers."""
+
+    text = (smiles or "").strip()
+    target = _integer_charge(target_charge)
+    if target is None:
+        return ChargeStateRepair(
+            text,
+            None,
+            net_formal_charge(text),
+            None,
+            "invalid_target_charge",
+        )
+
+    mol = Chem.MolFromSmiles(text)
+    if mol is None:
+        return ChargeStateRepair(
+            text,
+            None,
+            None,
+            target,
+            "invalid_smiles",
+        )
+    canonical_smiles = Chem.MolToSmiles(
+        mol,
+        canonical=True,
+        isomericSmiles=True,
+    )
+    return _reconcile_valid_smiles_charge(canonical_smiles, target)
+
+
 @lru_cache(maxsize=None)
 def parse_ion_pair_identity(raw_chem_text: str | None) -> IonPairIdentity:
-    """Partition a charge-balanced, dot-separated SMILES into ionic roles."""
+    """Partition a dot-separated SMILES into positive and negative ionic roles."""
 
     chem = (raw_chem_text or "").strip()
     if not chem:
@@ -218,8 +405,6 @@ def parse_ion_pair_identity(raw_chem_text: str | None) -> IonPairIdentity:
     negative = [part for part, charge in charged_parts if charge < 0]
     if not positive or not negative:
         return IonPairIdentity(None, None, "missing_charge_role")
-    if sum(charge for _part, charge in charged_parts) != 0:
-        return IonPairIdentity(None, None, "charge_imbalance")
     return IonPairIdentity(".".join(positive), ".".join(negative))
 
 
