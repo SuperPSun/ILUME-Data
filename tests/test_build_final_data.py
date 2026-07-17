@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pandas as pd
+
 from scripts.build_final_data import build_final_data
 
 
@@ -24,12 +26,26 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
         (experiment / filename).write_bytes(b"excluded,1\\n")
     retained_simulation = simulation / "heat_of_vaporization.csv"
     retained_simulation.write_bytes(b"heat_of_vaporization,1\\n")
+    pd.DataFrame(
+        {
+            "mol_id": ["mol_0000000", "mol_0022092"],
+            "SMILES": ["CCO", "CC"],
+            "charge": [0, -1],
+            "source_list": ["simulation", "simulation"],
+        }
+    ).to_csv(simulation / "charge.csv", index=False)
     box_features = simulation / "3d_box.csv"
     box_features.write_bytes(b"mol_id,rdf_ca_peak1_r_A\\nmol_1,4.1\\n")
     charge_data_root = tmp_path / "raw" / "simulation_data" / "charge_20260514"
     charge_data_root.mkdir(parents=True)
     charge_file = charge_data_root / "mol_0000000.mol2"
     charge_file.write_bytes(b"charge data")
+    excluded_mol = charge_data_root / "mol_0022092.mol"
+    excluded_mol.write_bytes(b"excluded mol")
+    excluded_mol2 = charge_data_root / "mol_0022092.mol2"
+    excluded_mol2.write_bytes(b"excluded mol2")
+    mapping = charge_data_root / "mapping.csv"
+    mapping.write_text("mol_id,smiles,charge\\nmol_0000000,CCO,0\\nmol_0022092,CC,-1\\n")
 
     final_root = tmp_path / "final"
     stale_file = final_root / "experiment" / "stale.csv"
@@ -44,6 +60,11 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
     assert (
         final_root / "simulation" / "charge_20260514" / "mol_0000000.mol2"
     ).read_bytes() == charge_file.read_bytes()
+    final_charge = pd.read_csv(final_root / "simulation" / "charge.csv")
+    assert final_charge["mol_id"].tolist() == ["mol_0000000"]
+    assert not (final_root / "simulation" / "charge_20260514" / "mol_0022092.mol").exists()
+    assert not (final_root / "simulation" / "charge_20260514" / "mol_0022092.mol2").exists()
+    assert not (final_root / "simulation" / "charge_20260514" / "mapping.csv").exists()
     assert not stale_file.exists()
     for filename in (
         "thermal_diffusivity.csv",
