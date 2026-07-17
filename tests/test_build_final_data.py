@@ -40,10 +40,10 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
     charge_data_root.mkdir(parents=True)
     charge_file = charge_data_root / "mol_0000000.mol2"
     charge_file.write_bytes(b"charge data")
-    excluded_mol = charge_data_root / "mol_0022092.mol"
-    excluded_mol.write_bytes(b"excluded mol")
-    excluded_mol2 = charge_data_root / "mol_0022092.mol2"
-    excluded_mol2.write_bytes(b"excluded mol2")
+    retained_mol = charge_data_root / "mol_0022092.mol"
+    retained_mol.write_bytes(b"retained mol")
+    retained_mol2 = charge_data_root / "mol_0022092.mol2"
+    retained_mol2.write_bytes(b"retained mol2")
     mapping = charge_data_root / "mapping.csv"
     mapping.write_text("mol_id,smiles,charge\\nmol_0000000,CCO,0\\nmol_0022092,CC,-1\\n")
 
@@ -61,9 +61,9 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
         final_root / "simulation" / "charge_20260514" / "mol_0000000.mol2"
     ).read_bytes() == charge_file.read_bytes()
     final_charge = pd.read_csv(final_root / "simulation" / "charge.csv")
-    assert final_charge["mol_id"].tolist() == ["mol_0000000"]
-    assert not (final_root / "simulation" / "charge_20260514" / "mol_0022092.mol").exists()
-    assert not (final_root / "simulation" / "charge_20260514" / "mol_0022092.mol2").exists()
+    assert final_charge["mol_id"].tolist() == ["mol_0000000", "mol_0022092"]
+    assert (final_root / "simulation" / "charge_20260514" / retained_mol.name).exists()
+    assert (final_root / "simulation" / "charge_20260514" / retained_mol2.name).exists()
     assert not (final_root / "simulation" / "charge_20260514" / "mapping.csv").exists()
     assert not stale_file.exists()
     for filename in (
