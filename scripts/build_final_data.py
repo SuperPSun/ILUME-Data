@@ -7,8 +7,6 @@ import shutil
 import tempfile
 from pathlib import Path
 
-import pandas as pd
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CHARGE_DATA_ROOT = (
@@ -25,23 +23,11 @@ EXCLUDED_EXPERIMENT_FILES = (
     "equilibrium_temperature.csv",
 )
 EXCLUDED_SIMULATION_FILES = ("3d_box.csv",)
-EXCLUDED_CHARGE_MOL_IDS = ("mol_0022092",)
-CHARGE_STRUCTURE_SUFFIXES = (".mol", ".mol2")
 
 
-def remove_excluded_charge_data(staged_root: Path) -> None:
-    charge_csv = staged_root / "simulation" / "charge.csv"
-    charge = pd.read_csv(charge_csv)
-    if "mol_id" not in charge.columns:
-        raise ValueError(f"{charge_csv} is missing mol_id")
-    charge = charge[~charge["mol_id"].isin(EXCLUDED_CHARGE_MOL_IDS)]
-    charge.to_csv(charge_csv, index=False)
-
+def remove_charge_mapping(staged_root: Path) -> None:
     charge_structure_root = staged_root / "simulation" / "charge_20260514"
     (charge_structure_root / "mapping.csv").unlink(missing_ok=True)
-    for mol_id in EXCLUDED_CHARGE_MOL_IDS:
-        for suffix in CHARGE_STRUCTURE_SUFFIXES:
-            (charge_structure_root / f"{mol_id}{suffix}").unlink(missing_ok=True)
 
 
 def build_final_data(
@@ -67,7 +53,7 @@ def build_final_data(
             (staged_root / "experiment" / filename).unlink()
         for filename in EXCLUDED_SIMULATION_FILES:
             (staged_root / "simulation" / filename).unlink(missing_ok=True)
-        remove_excluded_charge_data(staged_root)
+        remove_charge_mapping(staged_root)
 
         if output_root.exists():
             shutil.rmtree(output_root)
