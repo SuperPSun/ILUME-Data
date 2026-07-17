@@ -341,6 +341,27 @@ def test_empty_charge_is_kept_but_out_of_range_charge_is_rejected(tmp_path: Path
     assert rejected.loc[0, "rejection_reason"] == "hard_threshold"
 
 
+def test_noninteger_charge_is_rejected(tmp_path: Path):
+    input_path = tmp_path / "simulated_charge_20260514_mapping_structured.csv"
+    output_path = tmp_path / "out.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    pd.DataFrame(
+        {
+            "mol_id": ["mol_1", "mol_2"],
+            "SMILES": ["CCO", "CCN"],
+            "charge": [0, -0.5],
+        }
+    ).to_csv(input_path, index=False)
+
+    clean_structured_file(input_path, output_path, rejected_path)
+
+    cleaned = pd.read_csv(output_path)
+    rejected = pd.read_csv(rejected_path)
+    assert cleaned["mol_id"].tolist() == ["mol_1"]
+    assert rejected.loc[0, "rejection_reason"] == "hard_threshold"
+    assert rejected.loc[0, "trigger_column"] == "charge"
+
+
 def test_invalid_ion_roles_are_rejected_and_multifragment_roles_are_kept(tmp_path: Path):
     input_path = tmp_path / "AIonopedia_density_structured.csv"
     output_path = tmp_path / "out.csv"
@@ -460,6 +481,8 @@ def test_qm_label_filtering_precedes_missing_label_and_threshold_checks(tmp_path
         "q_pos_frac": 0.5,
         "Gap": 5.0,
         "q_abs_mean": 0.1,
+        "q_pos_sum": 1.0,
+        "q_neg_sum": -1.0,
     }
     pd.DataFrame(
         [
@@ -471,7 +494,7 @@ def test_qm_label_filtering_precedes_missing_label_and_threshold_checks(tmp_path
             },
             {"SMILES": "CCC", **base, "ESP_pos_frac": 1.1},
             {"SMILES": "CCCC", **base, "q_pos_frac": -0.1},
-            {"SMILES": "CCCCC", **base, "Gap": 31.0},
+            {"SMILES": "CCCCC", **base, "Gap": 101.0},
         ]
     ).to_csv(input_path, index=False)
 
@@ -487,6 +510,88 @@ def test_qm_label_filtering_precedes_missing_label_and_threshold_checks(tmp_path
         "gap_eV",
         ",".join(cleaned.columns[1:]),
     }
+
+
+def test_qm_charge_sum_must_match_three_times_smiles_formal_charge(tmp_path: Path):
+    input_path = tmp_path / "simulated_QM_elec_HF_structured.csv"
+    output_path = tmp_path / "out.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    base = {
+        "ESP_max": 1.0,
+        "ESP_min": -1.0,
+        "ESP_std": 0.3,
+        "ESP_pos_frac": 0.5,
+        "Dipole": 2.0,
+        "Quadrupole": 3.0,
+        "q_max": 0.5,
+        "q_min": -0.5,
+        "q_std": 0.2,
+        "q_pos_frac": 0.5,
+        "Gap": 5.0,
+    }
+    pd.DataFrame(
+        [
+            {"SMILES": "CCO", **base, "q_pos_sum": 1.0, "q_neg_sum": -1.0},
+            {"SMILES": "CCN", **base, "q_pos_sum": 1.0, "q_neg_sum": -4.0},
+            {"SMILES": "[NH4+]", **base, "q_pos_sum": 4.0, "q_neg_sum": -1.00001},
+            {"SMILES": "[Cl-]", **base, "q_pos_sum": 1.0, "q_neg_sum": -4.0},
+        ]
+    ).to_csv(input_path, index=False)
+
+    result = clean_structured_file(input_path, output_path, rejected_path)
+
+    cleaned = pd.read_csv(output_path)
+    rejected = pd.read_csv(rejected_path)
+    assert cleaned["SMILES"].tolist() == ["CCO", "[NH4+]", "[Cl-]"]
+    assert result.rejection_counts == {"qm_charge_mismatch": 1}
+    assert rejected.loc[0, "SMILES"] == "CCN"
+    assert rejected.loc[0, "rejection_reason"] == "qm_charge_mismatch"
+    assert rejected.loc[0, "trigger_column"] == "q_pos_sum+q_neg_sum"
+
+
+def test_revised_hard_thresholds_keep_valid_extremes_and_reject_impossible_values(tmp_path: Path):
+    input_path = tmp_path / "AIonopedia_viscosity_structured.csv"
+    output_path = tmp_path / "out.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    pd.DataFrame(
+        {
+            "cation": [
+                "C[N+](C)(C)C",
+                "CC[N+](C)(C)C",
+                "CCC[N+](C)(C)C",
+            ],
+            "anion": ["[Cl-]", "[Cl-]", "[Cl-]"],
+            "viscosity_mPa*s_log10": [-3.0, 20.0, 20.1],
+        }
+    ).to_csv(input_path, index=False)
+
+    clean_structured_file(input_path, output_path, rejected_path)
+
+    cleaned = pd.read_csv(output_path)
+    rejected = pd.read_csv(rejected_path)
+    assert cleaned["viscosity_mPa*s_log10"].tolist() == [-3.0, 20.0]
+    assert rejected.loc[0, "trigger_value"] == 20.1
+    assert rejected.loc[0, "rejection_reason"] == "hard_threshold"
+
+
+def test_simulation_transfer_uses_its_specific_hard_threshold(tmp_path: Path):
+    input_path = tmp_path / "simulated_combi_qm_solv_structured.csv"
+    output_path = tmp_path / "out.csv"
+    rejected_path = tmp_path / "rejected.csv"
+    pd.DataFrame(
+        {
+            "smiles": ["CCO", "CCN", "CCC"],
+            "solv": [-100.0, 100.0, 100.1],
+        }
+    ).to_csv(input_path, index=False)
+
+    clean_structured_file(input_path, output_path, rejected_path)
+
+    cleaned = pd.read_csv(output_path)
+    rejected = pd.read_csv(rejected_path)
+    assert cleaned["solvation_kcal/mol"].tolist() == [-100.0, 100.0]
+    assert rejected.loc[0, "trigger_value"] == 100.1
+    assert rejected.loc[0, "rejection_reason"] == "hard_threshold"
 
 
 def test_directory_cleaning_skips_ilthermo_and_constructed_and_writes_reports(tmp_path: Path):
