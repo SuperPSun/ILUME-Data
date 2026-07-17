@@ -49,6 +49,10 @@ BOX_3D_OUTPUT_COLUMNS = (
 #    "szz_peak_area_A^-1",
 )
 QM_ELEC_HF_FILENAME = "simulated_QM_elec_HF_structured.csv"
+# The QM source stores q_pos_sum + q_neg_sum on a verified 3× charge scale.
+QM_CHARGE_MULTIPLIER = 3.0
+QM_CHARGE_ABSOLUTE_TOLERANCE = 1e-4
+SIMULATION_TRANSFER_FILENAME = "simulated_combi_qm_solv_structured.csv"
 QM_ELEC_HF_COLUMNS = (
     "SMILES",
     "ESP_max",
@@ -65,33 +69,40 @@ QM_ELEC_HF_COLUMNS = (
 )
 
 HARD_THRESHOLDS: dict[str, tuple[float, float]] = {
-    "density_g/cm^3": (0.5, 3.0),
+    "density_g/cm^3": (0, 5),
     "density_err_g/cm^3": (0, 0.1),
-    "viscosity_mPa*s_log10": (-1, 6),
-    "surface_tension_mN/m": (0, 120),
-    "melting_point_K": (150, 800),
-    "solvation_kcal/mol": (-100, 100),
-    "transfer_kcal/mol": (-50, 50),
-    "transfer_organic_kcal/mol": (-50, 50),
+    "viscosity_mPa*s_log10": (-3, 20),
+    "surface_tension_mN/m": (0, 500),
+    "melting_point_K": (0, 2000),
+    "solvation_kcal/mol": (-200, 200),
+    "transfer_kcal/mol": (-100, 100),
+    "transfer_organic_kcal/mol": (-100, 100),
     "partition_log10": (-10, 15),
-    "electrical_conductivity_S/m_log10": (-6, 3),
+    "electrical_conductivity_S/m_log10": (-20, 4),
     "x_CO2_unitless": (0, 1),
-    "pEC50": (-8, 5),
     "glass_transition_temperature_K": (100, 600),
     "refractive_index_unitless": (1, 2),
-    "thermal_conductivity_W/m/K": (0, 1),
+    "thermal_conductivity_W/m/K": (0, 10),
     "thermal_decomposition_temperature_K": (250, 1000),
-    "heat_capacity_J/mol/K": (0, 5000),
+    "heat_capacity_J/mol/K": (0, 20000),
     "heat_capacity_err_J/mol/K": (0, 500),
     "heat_of_vaporization_kJ/mol": (0, 1000),
     "heat_of_vaporization_err_kJ/mol": (0, 100),
     "thermal_expansion_K^-1": (0, 0.01),
     "thermal_expansion_err_K^-1": (0, 0.005),
-    "HOMO_eV": (-20, 10),
-    "LUMO_eV": (-20, 10),
-    "gap_eV": (-30, 30),
+    "speed_of_sound_m/s": (0, 10000),
+    "HOMO_eV": (-50, 50),
+    "LUMO_eV": (-50, 50),
+    "gap_eV": (0, 100),
     "charge": (-20, 20),
     "solv": (-100, 100),
+}
+STRICTLY_POSITIVE_COLUMNS = {
+    "density_g/cm^3",
+    "melting_point_K",
+    "thermal_conductivity_W/m/K",
+    "heat_capacity_J/mol/K",
+    "speed_of_sound_m/s",
 }
 
 OUTPUT_ORDER = (
@@ -348,12 +359,21 @@ def apply_hard_thresholds(
     df: pd.DataFrame,
     rejected_rows: list[dict[str, object]],
     active: pd.Series,
+    filename: str = "",
 ) -> pd.Series:
-    for column, (lower, upper) in HARD_THRESHOLDS.items():
+    for column in HARD_THRESHOLDS:
         if column not in df.columns:
             continue
+        lower, upper = hard_threshold_bounds(column, filename)
         values = pd.to_numeric(df[column], errors="coerce")
-        mask = active & values.notna() & ((values < lower) | (values > upper))
+        below_lower = values <= lower if column in STRICTLY_POSITIVE_COLUMNS else values < lower
+        mask = active & values.notna() & (below_lower | (values > upper))
+        if column == "charge":
+            mask = mask | (
+                active
+                & values.notna()
+                & (values - values.round()).abs().gt(1e-9)
+            )
         if mask.any():
             add_rejections(rejected_rows, df, mask, "hard_threshold", column, values)
             active = active & ~mask
@@ -365,6 +385,66 @@ def apply_hard_thresholds(
         if mask.any():
             add_rejections(rejected_rows, df, mask, "hard_threshold", column, values)
             active = active & ~mask
+    return active
+
+
+def hard_threshold_bounds(column: str, filename: str = "") -> tuple[float, float]:
+    if filename == SIMULATION_TRANSFER_FILENAME and column == "solvation_kcal/mol":
+        return (-100, 100)
+    return HARD_THRESHOLDS[column]
+
+
+def hard_threshold_violation(column: str, value: object, filename: str = "") -> bool:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return False
+    if column in HARD_THRESHOLDS:
+        lower, upper = hard_threshold_bounds(column, filename)
+        below_lower = numeric <= lower if column in STRICTLY_POSITIVE_COLUMNS else numeric < lower
+        if below_lower or numeric > upper:
+            return True
+    if column in FRACTION_COLUMNS and not 0 <= numeric <= 1:
+        return True
+    return column == "charge" and not math.isclose(numeric, round(numeric), abs_tol=1e-9)
+
+
+def reject_qm_charge_mismatches(
+    df: pd.DataFrame,
+    filename: str,
+    rejected_rows: list[dict[str, object]],
+    active: pd.Series,
+) -> pd.Series:
+    if filename != QM_ELEC_HF_FILENAME:
+        return active
+
+    required = {"SMILES", "q_pos_sum", "q_neg_sum"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"{QM_ELEC_HF_FILENAME} is missing columns: {sorted(missing)}")
+
+    q_sum = pd.to_numeric(df["q_pos_sum"], errors="coerce") + pd.to_numeric(
+        df["q_neg_sum"], errors="coerce"
+    )
+    formal_charge = df["SMILES"].map(
+        lambda value: net_formal_charge(value) if not pd.isna(value) else None
+    )
+    expected = pd.to_numeric(formal_charge, errors="coerce") * QM_CHARGE_MULTIPLIER
+    comparable = q_sum.notna() & expected.notna()
+    mismatch = (
+        active
+        & comparable
+        & (q_sum - expected).abs().gt(QM_CHARGE_ABSOLUTE_TOLERANCE)
+    )
+    if mismatch.any():
+        add_rejections(
+            rejected_rows,
+            df,
+            mismatch,
+            "qm_charge_mismatch",
+            "q_pos_sum+q_neg_sum",
+            q_sum,
+        )
+        active = active & ~mismatch
     return active
 
 
@@ -464,6 +544,12 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
             active = active & ~invalid_role
 
     df = coerce_numeric_columns(df)
+    active = reject_qm_charge_mismatches(
+        df,
+        input_path.name,
+        rejected_rows,
+        active,
+    )
     active = reject_nonpositive_log_inputs(df, rejected_rows, active)
     df, unit_conversions = standardize_units(df, input_path.name)
     df, qm_filter_notes = filter_supported_qm_labels(df, input_path.name)
@@ -480,7 +566,7 @@ def clean_structured_file(input_path: Path, output_path: Path, rejected_path: Pa
         add_rejections(rejected_rows, df, duplicate_mask, "duplicate_row", "all_columns", "")
         active = active & ~duplicate_mask
 
-    active = apply_hard_thresholds(df, rejected_rows, active)
+    active = apply_hard_thresholds(df, rejected_rows, active, input_path.name)
 
     cleaned = ordered_frame(df[active].reset_index(drop=True))
     output_path.parent.mkdir(parents=True, exist_ok=True)
