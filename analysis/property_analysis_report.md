@@ -3,8 +3,8 @@
 ## Global Summary
 
 - Analyzed properties: 42
-- Total data points across analyzed properties: 1696750
-- Sum of property-level unique systems: 1440239
+- Total data points across analyzed properties: 1696617
+- Sum of property-level unique systems: 1440068
 - Properties recommended for system holdout test: 35
 - Properties recommended for grouped CV: 7
 - Properties recommended for leave-one-system-out or descriptive analysis: 0
@@ -14,17 +14,17 @@
 | bucket | property | data_points | unique_systems | recommended_split |
 | --- | --- | --- | --- | --- |
 | simulation | transfer_organic | 1000000 | 1000000 | system_holdout_test |
-| experiment | density | 97824 | 6202 | system_holdout_test |
+| experiment | density | 97830 | 6202 | system_holdout_test |
 | experiment | viscosity | 44529 | 2753 | system_holdout_test |
-| simulation | charge | 28212 | 28212 | system_holdout_test |
-| simulation | dipole | 27279 | 27279 | system_holdout_test |
-| simulation | q_max | 27279 | 27279 | system_holdout_test |
-| simulation | q_min | 27279 | 27279 | system_holdout_test |
-| simulation | q_pos_frac | 27279 | 27279 | system_holdout_test |
-| simulation | gap | 27279 | 27279 | system_holdout_test |
-| simulation | esp_min | 27279 | 27279 | system_holdout_test |
-| simulation | esp_pos_frac | 27279 | 27279 | system_holdout_test |
-| simulation | quadrupole | 27279 | 27279 | system_holdout_test |
+| simulation | charge | 28203 | 28203 | system_holdout_test |
+| simulation | dipole | 27263 | 27263 | system_holdout_test |
+| simulation | q_max | 27263 | 27263 | system_holdout_test |
+| simulation | q_min | 27263 | 27263 | system_holdout_test |
+| simulation | q_pos_frac | 27263 | 27263 | system_holdout_test |
+| simulation | gap | 27263 | 27263 | system_holdout_test |
+| simulation | esp_min | 27263 | 27263 | system_holdout_test |
+| simulation | esp_pos_frac | 27263 | 27263 | system_holdout_test |
+| simulation | quadrupole | 27263 | 27263 | system_holdout_test |
 
 ## High Leakage Risk Properties
 
@@ -39,10 +39,10 @@ These properties should not be split by random rows because repeated systems can
 | experiment | equilibrium_pressure | 95 | 0.9894736842105263 | 151 |
 | experiment | speed_of_sound | 216 | 0.9861111111111112 | 252 |
 | experiment | thermal_conductivity | 111 | 0.9819819819819819 | 75 |
-| experiment | heat_capacity | 429 | 0.9440559440559441 | 1732 |
+| experiment | heat_capacity | 430 | 0.9441860465116279 | 1732 |
 | experiment | surface_tension | 1250 | 0.832 | 163 |
 | experiment | electrical_conductivity | 705 | 0.8042553191489362 | 319 |
-| experiment | refractive_index | 756 | 0.7976190476190477 | 237 |
+| experiment | refractive_index | 757 | 0.797886393659181 | 237 |
 | experiment | density | 6202 | 0.7966784908094163 | 1823 |
 
 ## System Holdout Test Candidates
@@ -52,15 +52,15 @@ These properties should not be split by random rows because repeated systems can
 | simulation | transfer_organic | 1000000 | 100000 |
 | experiment | density | 6202 | 621 |
 | experiment | viscosity | 2753 | 276 |
-| simulation | charge | 28212 | 2822 |
-| simulation | quadrupole | 27279 | 2728 |
-| simulation | esp_min | 27279 | 2728 |
-| simulation | q_min | 27279 | 2728 |
-| simulation | q_max | 27279 | 2728 |
-| simulation | gap | 27279 | 2728 |
-| simulation | q_pos_frac | 27279 | 2728 |
-| simulation | dipole | 27279 | 2728 |
-| simulation | esp_pos_frac | 27279 | 2728 |
+| simulation | charge | 28203 | 2821 |
+| simulation | quadrupole | 27263 | 2727 |
+| simulation | esp_min | 27263 | 2727 |
+| simulation | q_min | 27263 | 2727 |
+| simulation | q_max | 27263 | 2727 |
+| simulation | gap | 27263 | 2727 |
+| simulation | q_pos_frac | 27263 | 2727 |
+| simulation | dipole | 27263 | 2727 |
+| simulation | esp_pos_frac | 27263 | 2727 |
 
 ## Grouped Cross-Validation Candidates
 
