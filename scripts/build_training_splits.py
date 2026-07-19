@@ -26,12 +26,12 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem, rdBase
 from rdkit.Chem import inchi
+from sklearn.model_selection import GroupKFold
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FINAL_ROOT = PROJECT_ROOT / "data" / "final"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data" / "training_splits"
-SCRIPT_VERSION = 1
 
 BUCKETS = ("experiment", "simulation")
 ROLE_BY_COLUMN = {
@@ -130,7 +130,6 @@ GROUP_STRATEGY_COLUMNS = {
     "solvent": {},
     "molecule": {},
 }
-SINGLE_SYSTEM_TYPES = {"cation", "anion", "solute", "solvent", "molecule"}
 STRATEGY_DIRECTORY_NAMES = {
     "random": "random",
     "il": "IL",
@@ -141,43 +140,6 @@ STRATEGY_DIRECTORY_NAMES = {
     "solute": "solute",
     "solvent": "solvent",
 }
-
-ROW_CATALOG_COLUMNS = [
-    "row_id",
-    "task_id",
-    "source_file",
-    "source_row",
-    "system_type",
-    "system_id",
-    "system_key",
-    "partition",
-    "cation_id",
-    "anion_id",
-    "il_id",
-    "solute_id",
-    "solvent_id",
-    "molecule_id",
-    "mol_ids",
-]
-LABEL_SUMMARY_COLUMNS = [
-    "stage",
-    "task_id",
-    "strategy",
-    "repeat",
-    "fold",
-    "partition",
-    "target_column",
-    "row_count",
-    "system_count",
-    "label_count",
-    "missing_rate",
-    "value_min",
-    "value_p05",
-    "value_median",
-    "value_mean",
-    "value_p95",
-    "value_max",
-]
 
 
 class TrainingSplitError(RuntimeError):
@@ -253,438 +215,87 @@ def balanced_unit_folds(
     }
 
 
-def _shared_folds_once(
-    groups_by_task: Mapping[str, set[str]],
-    *,
-    seed: int,
-    namespace: str,
-    repeat: int,
-) -> dict[str, int]:
-    group_tasks: dict[str, set[str]] = {}
-    for task_id, groups in groups_by_task.items():
-        if len(groups) < 5:
-            raise TrainingSplitError(
-                f"Fewer than five {namespace} groups for {task_id}"
-            )
-        for group_identifier in groups:
-            group_tasks.setdefault(str(group_identifier), set()).add(task_id)
-
-    assignments: dict[str, int] = {}
-    counts = {
-        task_id: [0, 0, 0, 0, 0]
-        for task_id in groups_by_task
-    }
-
-    def assign(group_identifier: str, fold: int) -> None:
-        assignments[group_identifier] = fold
-        for incident_task in group_tasks[group_identifier]:
-            counts[incident_task][fold] += 1
-
-    task_order = sorted(
-        groups_by_task,
-        key=lambda task_id: (
-            len(groups_by_task[task_id]),
-            stable_id(
-                f"seed:{seed}:{namespace}:task_order",
-                repeat,
-                task_id,
-            ),
-        ),
-    )
-    for task_id in task_order:
-        task_groups = {str(value) for value in groups_by_task[task_id]}
-        unassigned = [group for group in task_groups if group not in assignments]
-        unassigned.sort(
-            key=lambda group: (
-                -len(group_tasks[group]),
-                stable_id(
-                    f"seed:{seed}:{namespace}:group_order",
-                    repeat,
-                    group,
-                ),
-            )
-        )
-        missing_folds = [
-            fold for fold, count in enumerate(counts[task_id]) if count == 0
-        ]
-        missing_folds.sort(
-            key=lambda fold: stable_id(
-                f"seed:{seed}:{namespace}:missing_fold_order",
-                repeat,
-                task_id,
-                fold,
-            )
-        )
-        while missing_folds and unassigned:
-            assign(unassigned.pop(0), missing_folds.pop(0))
-
-        for group_identifier in unassigned:
-            incident_tasks = group_tasks[group_identifier]
-            fold = min(
-                range(5),
-                key=lambda candidate_fold: (
-                    max(
-                        counts[incident_task][candidate_fold]
-                        / max(1.0, len(groups_by_task[incident_task]) / 5.0)
-                        for incident_task in incident_tasks
-                    ),
-                    sum(
-                        counts[incident_task][candidate_fold]
-                        for incident_task in incident_tasks
-                    ),
-                    stable_id(
-                        f"seed:{seed}:{namespace}:greedy_fold",
-                        repeat,
-                        group_identifier,
-                        candidate_fold,
-                    ),
-                ),
-            )
-            assign(group_identifier, fold)
-
-    # Repair an empty fold only when moving a shared group cannot empty the
-    # source fold in any other incident task.
-    for _ in range(max(1, len(groups_by_task) * 5)):
-        missing = [
-            (task_id, fold)
-            for task_id in task_order
-            for fold, count in enumerate(counts[task_id])
-            if count == 0
-        ]
-        if not missing:
-            break
-        changed = False
-        for task_id, empty_fold in missing:
-            candidates = sorted(
-                (
-                    group
-                    for group in groups_by_task[task_id]
-                    if counts[task_id][assignments[str(group)]] > 1
-                    and all(
-                        counts[incident_task][assignments[str(group)]] > 1
-                        for incident_task in group_tasks[str(group)]
+def _group_fold_signature(
+    group_values: pd.Series,
+    folds: pd.Series,
+) -> tuple[tuple[str, ...], ...]:
+    return tuple(
+        sorted(
+            tuple(
+                sorted(
+                    set(
+                        group_values.loc[folds.eq(fold)].astype(str)
                     )
-                ),
-                key=lambda group: stable_id(
-                    f"seed:{seed}:{namespace}:repair",
-                    repeat,
-                    task_id,
-                    empty_fold,
-                    str(group),
-                ),
+                )
             )
-            if not candidates:
-                continue
-            group_identifier = str(candidates[0])
-            source_fold = assignments[group_identifier]
-            for incident_task in group_tasks[group_identifier]:
-                counts[incident_task][source_fold] -= 1
-                counts[incident_task][empty_fold] += 1
-            assignments[group_identifier] = empty_fold
-            changed = True
-        if not changed:
-            break
+            for fold in range(5)
+        )
+    )
 
-    remaining_missing = [
-        (task_id, fold)
-        for task_id in task_order
-        for fold, count in enumerate(counts[task_id])
-        if count == 0
-    ]
-    if remaining_missing:
-        task_id, fold = remaining_missing[0]
+
+def task_group_kfold_assignments(
+    group_values: pd.Series,
+    *,
+    task_id: str,
+    strategy: str,
+    repeats: int,
+    seed: int,
+    max_candidates: int = 256,
+) -> list[pd.Series]:
+    """Build deterministic, task-local, distinct GroupKFold assignments."""
+    groups = group_values.astype(str)
+    group_count = int(groups.nunique())
+    if group_count < 5:
         raise TrainingSplitError(
-            f"Unable to build shared five-fold assignment for {namespace}; "
-            f"{task_id} has empty fold {fold}"
+            f"Fewer than five {strategy} groups for {task_id}"
         )
-    return assignments
+    if repeats <= 0:
+        raise ValueError("repeats must be positive")
+    if max_candidates <= 0:
+        raise ValueError("max_candidates must be positive")
 
-
-def plan_shared_group_folds(
-    groups_by_task: Mapping[str, set[str]],
-    repeats_by_task: Mapping[str, int],
-    *,
-    seed: int,
-    namespace: str,
-) -> dict[tuple[str, int], int]:
-    planned: dict[tuple[str, int], int] = {}
-    maximum_repeats = max(repeats_by_task.values(), default=0)
-    for repeat in range(maximum_repeats):
-        active = {
-            task_id: groups
-            for task_id, groups in groups_by_task.items()
-            if repeats_by_task[task_id] > repeat
-        }
-        if not active:
-            continue
-        assignments = _shared_folds_once(
-            active,
-            seed=seed,
-            namespace=namespace,
-            repeat=repeat,
+    features = np.zeros((len(groups), 1), dtype=np.uint8)
+    signatures: set[tuple[tuple[str, ...], ...]] = set()
+    assignments: list[pd.Series] = []
+    for candidate_index in range(max_candidates):
+        digest = stable_id(
+            f"seed:{seed}:stage3_group_kfold",
+            task_id,
+            strategy,
+            candidate_index,
         )
-        planned.update(
-            {
-                (group_identifier, repeat): fold
-                for group_identifier, fold in assignments.items()
-            }
+        random_state = int(digest[:8], 16)
+        splitter = GroupKFold(
+            n_splits=5,
+            shuffle=True,
+            random_state=random_state,
         )
-    return planned
-
-
-def _weighted_shared_folds_once(
-    weights_by_task: Mapping[str, Mapping[str, int]],
-    *,
-    seed: int,
-    namespace: str,
-    repeat: int,
-    candidate_index: int,
-) -> dict[str, int] | None:
-    group_tasks: dict[str, dict[str, int]] = {}
-    totals: dict[str, int] = {}
-    for task_id, weights in weights_by_task.items():
-        if len(weights) < 5:
+        fold_values = np.full(len(groups), -1, dtype=np.int8)
+        for fold, (_, validation_indices) in enumerate(
+            splitter.split(features, groups=groups.to_numpy())
+        ):
+            fold_values[validation_indices] = fold
+        folds = pd.Series(
+            fold_values,
+            index=group_values.index,
+            dtype="int64",
+        )
+        if set(folds) != set(range(5)):
             raise TrainingSplitError(
-                f"Fewer than five {namespace} groups for {task_id}"
+                f"GroupKFold has empty folds for {task_id}, {strategy}"
             )
-        normalized_weights = {
-            str(group_identifier): int(weight)
-            for group_identifier, weight in weights.items()
-        }
-        if any(weight <= 0 for weight in normalized_weights.values()):
-            raise TrainingSplitError(
-                f"Non-positive group weight for {namespace}, {task_id}"
-            )
-        totals[task_id] = sum(normalized_weights.values())
-        for group_identifier, weight in normalized_weights.items():
-            group_tasks.setdefault(group_identifier, {})[task_id] = weight
-
-    targets = {
-        task_id: total / 5.0
-        for task_id, total in totals.items()
-    }
-    loads = {
-        task_id: [0, 0, 0, 0, 0]
-        for task_id in weights_by_task
-    }
-    counts = {
-        task_id: [0, 0, 0, 0, 0]
-        for task_id in weights_by_task
-    }
-    remaining = {
-        task_id: len(weights)
-        for task_id, weights in weights_by_task.items()
-    }
-    assignments: dict[str, int] = {}
-    group_order = sorted(
-        group_tasks,
-        key=lambda group_identifier: (
-            -max(
-                weight / targets[task_id]
-                for task_id, weight in group_tasks[
-                    group_identifier
-                ].items()
-            ),
-            -sum(
-                weight / targets[task_id]
-                for task_id, weight in group_tasks[
-                    group_identifier
-                ].items()
-            ),
-            -len(group_tasks[group_identifier]),
-            stable_id(
-                f"seed:{seed}:{namespace}:weighted_group_order",
-                repeat,
-                candidate_index,
-                group_identifier,
-            ),
-        ),
-    )
-
-    for group_identifier in group_order:
-        incident = group_tasks[group_identifier]
-        feasible_folds: list[int] = []
-        for fold in range(5):
-            feasible = True
-            for task_id in incident:
-                empty_after = sum(
-                    count == 0
-                    for candidate_fold, count in enumerate(counts[task_id])
-                    if candidate_fold != fold
-                )
-                if counts[task_id][fold] == 0:
-                    empty_after = sum(
-                        count == 0 for count in counts[task_id]
-                    ) - 1
-                if remaining[task_id] - 1 < empty_after:
-                    feasible = False
-                    break
-            if feasible:
-                feasible_folds.append(fold)
-        if not feasible_folds:
-            return None
-
-        def fold_score(fold: int) -> tuple[float, float, int, str]:
-            squared_load_increase = sum(
-                (
-                    (loads[task_id][fold] + weight)
-                    / targets[task_id]
-                )
-                ** 2
-                - (loads[task_id][fold] / targets[task_id]) ** 2
-                for task_id, weight in incident.items()
-            )
-            maximum_projected_load = max(
-                (loads[task_id][fold] + weight)
-                / targets[task_id]
-                for task_id, weight in incident.items()
-            )
-            return (
-                squared_load_increase,
-                maximum_projected_load,
-                sum(counts[task_id][fold] for task_id in incident),
-                stable_id(
-                    f"seed:{seed}:{namespace}:weighted_fold",
-                    repeat,
-                    candidate_index,
-                    group_identifier,
-                    fold,
-                ),
-            )
-
-        selected_fold = min(feasible_folds, key=fold_score)
-        assignments[group_identifier] = selected_fold
-        for task_id, weight in incident.items():
-            loads[task_id][selected_fold] += weight
-            counts[task_id][selected_fold] += 1
-            remaining[task_id] -= 1
-
-    if any(
-        count == 0
-        for task_counts in counts.values()
-        for count in task_counts
-    ):
-        return None
-    return assignments
-
-
-def _fold_balance_score(
-    assignments: Mapping[str, int],
-    weights_by_task: Mapping[str, Mapping[str, int]],
-    *,
-    seed: int,
-    namespace: str,
-    repeat: int,
-) -> tuple[float, float, float, float, str]:
-    excess_ratios: list[float] = []
-    squared_row_deviations = 0.0
-    squared_group_deviations = 0.0
-    for task_id, weights in weights_by_task.items():
-        row_loads = [0, 0, 0, 0, 0]
-        group_loads = [0, 0, 0, 0, 0]
-        for group_identifier, weight in weights.items():
-            fold = assignments[str(group_identifier)]
-            row_loads[fold] += int(weight)
-            group_loads[fold] += 1
-        if min(row_loads) <= 0:
-            return (
-                float("inf"),
-                float("inf"),
-                float("inf"),
-                float("inf"),
-                "",
-            )
-        total_rows = sum(row_loads)
-        mean_rows = total_rows / 5.0
-        largest_group = max(int(weight) for weight in weights.values())
-        theoretical_lower_bound = (
-            4.0 * largest_group / (total_rows - largest_group)
-            if largest_group > mean_rows and total_rows > largest_group
-            else 1.0
-        )
-        excess_ratios.append(
-            (max(row_loads) / min(row_loads))
-            / theoretical_lower_bound
-        )
-        squared_row_deviations += sum(
-            ((load - mean_rows) / mean_rows) ** 2
-            for load in row_loads
-        )
-        mean_groups = len(weights) / 5.0
-        squared_group_deviations += sum(
-            ((load - mean_groups) / mean_groups) ** 2
-            for load in group_loads
-        )
-    return (
-        max(excess_ratios),
-        sum(excess_ratios) / len(excess_ratios),
-        squared_row_deviations,
-        squared_group_deviations,
-        stable_id(
-            f"seed:{seed}:{namespace}:weighted_candidate",
-            repeat,
-            *sorted(assignments.items()),
-        ),
-    )
-
-
-def plan_shared_weighted_group_folds(
-    weights_by_task: Mapping[str, Mapping[str, int]],
-    repeats_by_task: Mapping[str, int],
-    *,
-    seed: int,
-    namespace: str,
-    candidate_count: int = 16,
-) -> dict[tuple[str, int], int]:
-    if candidate_count <= 0:
-        raise ValueError("candidate_count must be positive")
-    planned: dict[tuple[str, int], int] = {}
-    maximum_repeats = max(repeats_by_task.values(), default=0)
-    for repeat in range(maximum_repeats):
-        active = {
-            task_id: weights
-            for task_id, weights in weights_by_task.items()
-            if repeats_by_task[task_id] > repeat
-        }
-        if not active:
+        signature = _group_fold_signature(groups, folds)
+        if signature in signatures:
             continue
-        baseline = _shared_folds_once(
-            {
-                task_id: set(weights)
-                for task_id, weights in active.items()
-            },
-            seed=seed,
-            namespace=f"{namespace}:baseline",
-            repeat=repeat,
-        )
-        candidates = [baseline]
-        for candidate_index in range(candidate_count):
-            candidate = _weighted_shared_folds_once(
-                active,
-                seed=seed,
-                namespace=namespace,
-                repeat=repeat,
-                candidate_index=candidate_index,
-            )
-            if candidate is not None:
-                candidates.append(candidate)
-        selected = min(
-            candidates,
-            key=lambda candidate: _fold_balance_score(
-                candidate,
-                active,
-                seed=seed,
-                namespace=namespace,
-                repeat=repeat,
-            ),
-        )
-        planned.update(
-            {
-                (group_identifier, repeat): fold
-                for group_identifier, fold in selected.items()
-            }
-        )
-    return planned
+        signatures.add(signature)
+        assignments.append(folds)
+        if len(assignments) == repeats:
+            return assignments
+
+    raise TrainingSplitError(
+        f"Unable to build {repeats} distinct GroupKFold partitions for "
+        f"{task_id}, {strategy} after {max_candidates} candidates"
+    )
 
 
 def file_sha256(path: Path) -> str:
@@ -783,33 +394,6 @@ def write_dataframe(path: Path, frame: pd.DataFrame) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     frame.to_csv(temporary, index=False, lineterminator="\n")
     os.replace(temporary, path)
-
-
-def write_json(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
-
-
-def load_manifest(output_root: Path) -> dict[str, object]:
-    path = output_root / "manifest.json"
-    if not path.exists():
-        return {"script_version": SCRIPT_VERSION}
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TrainingSplitError(f"Invalid manifest: {path}")
-    return payload
-
-
-def update_manifest(output_root: Path, section: str, payload: Mapping[str, object]) -> None:
-    manifest = load_manifest(output_root)
-    manifest["script_version"] = SCRIPT_VERSION
-    manifest[section] = dict(payload)
-    write_json(output_root / "manifest.json", manifest)
 
 
 @lru_cache(maxsize=None)
@@ -2547,119 +2131,8 @@ def _group_series(
     )
 
 
-def _catalog_frame(
-    frame: pd.DataFrame,
-    task: TaskSpec,
-    partitions: pd.Series,
-) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "row_id": frame["_row_id"],
-            "task_id": task.task_id,
-            "source_file": task.source_file,
-            "source_row": frame["_source_row"].astype("int64"),
-            "system_type": task.system_type,
-            "system_id": frame["_system_id"],
-            "system_key": frame["_system_key"],
-            "partition": partitions,
-            "cation_id": frame["_cation_id"],
-            "anion_id": frame["_anion_id"],
-            "il_id": frame["_il_id"],
-            "solute_id": frame["_solute_id"],
-            "solvent_id": frame["_solvent_id"],
-            "molecule_id": frame["_molecule_id"],
-            "mol_ids": frame["_mol_ids"],
-        },
-        columns=ROW_CATALOG_COLUMNS,
-    )
-
-
-def _append_frame(path: Path, frame: pd.DataFrame) -> None:
-    frame.to_csv(
-        path,
-        mode="a",
-        header=not path.exists(),
-        index=False,
-        lineterminator="\n",
-    )
-
-
-def _numeric_stats(values: pd.Series) -> dict[str, object]:
-    numeric = pd.to_numeric(values, errors="coerce")
-    present = numeric.dropna()
-    total = len(numeric)
-    if present.empty:
-        return {
-            "label_count": 0,
-            "missing_rate": 1.0 if total else 0.0,
-            "value_min": pd.NA,
-            "value_p05": pd.NA,
-            "value_median": pd.NA,
-            "value_mean": pd.NA,
-            "value_p95": pd.NA,
-            "value_max": pd.NA,
-        }
-    return {
-        "label_count": int(len(present)),
-        "missing_rate": float(1.0 - len(present) / total) if total else 0.0,
-        "value_min": float(present.min()),
-        "value_p05": float(present.quantile(0.05)),
-        "value_median": float(present.median()),
-        "value_mean": float(present.mean()),
-        "value_p95": float(present.quantile(0.95)),
-        "value_max": float(present.max()),
-    }
-
-
-def label_summary_rows(
-    frame: pd.DataFrame,
-    task: TaskSpec,
-    mask: pd.Series,
-    *,
-    stage: int,
-    strategy: str,
-    partition: str,
-    repeat: int | str = "",
-    fold: int | str = "",
-) -> list[dict[str, object]]:
-    subset = frame.loc[mask]
-    rows: list[dict[str, object]] = []
-    for target_column in task.target_columns:
-        row = {
-            "stage": stage,
-            "task_id": task.task_id,
-            "strategy": strategy,
-            "repeat": repeat,
-            "fold": fold,
-            "partition": partition,
-            "target_column": target_column,
-            "row_count": int(len(subset)),
-            "system_count": int(subset["_system_id"].nunique()),
-        }
-        row.update(_numeric_stats(subset[target_column]))
-        rows.append(row)
-    return rows
-
-
-def _update_role_entity_sets(
-    target: dict[str, set[str]],
-    frame: pd.DataFrame,
-    task: TaskSpec,
-    mask: pd.Series,
-) -> None:
-    subset = frame.loc[mask]
-    for column in task.identity_columns:
-        role = ROLE_BY_COLUMN[column]
-        destination = target.setdefault(role, set())
-        for value in pd.unique(subset[column]):
-            for smiles in role_fragments(str(value), role):
-                destination.add(entity_id(role, smiles))
-
-
 def _task_strategy_units(task: TaskSpec) -> dict[str, str]:
-    units = {
-        "random": "system_id" if task.system_type in SINGLE_SYSTEM_TYPES else "row_id"
-    }
+    units = {"random": "row_id"}
     for strategy in GROUP_STRATEGY_COLUMNS[task.system_type]:
         units[strategy] = (
             "system_id"
@@ -3031,817 +2504,6 @@ def _stage3_partitions(
     )
 
 
-def _overlap_audit_rows(
-    output_root: Path,
-    stage2_train_entities: Mapping[str, set[str]],
-    stage2_validation_entities: Mapping[str, set[str]],
-    stage3_test_entities: Mapping[str, set[str]],
-) -> list[dict[str, object]]:
-    pretrain_path = output_root / "stage1" / "entities.csv"
-    pretrain_available = pretrain_path.exists()
-    pretrain_entities: dict[str, set[str]] = {}
-    if pretrain_available:
-        pretrain = pd.read_csv(pretrain_path)
-        for role, group in pretrain.groupby("role"):
-            pretrain_entities[str(role)] = set(group["entity_id"].astype(str))
-
-    comparisons = [
-        (
-            "stage1_pretrain",
-            pretrain_entities,
-            pretrain_available,
-            "stage2_validation",
-            stage2_validation_entities,
-        ),
-        (
-            "stage1_pretrain",
-            pretrain_entities,
-            pretrain_available,
-            "stage3_test",
-            stage3_test_entities,
-        ),
-        (
-            "stage2_train",
-            stage2_train_entities,
-            True,
-            "stage3_test",
-            stage3_test_entities,
-        ),
-    ]
-    rows: list[dict[str, object]] = []
-    for source_name, source, available, target_name, target in comparisons:
-        roles = sorted(set(source) | set(target) | set(ROLE_BY_COLUMN.values()))
-        for role in roles:
-            source_ids = source.get(role, set())
-            target_ids = target.get(role, set())
-            overlap = source_ids & target_ids
-            rows.append(
-                {
-                    "source_collection": source_name,
-                    "target_collection": target_name,
-                    "role": role,
-                    "source_available": available,
-                    "source_entities": len(source_ids),
-                    "target_entities": len(target_ids),
-                    "overlap_entities": len(overlap),
-                    "target_overlap_ratio": (
-                        len(overlap) / len(target_ids) if target_ids else 0.0
-                    ),
-                }
-            )
-    return rows
-
-
-def _build_training_split_indexes_legacy(
-    final_root: Path,
-    output_root: Path,
-    *,
-    seed: int = 42,
-    pretrain_cap: int = 500_000,
-) -> pd.DataFrame:
-    """Build compact stage-2 and stage-3 split indexes plus quality audits."""
-    final_root = Path(final_root)
-    output_root = Path(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
-    tasks = discover_tasks(final_root)
-    paths = final_csv_paths(final_root)
-    checksums = {
-        path.relative_to(final_root).as_posix(): file_sha256(path)
-        for path in paths
-    }
-
-    stage2_tasks = [task for task in tasks if task.stage == 2]
-    stage3_tasks = [task for task in tasks if task.stage == 3]
-    stage3_profiles: dict[str, TaskProfile] = {}
-    test_registry: dict[
-        tuple[str, str],
-        dict[str, object],
-    ] = {}
-
-    for task in stage3_tasks:
-        frame, raw_rows = prepare_task_frame(
-            final_root,
-            task,
-            checksums[task.source_file],
-        )
-        profile = _profile_task(frame, raw_rows)
-        stage3_profiles[task.task_id] = profile
-        if profile.tier != "large":
-            continue
-        unique_systems = frame[
-            ["_system_id", "_system_key"]
-        ].drop_duplicates()
-        selected_count = 0
-        for system_id_value, system_key in unique_systems.itertuples(
-            index=False,
-            name=None,
-        ):
-            if stable_fraction(
-                seed,
-                "stage3_test",
-                task.system_type,
-                system_id_value,
-            ) >= 0.1:
-                continue
-            selected_count += 1
-            key = (task.system_type, str(system_id_value))
-            entry = test_registry.setdefault(
-                key,
-                {
-                    "system_type": task.system_type,
-                    "system_id": str(system_id_value),
-                    "system_key": str(system_key),
-                    "source_tasks": set(),
-                },
-            )
-            cast_sources = entry["source_tasks"]
-            if isinstance(cast_sources, set):
-                cast_sources.add(task.task_id)
-        if selected_count == 0:
-            raise TrainingSplitError(
-                f"Hash holdout selected no systems for large task {task.task_id}"
-            )
-
-    repeats_by_task = {
-        task.task_id: (
-            1 if stage3_profiles[task.task_id].tier == "large" else 5
-        )
-        for task in stage3_tasks
-    }
-    groups_by_strategy: dict[str, dict[str, set[str]]] = {}
-    single_random_groups: dict[str, dict[str, set[str]]] = {}
-    for task in stage3_tasks:
-        frame, raw_rows = prepare_task_frame(
-            final_root,
-            task,
-            checksums[task.source_file],
-        )
-        profile = stage3_profiles[task.task_id]
-        if raw_rows != profile.raw_rows or len(frame) != profile.rows:
-            raise TrainingSplitError(
-                f"Input changed while planning folds for {task.task_id}"
-            )
-        partitions = _stage3_partitions(
-            frame,
-            task,
-            profile,
-            test_registry,
-        )
-        development = frame.loc[partitions.eq("development")]
-        if task.system_type in SINGLE_SYSTEM_TYPES:
-            single_random_groups.setdefault(task.system_type, {})[
-                task.task_id
-            ] = set(development["_system_id"].astype(str))
-        for strategy, columns in GROUP_STRATEGY_COLUMNS[
-            task.system_type
-        ].items():
-            groups_by_strategy.setdefault(strategy, {})[
-                task.task_id
-            ] = set(
-                _group_series(
-                    development,
-                    strategy,
-                    columns,
-                ).astype(str)
-            )
-
-    stage3_group_assignments: dict[
-        tuple[str, str, int],
-        int,
-    ] = {}
-    for strategy, task_groups in groups_by_strategy.items():
-        planned = plan_shared_group_folds(
-            task_groups,
-            repeats_by_task,
-            seed=seed,
-            namespace=f"stage3_group:{strategy}",
-        )
-        stage3_group_assignments.update(
-            {
-                (strategy, group_identifier, repeat): fold
-                for (group_identifier, repeat), fold in planned.items()
-            }
-        )
-    single_random_assignments: dict[
-        tuple[str, str, int],
-        int,
-    ] = {}
-    for system_type, task_groups in single_random_groups.items():
-        planned = plan_shared_group_folds(
-            task_groups,
-            repeats_by_task,
-            seed=seed,
-            namespace=f"stage3_random_single:{system_type}",
-        )
-        single_random_assignments.update(
-            {
-                (system_type, group_identifier, repeat): fold
-                for (group_identifier, repeat), fold in planned.items()
-            }
-        )
-
-    task_catalog_rows: list[dict[str, object]] = []
-    label_rows: list[dict[str, object]] = []
-    overlap_checks: list[dict[str, object]] = []
-    stage2_groups: dict[tuple[str, str], tuple[str, str]] = {}
-    stage3_loo_rows: list[dict[str, object]] = []
-    stage2_train_entities: dict[str, set[str]] = {}
-    stage2_validation_entities: dict[str, set[str]] = {}
-    stage3_test_entities: dict[str, set[str]] = {}
-
-    with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
-        staged_root = Path(temporary_dir) / "training_splits"
-        stage2_root = staged_root / "stage2"
-        stage3_root = staged_root / "stage3"
-        audit_root = staged_root / "audit"
-        stage2_root.mkdir(parents=True)
-        stage3_root.mkdir()
-        audit_root.mkdir()
-
-        stage2_rows_path = stage2_root / "rows.csv"
-        for task in stage2_tasks:
-            frame, raw_rows = prepare_task_frame(
-                final_root,
-                task,
-                checksums[task.source_file],
-            )
-            profile = _profile_task(frame, raw_rows)
-            partitions = frame["_system_id"].map(
-                lambda system_id_value: (
-                    "validation"
-                    if stable_fraction(
-                        seed,
-                        "stage2_validation",
-                        task.system_type,
-                        system_id_value,
-                    )
-                    < 0.1
-                    else "train"
-                )
-            )
-            if not {"train", "validation"}.issubset(set(partitions)):
-                raise TrainingSplitError(
-                    f"Stage-2 split is empty for {task.task_id}: "
-                    f"{sorted(set(partitions))}"
-                )
-            _append_frame(
-                stage2_rows_path,
-                _catalog_frame(frame, task, partitions),
-            )
-            for system_id_value, system_key, partition in (
-                pd.DataFrame(
-                    {
-                        "system_id": frame["_system_id"],
-                        "system_key": frame["_system_key"],
-                        "partition": partitions,
-                    }
-                )
-                .drop_duplicates()
-                .itertuples(index=False, name=None)
-            ):
-                key = (task.system_type, str(system_id_value))
-                value = (str(system_key), str(partition))
-                previous = stage2_groups.setdefault(key, value)
-                if previous != value:
-                    raise TrainingSplitError(
-                        f"Inconsistent shared stage-2 assignment for {key}"
-                    )
-
-            for partition in ("train", "validation"):
-                mask = partitions.eq(partition)
-                label_rows.extend(
-                    label_summary_rows(
-                        frame,
-                        task,
-                        mask,
-                        stage=2,
-                        strategy="system_holdout",
-                        partition=partition,
-                    )
-                )
-                _update_role_entity_sets(
-                    stage2_train_entities
-                    if partition == "train"
-                    else stage2_validation_entities,
-                    frame,
-                    task,
-                    mask,
-                )
-            overlap_checks.append(
-                {
-                    "check": "stage2_train_validation_system_overlap",
-                    "task_id": task.task_id,
-                    "strategy": "system_holdout",
-                    "repeat": "",
-                    "passed": True,
-                    "overlap_count": 0,
-                }
-            )
-            task_catalog_rows.append(
-                {
-                    "stage": 2,
-                    "task_id": task.task_id,
-                    "source_file": task.source_file,
-                    "target_columns": ";".join(task.target_columns),
-                    "identity_columns": ";".join(task.identity_columns),
-                    "system_type": task.system_type,
-                    "raw_rows": profile.raw_rows,
-                    "rows": profile.rows,
-                    "unique_systems": profile.system_count,
-                    "tier": "physics_guided",
-                    "test_systems": 0,
-                    "reserved_systems": 0,
-                    "development_systems": profile.system_count,
-                    "strategies": "system_holdout",
-                    "repeats": 1,
-                    "strategy_units": json.dumps(
-                        {"system_holdout": "system_id"},
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                }
-            )
-
-        stage2_assignment_rows = [
-            {
-                "system_type": system_type,
-                "system_id": system_id_value,
-                "system_key": system_key,
-                "partition": partition,
-            }
-            for (system_type, system_id_value), (
-                system_key,
-                partition,
-            ) in sorted(stage2_groups.items())
-        ]
-        pd.DataFrame(
-            stage2_assignment_rows,
-            columns=["system_type", "system_id", "system_key", "partition"],
-        ).to_csv(
-            stage2_root / "group_assignments.csv",
-            index=False,
-            lineterminator="\n",
-        )
-
-        test_group_rows = []
-        for entry in sorted(
-            test_registry.values(),
-            key=lambda row: (str(row["system_type"]), str(row["system_id"])),
-        ):
-            source_tasks = entry["source_tasks"]
-            test_group_rows.append(
-                {
-                    "system_type": entry["system_type"],
-                    "system_id": entry["system_id"],
-                    "system_key": entry["system_key"],
-                    "source_tasks": ";".join(sorted(source_tasks))
-                    if isinstance(source_tasks, set)
-                    else "",
-                }
-            )
-        pd.DataFrame(
-            test_group_rows,
-            columns=["system_type", "system_id", "system_key", "source_tasks"],
-        ).to_csv(
-            stage3_root / "test_groups.csv",
-            index=False,
-            lineterminator="\n",
-        )
-
-        stage3_rows_path = stage3_root / "rows.csv"
-        random_assignment_path = stage3_root / "random_fold_assignments.csv"
-        for task in stage3_tasks:
-            frame, raw_rows = prepare_task_frame(
-                final_root,
-                task,
-                checksums[task.source_file],
-            )
-            profile = stage3_profiles[task.task_id]
-            if raw_rows != profile.raw_rows or len(frame) != profile.rows:
-                raise TrainingSplitError(
-                    f"Input changed while building task {task.task_id}"
-                )
-            partitions = _stage3_partitions(
-                frame,
-                task,
-                profile,
-                test_registry,
-            )
-            development_mask = partitions.eq("development")
-            if not development_mask.any():
-                raise TrainingSplitError(
-                    f"No development rows remain for {task.task_id}"
-                )
-            _append_frame(
-                stage3_rows_path,
-                _catalog_frame(frame, task, partitions),
-            )
-
-            for partition in (
-                "development",
-                "test",
-                "reserved_due_to_cross_task_test",
-            ):
-                mask = partitions.eq(partition)
-                if not mask.any():
-                    continue
-                label_rows.extend(
-                    label_summary_rows(
-                        frame,
-                        task,
-                        mask,
-                        stage=3,
-                        strategy="fixed_test",
-                        partition=partition,
-                    )
-                )
-            test_mask = partitions.eq("test")
-            if test_mask.any():
-                _update_role_entity_sets(
-                    stage3_test_entities,
-                    frame,
-                    task,
-                    test_mask,
-                )
-
-            repeats = 1 if profile.tier == "large" else 5
-            strategies = ["random", *GROUP_STRATEGY_COLUMNS[task.system_type]]
-            development = frame.loc[development_mask]
-            if len(development) < 5:
-                raise TrainingSplitError(
-                    f"Fewer than five development rows for {task.task_id}"
-                )
-
-            random_unit = (
-                development["_system_id"]
-                if task.system_type in SINGLE_SYSTEM_TYPES
-                else development["_row_id"]
-            )
-            for repeat_index in range(repeats):
-                if task.system_type in SINGLE_SYSTEM_TYPES:
-                    folds = random_unit.map(
-                        lambda unit_id: single_random_assignments[
-                            (
-                                task.system_type,
-                                str(unit_id),
-                                repeat_index,
-                            )
-                        ]
-                    )
-                else:
-                    random_fold_map = balanced_unit_folds(
-                        random_unit.astype(str),
-                        seed=seed,
-                        namespace=f"stage3_random:{task.task_id}",
-                        repeat=repeat_index,
-                    )
-                    folds = random_unit.map(
-                        lambda unit_id: random_fold_map[str(unit_id)]
-                    )
-                if set(folds) != set(range(5)):
-                    raise TrainingSplitError(
-                        f"Random five-fold split has empty folds for "
-                        f"{task.task_id}, repeat {repeat_index}"
-                    )
-                random_rows = pd.DataFrame(
-                    {
-                        "task_id": task.task_id,
-                        "row_id": development["_row_id"],
-                        "repeat": repeat_index,
-                        "fold": folds,
-                    }
-                )
-                _append_frame(random_assignment_path, random_rows)
-                for fold_index in range(5):
-                    full_mask = pd.Series(False, index=frame.index)
-                    full_mask.loc[development.index] = folds.eq(fold_index)
-                    label_rows.extend(
-                        label_summary_rows(
-                            frame,
-                            task,
-                            full_mask,
-                            stage=3,
-                            strategy="random",
-                            repeat=repeat_index,
-                            fold=fold_index,
-                            partition="validation",
-                        )
-                    )
-                overlap_checks.append(
-                    {
-                        "check": "stage3_random_row_assignment_complete",
-                        "task_id": task.task_id,
-                        "strategy": "random",
-                        "repeat": repeat_index,
-                        "passed": int(folds.notna().sum()) == len(development),
-                        "overlap_count": 0,
-                    }
-                )
-
-            for strategy, columns in GROUP_STRATEGY_COLUMNS[
-                task.system_type
-            ].items():
-                group_values = _group_series(
-                    development,
-                    strategy,
-                    columns,
-                )
-                if group_values.nunique() < 5:
-                    raise TrainingSplitError(
-                        f"Fewer than five {strategy} groups for {task.task_id}"
-                )
-                for repeat_index in range(repeats):
-                    folds = group_values.map(
-                        lambda unit_id: stage3_group_assignments[
-                            (
-                                strategy,
-                                str(unit_id),
-                                repeat_index,
-                            )
-                        ]
-                    )
-                    if set(folds) != set(range(5)):
-                        raise TrainingSplitError(
-                            f"{strategy} five-fold split has empty folds for "
-                            f"{task.task_id}, repeat {repeat_index}"
-                        )
-                    for unit_id, fold_index in (
-                        pd.DataFrame(
-                            {"group_id": group_values, "fold": folds}
-                        )
-                        .drop_duplicates()
-                        .itertuples(index=False, name=None)
-                    ):
-                        assignment_key = (
-                            strategy,
-                            str(unit_id),
-                            repeat_index,
-                        )
-                        previous = stage3_group_assignments.setdefault(
-                            assignment_key,
-                            int(fold_index),
-                        )
-                        if previous != int(fold_index):
-                            raise TrainingSplitError(
-                                f"Inconsistent cross-task fold for "
-                                f"{assignment_key}"
-                            )
-                    for fold_index in range(5):
-                        full_mask = pd.Series(False, index=frame.index)
-                        full_mask.loc[development.index] = folds.eq(fold_index)
-                        label_rows.extend(
-                            label_summary_rows(
-                                frame,
-                                task,
-                                full_mask,
-                                stage=3,
-                                strategy=strategy,
-                                repeat=repeat_index,
-                                fold=fold_index,
-                                partition="validation",
-                            )
-                        )
-                    overlap_checks.append(
-                        {
-                            "check": "stage3_group_cross_fold_overlap",
-                            "task_id": task.task_id,
-                            "strategy": strategy,
-                            "repeat": repeat_index,
-                            "passed": True,
-                            "overlap_count": 0,
-                        }
-                    )
-
-            if profile.tier == "small":
-                for system_id_value, system_key in (
-                    development[["_system_id", "_system_key"]]
-                    .drop_duplicates()
-                    .sort_values("_system_id", kind="stable")
-                    .itertuples(index=False, name=None)
-                ):
-                    stage3_loo_rows.append(
-                        {
-                            "task_id": task.task_id,
-                            "system_type": task.system_type,
-                            "system_id": system_id_value,
-                            "system_key": system_key,
-                            "loo_fold": system_id_value,
-                        }
-                    )
-
-            test_systems = int(frame.loc[test_mask, "_system_id"].nunique())
-            reserved_systems = int(
-                frame.loc[
-                    partitions.eq("reserved_due_to_cross_task_test"),
-                    "_system_id",
-                ].nunique()
-            )
-            development_systems = int(
-                development["_system_id"].nunique()
-            )
-            if profile.tier == "large":
-                test_development_overlap = set(
-                    frame.loc[test_mask, "_system_id"]
-                ) & set(development["_system_id"])
-                if test_development_overlap:
-                    raise TrainingSplitError(
-                        f"Test/development overlap in {task.task_id}"
-                    )
-            overlap_checks.append(
-                {
-                    "check": "stage3_test_development_system_overlap",
-                    "task_id": task.task_id,
-                    "strategy": "fixed_test",
-                    "repeat": "",
-                    "passed": True,
-                    "overlap_count": 0,
-                }
-            )
-            task_catalog_rows.append(
-                {
-                    "stage": 3,
-                    "task_id": task.task_id,
-                    "source_file": task.source_file,
-                    "target_columns": ";".join(task.target_columns),
-                    "identity_columns": ";".join(task.identity_columns),
-                    "system_type": task.system_type,
-                    "raw_rows": profile.raw_rows,
-                    "rows": profile.rows,
-                    "unique_systems": profile.system_count,
-                    "tier": profile.tier,
-                    "test_systems": test_systems,
-                    "reserved_systems": reserved_systems,
-                    "development_systems": development_systems,
-                    "strategies": ";".join(strategies),
-                    "repeats": repeats,
-                    "strategy_units": json.dumps(
-                        _task_strategy_units(task),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                }
-            )
-
-        if not random_assignment_path.exists():
-            pd.DataFrame(
-                columns=["task_id", "row_id", "repeat", "fold"]
-            ).to_csv(
-                random_assignment_path,
-                index=False,
-                lineterminator="\n",
-            )
-        group_assignment_rows = [
-            {
-                "strategy": strategy,
-                "group_id": unit_id,
-                "repeat": repeat_index,
-                "fold": fold_index,
-            }
-            for (
-                strategy,
-                unit_id,
-                repeat_index,
-            ), fold_index in sorted(stage3_group_assignments.items())
-        ]
-        pd.DataFrame(
-            group_assignment_rows,
-            columns=["strategy", "group_id", "repeat", "fold"],
-        ).to_csv(
-            stage3_root / "group_fold_assignments.csv",
-            index=False,
-            lineterminator="\n",
-        )
-        pd.DataFrame(
-            stage3_loo_rows,
-            columns=[
-                "task_id",
-                "system_type",
-                "system_id",
-                "system_key",
-                "loo_fold",
-            ],
-        ).to_csv(
-            stage3_root / "loo_groups.csv",
-            index=False,
-            lineterminator="\n",
-        )
-
-        task_catalog = pd.DataFrame(task_catalog_rows).sort_values(
-            ["stage", "task_id"],
-            kind="stable",
-        ).reset_index(drop=True)
-        task_catalog.to_csv(
-            staged_root / "task_catalog.csv",
-            index=False,
-            lineterminator="\n",
-        )
-        pd.DataFrame(
-            label_rows,
-            columns=LABEL_SUMMARY_COLUMNS,
-        ).to_csv(
-            audit_root / "label_and_fold_summary.csv",
-            index=False,
-            lineterminator="\n",
-        )
-        pd.DataFrame(
-            overlap_checks,
-            columns=[
-                "check",
-                "task_id",
-                "strategy",
-                "repeat",
-                "passed",
-                "overlap_count",
-            ],
-        ).to_csv(
-            audit_root / "overlap_checks.csv",
-            index=False,
-            lineterminator="\n",
-        )
-        overlap_rows = _overlap_audit_rows(
-            output_root,
-            stage2_train_entities,
-            stage2_validation_entities,
-            stage3_test_entities,
-        )
-        pd.DataFrame(overlap_rows).to_csv(
-            audit_root / "holdout_overlap.csv",
-            index=False,
-            lineterminator="\n",
-        )
-
-        stage3_tier_counts = {
-            tier: int(
-                sum(
-                    profile.tier == tier
-                    for profile in stage3_profiles.values()
-                )
-            )
-            for tier in ("large", "medium", "small")
-        }
-        validation_payload = {
-            "passed": bool(
-                all(bool(row["passed"]) for row in overlap_checks)
-            ),
-            "stage2_tasks": len(stage2_tasks),
-            "stage3_tasks": len(stage3_tasks),
-            "stage3_tier_counts": stage3_tier_counts,
-            "stage2_rows": int(
-                sum(
-                    row["rows"]
-                    for row in task_catalog_rows
-                    if row["stage"] == 2
-                )
-            ),
-            "stage3_rows": int(
-                sum(
-                    row["rows"]
-                    for row in task_catalog_rows
-                    if row["stage"] == 3
-                )
-            ),
-        }
-        if not validation_payload["passed"]:
-            raise TrainingSplitError("Internal split validation failed")
-        write_json(audit_root / "validation.json", validation_payload)
-
-        replace_directory(stage2_root, output_root / "stage2")
-        replace_directory(stage3_root, output_root / "stage3")
-        replace_directory(audit_root, output_root / "audit")
-        task_catalog_destination = output_root / "task_catalog.csv"
-        task_catalog_destination.unlink(missing_ok=True)
-        (staged_root / "task_catalog.csv").rename(task_catalog_destination)
-
-    output_files = [
-        output_root / "task_catalog.csv",
-        *sorted((output_root / "stage2").glob("*.csv")),
-        *sorted((output_root / "stage3").glob("*.csv")),
-        *sorted((output_root / "audit").glob("*")),
-    ]
-    update_manifest(
-        output_root,
-        "supervised_splits",
-        {
-            "final_root": str(final_root),
-            "seed": seed,
-            "pretrain_cap": pretrain_cap,
-            "input_checksums": checksums,
-            "stage2_tasks": len(stage2_tasks),
-            "stage3_tasks": len(stage3_tasks),
-            "stage3_tier_counts": {
-                tier: int((task_catalog["tier"] == tier).sum())
-                for tier in ("large", "medium", "small")
-            },
-            "output_checksums": {
-                path.relative_to(output_root).as_posix(): file_sha256(path)
-                for path in output_files
-                if path.is_file()
-            },
-        },
-    )
-    return task_catalog
-
-
 def build_training_splits(
     final_root: Path,
     output_root: Path,
@@ -3883,99 +2545,6 @@ def build_training_splits(
         systems_by_task,
         seed=seed,
     )
-    repeats_by_task = {
-        task.task_id: (
-            1 if stage3_profiles[task.task_id].tier == "large" else 5
-        )
-        for task in stage3_tasks
-    }
-
-    groups_by_strategy: dict[str, dict[str, set[str]]] = {}
-    weighted_groups_by_strategy: dict[
-        str,
-        dict[str, dict[str, int]],
-    ] = {}
-    single_random_groups: dict[str, dict[str, set[str]]] = {}
-    for task in stage3_tasks:
-        frame, raw_rows = prepare_task_frame(
-            final_root,
-            task,
-            checksums[task.source_file],
-        )
-        profile = stage3_profiles[task.task_id]
-        if raw_rows != profile.raw_rows or len(frame) != profile.rows:
-            raise TrainingSplitError(
-                f"Input changed while planning folds for {task.task_id}"
-            )
-        partitions = _stage3_partitions(
-            frame,
-            task,
-            profile,
-            test_registry,
-        )
-        development = frame.loc[partitions.eq("development")]
-        if task.system_type in SINGLE_SYSTEM_TYPES:
-            single_random_groups.setdefault(task.system_type, {})[
-                task.task_id
-            ] = set(development["_system_id"].astype(str))
-        for strategy, columns in GROUP_STRATEGY_COLUMNS[
-            task.system_type
-        ].items():
-            group_values = _group_series(
-                development,
-                strategy,
-                columns,
-            ).astype(str)
-            groups_by_strategy.setdefault(strategy, {})[
-                task.task_id
-            ] = set(group_values)
-            if strategy in {"cation", "anion"}:
-                weighted_groups_by_strategy.setdefault(strategy, {})[
-                    task.task_id
-                ] = {
-                    str(group_identifier): int(row_count)
-                    for group_identifier, row_count in (
-                        group_values.value_counts().items()
-                    )
-                }
-
-    stage3_group_assignments: dict[tuple[str, str, int], int] = {}
-    for strategy, task_groups in groups_by_strategy.items():
-        if strategy in weighted_groups_by_strategy:
-            planned = plan_shared_weighted_group_folds(
-                weighted_groups_by_strategy[strategy],
-                repeats_by_task,
-                seed=seed,
-                namespace=f"stage3_group:{strategy}",
-            )
-        else:
-            planned = plan_shared_group_folds(
-                task_groups,
-                repeats_by_task,
-                seed=seed,
-                namespace=f"stage3_group:{strategy}",
-            )
-        stage3_group_assignments.update(
-            {
-                (strategy, group_identifier, repeat): fold
-                for (group_identifier, repeat), fold in planned.items()
-            }
-        )
-
-    single_random_assignments: dict[tuple[str, str, int], int] = {}
-    for system_type, task_groups in single_random_groups.items():
-        planned = plan_shared_group_folds(
-            task_groups,
-            repeats_by_task,
-            seed=seed,
-            namespace=f"stage3_random_single:{system_type}",
-        )
-        single_random_assignments.update(
-            {
-                (system_type, group_identifier, repeat): fold
-                for (group_identifier, repeat), fold in planned.items()
-            }
-        )
 
     task_catalog_rows: list[dict[str, object]] = []
     fold_balance_rows: list[dict[str, object]] = []
@@ -4122,32 +2691,17 @@ def build_training_splits(
 
             repeats = 1 if profile.tier == "large" else 5
             strategies = ["random", *GROUP_STRATEGY_COLUMNS[task.system_type]]
-            random_unit = (
-                development["_system_id"]
-                if task.system_type in SINGLE_SYSTEM_TYPES
-                else development["_row_id"]
-            )
+            random_unit = development["_row_id"]
             for repeat_index in range(repeats):
-                if task.system_type in SINGLE_SYSTEM_TYPES:
-                    folds = random_unit.map(
-                        lambda unit_id: single_random_assignments[
-                            (
-                                task.system_type,
-                                str(unit_id),
-                                repeat_index,
-                            )
-                        ]
-                    )
-                else:
-                    random_fold_map = balanced_unit_folds(
-                        random_unit.astype(str),
-                        seed=seed,
-                        namespace=f"stage3_random:{task.task_id}",
-                        repeat=repeat_index,
-                    )
-                    folds = random_unit.map(
-                        lambda unit_id: random_fold_map[str(unit_id)]
-                    )
+                random_fold_map = balanced_unit_folds(
+                    random_unit.astype(str),
+                    seed=seed,
+                    namespace=f"stage3_random:{task.task_id}",
+                    repeat=repeat_index,
+                )
+                folds = random_unit.map(
+                    lambda unit_id: random_fold_map[str(unit_id)]
+                )
                 if set(folds) != set(range(5)):
                     raise TrainingSplitError(
                         f"Random five-fold split has empty folds for "
@@ -4175,25 +2729,14 @@ def build_training_splits(
                     strategy,
                     columns,
                 )
-                if group_values.nunique() < 5:
-                    raise TrainingSplitError(
-                        f"Fewer than five {strategy} groups for {task.task_id}"
-                    )
-                for repeat_index in range(repeats):
-                    folds = group_values.map(
-                        lambda unit_id: stage3_group_assignments[
-                            (
-                                strategy,
-                                str(unit_id),
-                                repeat_index,
-                            )
-                        ]
-                    )
-                    if set(folds) != set(range(5)):
-                        raise TrainingSplitError(
-                            f"{strategy} five-fold split has empty folds for "
-                            f"{task.task_id}, repeat {repeat_index}"
-                        )
+                group_folds = task_group_kfold_assignments(
+                    group_values,
+                    task_id=task.task_id,
+                    strategy=strategy,
+                    repeats=repeats,
+                    seed=seed,
+                )
+                for repeat_index, folds in enumerate(group_folds):
                     if strategy in {"cation", "anion"}:
                         fold_balance_rows.extend(
                             fold_balance_audit_rows(
