@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scripts.merge_data import merge_data, property_slug
+from scripts.merge_data import fixed_h_inchikey, merge_data, property_slug
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -22,6 +22,121 @@ def test_property_slug_uses_stable_filename_rules():
     assert property_slug("cation_LUMO_eV") == "cation_lumo"
     assert property_slug("x_CO2_unitless") == "x_co2"
     assert property_slug("simulated_QM_elec_HF") == "simulated_qm_elec_hf"
+
+
+def test_fixed_h_identity_merges_resonance_but_not_tautomers():
+    assert fixed_h_inchikey("CCCC[n+]1ccn(C)c1") == fixed_h_inchikey(
+        "CCCCn1cc[n+](C)c1"
+    )
+    assert fixed_h_inchikey("O=c1cccc[nH]1") != fixed_h_inchikey(
+        "Oc1ccccn1"
+    )
+
+
+def test_merge_normalizes_equivalent_smiles_before_property_aggregation(
+    tmp_path: Path,
+):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    first = {
+        "cation": "CCCC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+        "density_g/cm^3": 1.2,
+    }
+    equivalent = {
+        **first,
+        "cation": "CCCCn1cc[n+](C)c1",
+    }
+    write_csv(
+        input_root / "AIonopedia" / "density.csv",
+        [first],
+    )
+    write_csv(
+        input_root / "ILBERT" / "density.csv",
+        [
+            equivalent,
+            {
+                **equivalent,
+                "temperature_K": 308.15,
+                "density_g/cm^3": 1.1,
+            },
+        ],
+    )
+
+    merge_data(input_root, output_root)
+
+    density = pd.read_csv(output_root / "experiment" / "density.csv")
+    assert len(density) == 2
+    assert density["cation"].nunique() == 1
+    assert density.loc[
+        density["temperature_K"].eq(298.15),
+        "source_list",
+    ].item() == "AIonopedia; ILBERT"
+
+    audit = pd.read_csv(
+        output_root / "chemical_identity_equivalences.csv"
+    )
+    row = audit[audit["representative_smiles"].eq(density["cation"].iloc[0])]
+    assert len(row) == 1
+    assert set(row.iloc[0]["equivalent_smiles_list"].split("; ")) == {
+        "CCCC[n+]1ccn(C)c1",
+        "CCCCn1cc[n+](C)c1",
+    }
+    assert row.iloc[0]["occurrence_count"] == 3
+    assert row.iloc[0]["source_list"] == "AIonopedia; ILBERT"
+
+
+def test_qm_median_groups_fixed_h_equivalent_smiles(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    write_csv(
+        input_root / "simulation" / "simulated_QM_elec_HF_structured.csv",
+        [
+            {
+                "SMILES": "CCCC[n+]1ccn(C)c1",
+                "ESP_max": 1.0,
+                "gap_eV": 2.0,
+            },
+            {
+                "SMILES": "CCCCn1cc[n+](C)c1",
+                "ESP_max": 3.0,
+                "gap_eV": 4.0,
+            },
+        ],
+    )
+
+    merge_data(input_root, output_root)
+
+    qm = pd.read_csv(
+        output_root / "simulation" / "simulated_qm_elec_hf.csv"
+    )
+    assert len(qm) == 1
+    assert qm.loc[0, "ESP_max"] == 2.0
+    assert qm.loc[0, "gap_eV"] == 3.0
+
+
+def test_merge_rejects_invalid_chemical_identity_with_context(
+    tmp_path: Path,
+):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    write_csv(
+        input_root / "ILBERT" / "density.csv",
+        [
+            {
+                "cation": "not-a-smiles",
+                "anion": "[Cl-]",
+                "density_g/cm^3": 1.0,
+            }
+        ],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"ILBERT/density\.csv, column cation",
+    ):
+        merge_data(input_root, output_root)
 
 
 def test_experiment_sources_merge_by_property_and_aggregate_identical_records(tmp_path: Path):
@@ -111,10 +226,17 @@ def test_after_aionopedia_part_folds_precision_difference_and_preserves_material
 def test_scalar_properties_fold_close_values_without_crossing_conditions_or_tolerance(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
+    cations = {
+        "boundary": "C[N+](C)(C)C",
+        "above": "CC[N+](C)(C)C",
+        "condition": "CCC[N+](C)(C)C",
+        "artifact": "CCCC[N+](C)(C)C",
+        "chain": "CCCCC[N+](C)(C)C",
+    }
 
     def row(case: str, value: float, temperature: float = 298.15) -> dict[str, object]:
         return {
-            "cation": f"{case}[N+](C)(C)C",
+            "cation": cations[case],
             "anion": "[Cl-]",
             "temperature_K": temperature,
             "density_g/cm^3": value,
@@ -152,21 +274,21 @@ def test_scalar_properties_fold_close_values_without_crossing_conditions_or_tole
     density = pd.read_csv(output_root / "experiment" / "density.csv")
     assert len(density) == 8
 
-    boundary = density[density["cation"].str.startswith("boundary")]
+    boundary = density[density["cation"].eq(cations["boundary"])]
     assert boundary["density_g/cm^3"].tolist() == [1.2500005]
     assert boundary["source_list"].item() == "AIonopedia; ILBERT"
 
-    above = density[density["cation"].str.startswith("above")]
+    above = density[density["cation"].eq(cations["above"])]
     assert set(above["density_g/cm^3"]) == {1.25, 1.2500006}
 
-    condition = density[density["cation"].str.startswith("condition")]
+    condition = density[density["cation"].eq(cations["condition"])]
     assert set(condition["temperature_K"]) == {298.15, 308.15}
 
-    artifact = density[density["cation"].str.startswith("artifact")]
+    artifact = density[density["cation"].eq(cations["artifact"])]
     assert artifact["density_g/cm^3"].tolist() == [1.1206]
     assert artifact["source_list"].item() == "AIonopedia; after_AIonopedia"
 
-    chain = density[density["cation"].str.startswith("chain")]
+    chain = density[density["cation"].eq(cations["chain"])]
     assert set(chain["density_g/cm^3"]) == {1.0000004, 1.0000008}
     assert set(chain["source_list"]) == {"AIonopedia; ILBERT", "after_AIonopedia"}
 
