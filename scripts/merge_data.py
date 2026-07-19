@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 import re
 import shutil
 from pathlib import Path
 
 import pandas as pd
+from rdkit import Chem, rdBase
+from rdkit.Chem import inchi
 
 EXPERIMENT_SOURCES = ("AIonopedia", "ILBERT", "ILThermo", "after_AIonopedia")
 SIMULATION_SOURCES = ("simulation",)
@@ -38,6 +41,14 @@ DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM = 589.0
 SCALAR_VALUE_ABSOLUTE_TOLERANCE = Decimal("5e-7")
 SOLVATION_REVISION_PAIR_TOLERANCE = Decimal("0.005")
 FLOAT_SIGNIFICANT_DIGITS = 15
+CHEMICAL_IDENTITY_AUDIT_COLUMNS = (
+    "fixed_h_inchikey",
+    "representative_smiles",
+    "equivalent_smiles_list",
+    "occurrence_count",
+    "source_list",
+    "source_file_list",
+)
 UNIT_SUFFIXES = (
     "_10^-9*m^2/s",
     "_J/mol/K",
@@ -59,6 +70,126 @@ UNIT_SUFFIXES = (
     "_eV",
     "_K",
 )
+
+
+@lru_cache(maxsize=None)
+def canonicalize_identity_smiles(smiles: str) -> str:
+    text = str(smiles).strip()
+    if not text:
+        raise ValueError("empty SMILES")
+    with rdBase.BlockLogs():
+        molecule = Chem.MolFromSmiles(text)
+    if molecule is None:
+        raise ValueError(f"invalid SMILES: {text}")
+    return Chem.MolToSmiles(
+        molecule,
+        canonical=True,
+        isomericSmiles=True,
+    )
+
+
+@lru_cache(maxsize=None)
+def fixed_h_inchikey(smiles: str) -> str:
+    canonical = canonicalize_identity_smiles(smiles)
+    with rdBase.BlockLogs():
+        molecule = Chem.MolFromSmiles(canonical)
+        key = (
+            inchi.MolToInchiKey(molecule, options="/FixedH")
+            if molecule is not None
+            else ""
+        )
+    if not key:
+        raise ValueError(f"unable to generate Fixed-H InChIKey: {canonical}")
+    return key
+
+
+def normalize_chemical_identities(
+    buckets: dict[str, dict[str, list[pd.DataFrame]]],
+) -> pd.DataFrame:
+    observations: dict[str, dict[str, object]] = {}
+    for properties in buckets.values():
+        for frames in properties.values():
+            for frame in frames:
+                identity_columns = [
+                    column
+                    for column in IDENTIFIER_COLUMNS
+                    if column in frame.columns and column != "mol_id"
+                ]
+                for column in identity_columns:
+                    counts = frame[column].value_counts(dropna=False)
+                    for value, count in counts.items():
+                        if pd.isna(value) or not str(value).strip():
+                            raise ValueError(
+                                "missing chemical identity in "
+                                f"{frame['source'].iloc[0]}/"
+                                f"{frame['source_file'].iloc[0]}, column {column}"
+                            )
+                        try:
+                            canonical = canonicalize_identity_smiles(str(value))
+                            identity_key = fixed_h_inchikey(canonical)
+                        except ValueError as exc:
+                            raise ValueError(
+                                "chemical identity normalization failed in "
+                                f"{frame['source'].iloc[0]}/"
+                                f"{frame['source_file'].iloc[0]}, column {column}: "
+                                f"{exc}"
+                            ) from exc
+                        entry = observations.setdefault(
+                            identity_key,
+                            {
+                                "smiles": set(),
+                                "occurrence_count": 0,
+                                "sources": set(),
+                                "source_files": set(),
+                            },
+                        )
+                        entry["smiles"].add(canonical)
+                        entry["occurrence_count"] += int(count)
+                        entry["sources"].add(str(frame["source"].iloc[0]))
+                        entry["source_files"].add(
+                            str(frame["source_file"].iloc[0])
+                        )
+
+    representatives = {
+        identity_key: min(entry["smiles"])
+        for identity_key, entry in observations.items()
+    }
+    for properties in buckets.values():
+        for frames in properties.values():
+            for frame in frames:
+                for column in IDENTIFIER_COLUMNS:
+                    if column not in frame.columns or column == "mol_id":
+                        continue
+                    replacements: dict[object, str] = {}
+                    for value in pd.unique(frame[column]):
+                        canonical = canonicalize_identity_smiles(str(value))
+                        replacements[value] = representatives[
+                            fixed_h_inchikey(canonical)
+                        ]
+                    frame[column] = frame[column].map(replacements)
+
+    audit_rows = []
+    for identity_key, entry in observations.items():
+        equivalent_smiles = sorted(entry["smiles"])
+        if len(equivalent_smiles) < 2:
+            continue
+        audit_rows.append(
+            {
+                "fixed_h_inchikey": identity_key,
+                "representative_smiles": representatives[identity_key],
+                "equivalent_smiles_list": "; ".join(equivalent_smiles),
+                "occurrence_count": int(entry["occurrence_count"]),
+                "source_list": "; ".join(sorted(entry["sources"])),
+                "source_file_list": "; ".join(
+                    sorted(entry["source_files"])
+                ),
+            }
+        )
+    return (
+        pd.DataFrame(audit_rows, columns=CHEMICAL_IDENTITY_AUDIT_COLUMNS)
+        .sort_values("fixed_h_inchikey", kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 def property_name(label: str) -> str:
@@ -506,6 +637,9 @@ def clean_output_root(output_root: Path) -> None:
     system_counts = output_root / "system_property_counts.csv"
     if system_counts.exists():
         system_counts.unlink()
+    identity_audit = output_root / "chemical_identity_equivalences.csv"
+    if identity_audit.exists():
+        identity_audit.unlink()
 
 
 def write_bucket(
@@ -567,14 +701,28 @@ def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     output_root.mkdir(parents=True, exist_ok=True)
     clean_output_root(output_root)
 
+    buckets = {
+        "experiment": collect_bucket(input_root, EXPERIMENT_SOURCES),
+        "simulation": collect_bucket(input_root, SIMULATION_SOURCES),
+    }
+    identity_audit = normalize_chemical_identities(buckets)
+
     manifest_rows: list[dict[str, object]] = []
-    manifest_rows.extend(write_bucket("experiment", collect_bucket(input_root, EXPERIMENT_SOURCES), output_root))
-    manifest_rows.extend(write_bucket("simulation", collect_bucket(input_root, SIMULATION_SOURCES), output_root))
+    manifest_rows.extend(
+        write_bucket("experiment", buckets["experiment"], output_root)
+    )
+    manifest_rows.extend(
+        write_bucket("simulation", buckets["simulation"], output_root)
+    )
     manifest = pd.DataFrame(
         manifest_rows,
         columns=["bucket", "property_label", "output_file", "input_files", "input_rows", "output_rows"],
     )
     manifest.to_csv(output_root / "merged_manifest.csv", index=False)
+    identity_audit.to_csv(
+        output_root / "chemical_identity_equivalences.csv",
+        index=False,
+    )
     return manifest_rows
 
 
