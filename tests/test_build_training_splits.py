@@ -1,24 +1,26 @@
 import json
+from http.client import IncompleteRead
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from scripts.build_training_splits import (
+    PRETRAIN_ENTITY_COLUMNS,
     PubChemClient,
+    TaskProfile,
     TaskSpec,
     TrainingSplitError,
+    _round_robin_rule_candidates,
     augment_pretraining_entities,
     build_training_splits,
     candidate_allowed,
     canonicalize_smiles,
-    entity_id,
     extract_pretraining_entities,
     generate_rule_candidates,
-    group_id,
+    plan_joint_test_registry,
     prepare_task_frame,
     role_fragments,
-    stable_fraction,
     tier_for_system_count,
 )
 
@@ -156,12 +158,30 @@ def test_extract_pretraining_entities_splits_ion_fragments_and_preserves_roles(
     assert set(ethanol["role"]) == {"solute", "molecule"}
     assert "il" not in set(entities["role"])
 
-    sources = pd.read_csv(output_root / "stage1" / "entity_sources.csv")
-    assert len(sources) == 6
-    assert set(sources["source_file"]) == {
-        "experiment/solvation.csv",
-        "simulation/molecules.csv",
+    assert {
+        path.name
+        for path in (output_root / "stage1").glob("*.csv")
+    } == {
+        "IL.csv",
+        "anion.csv",
+        "cation.csv",
+        "solute.csv",
+        "solvent.csv",
+        "molecule.csv",
     }
+    il = pd.read_csv(output_root / "stage1" / "IL.csv")
+    assert list(il.columns) == ["cation", "anion"]
+    assert il.to_dict(orient="records") == [
+        {
+            "cation": canonicalize_smiles("[Na+].[K+]"),
+            "anion": canonicalize_smiles("[Cl-].[Br-]"),
+        }
+    ]
+    molecule = pd.read_csv(output_root / "stage1" / "molecule.csv")
+    assert list(molecule.columns) == PRETRAIN_ENTITY_COLUMNS
+    assert molecule.loc[0, "origin_list"] == "dataset"
+    assert not (output_root / "stage1" / "entities.csv").exists()
+    assert not (output_root / "stage1" / "entity_sources.csv").exists()
     assert structure_path.exists()
 
 
@@ -187,6 +207,167 @@ def test_rule_candidates_are_finite_and_preserve_charge():
     assert all(candidate_allowed("C[NH3+]", row["SMILES"], "cation") for row in charged)
     assert not candidate_allowed("C[NH3+]", "CCN", "cation")
     assert not candidate_allowed("[Cl-]", "[Na+]", "anion")
+
+
+def test_ion_rules_extend_and_branch_terminal_alkyl_chains():
+    linear = {
+        (row["rule"], row["SMILES"])
+        for row in generate_rule_candidates(
+            "CCC[N+](C)(C)C",
+            "cation",
+        )
+    }
+    assert (
+        "terminal_alkyl_extend_4",
+        canonicalize_smiles("CCCCCCC[N+](C)(C)C"),
+    ) in linear
+    assert (
+        "terminal_alkyl_linear_to_branch",
+        canonicalize_smiles("CC(C)[N+](C)(C)C"),
+    ) in linear
+
+    branched = {
+        (row["rule"], row["SMILES"])
+        for row in generate_rule_candidates(
+            "CC(C)[N+](C)(C)C",
+            "cation",
+        )
+    }
+    assert (
+        "terminal_alkyl_branch_to_linear",
+        canonicalize_smiles("CCC[N+](C)(C)C"),
+    ) in branched
+
+    neutral_rules = {
+        row["rule"]
+        for row in generate_rule_candidates("CCCC", "molecule")
+    }
+    assert "terminal_alkyl_extend_3" not in neutral_rules
+    assert "terminal_alkyl_linear_to_branch" not in neutral_rules
+
+
+def test_rule_candidates_drop_disconnected_explicit_hydrogen_fragments(capfd):
+    seed = "[2H]C([2H])([2H])C([2H])([2H])[n+]1ccn(C)c1"
+    candidates = generate_rule_candidates(seed, "cation")
+
+    assert candidates
+    assert all(
+        candidate_allowed(seed, row["SMILES"], "cation")
+        for row in candidates
+    )
+    assert "not removing hydrogen atom without neighbors" not in capfd.readouterr().err
+
+
+def test_ion_rules_cover_headgroups_and_perfluoroalkyl_chains():
+    ammonium = {
+        (row["rule"], row["SMILES"])
+        for row in generate_rule_candidates("C[N+](C)(C)C", "cation")
+    }
+    assert (
+        "cation_headgroup_N_to_P",
+        canonicalize_smiles("C[P+](C)(C)C"),
+    ) in ammonium
+
+    phosphonium = {
+        (row["rule"], row["SMILES"])
+        for row in generate_rule_candidates("C[P+](C)(C)C", "cation")
+    }
+    assert (
+        "cation_headgroup_P_to_N",
+        canonicalize_smiles("C[N+](C)(C)C"),
+    ) in phosphonium
+    assert not any(
+        row["rule"].startswith("cation_headgroup")
+        for row in generate_rule_candidates("C[N+](C)(C)C", "molecule")
+    )
+
+    triflate = {
+        (row["rule"], row["SMILES"])
+        for row in generate_rule_candidates(
+            "[O-]S(=O)(=O)C(F)(F)F",
+            "anion",
+        )
+    }
+    pentafluoroethyl = canonicalize_smiles(
+        "[O-]S(=O)(=O)C(F)(F)C(F)(F)F"
+    )
+    assert ("perfluoroalkyl_extend_1", pentafluoroethyl) in triflate
+
+    shortened = {
+        (row["rule"], row["SMILES"])
+        for row in generate_rule_candidates(pentafluoroethyl, "anion")
+    }
+    assert (
+        "perfluoroalkyl_shorten_1",
+        canonicalize_smiles("[O-]S(=O)(=O)C(F)(F)F"),
+    ) in shortened
+
+
+def test_ion_rules_cover_chalcogen_aromatic_and_iodine_analogs():
+    hydroxyl = {
+        (row["rule"], row["SMILES"])
+        for row in generate_rule_candidates(
+            "OCC[N+](C)(C)C",
+            "cation",
+        )
+    }
+    assert (
+        "hydroxyl_thiol_O_to_S",
+        canonicalize_smiles("SCC[N+](C)(C)C"),
+    ) in hydroxyl
+
+    formate = {
+        (row["rule"], row["SMILES"])
+        for row in generate_rule_candidates("[O-]C=O", "anion")
+    }
+    assert (
+        "anionic_chalcogen_O_to_S",
+        canonicalize_smiles("[S-]C=O"),
+    ) in formate
+    assert (
+        "carbonyl_thiocarbonyl_O_to_S",
+        canonicalize_smiles("[O-]C=S"),
+    ) in formate
+
+    pyridinium = generate_rule_candidates("C[n+]1ccccc1", "cation")
+    assert any(row["rule"] == "aromatic_C_to_N" for row in pyridinium)
+    assert all(
+        candidate_allowed("C[n+]1ccccc1", row["SMILES"], "cation")
+        for row in pyridinium
+    )
+
+    chloride = {
+        (row["rule"], row["SMILES"])
+        for row in generate_rule_candidates("[Cl-]", "anion")
+    }
+    assert ("halogen_Cl_to_I", "[I-]") in chloride
+    assert not any(
+        "_to_I" in row["rule"] or "I_to_" in row["rule"]
+        for row in generate_rule_candidates("CCCl", "molecule")
+    )
+
+
+def test_rule_family_order_is_deterministic_and_round_robin():
+    candidates = [
+        {
+            "candidate_smiles": f"C{index}",
+            "method": "rule",
+            "pubchem_cid": "",
+            "rule": f"{family}_{index}",
+            "family": family,
+        }
+        for family in ("halogen", "terminal_alkyl", "aromatic_CH_N")
+        for index in range(3)
+    ]
+    first = _round_robin_rule_candidates(candidates, "seed")
+    second = _round_robin_rule_candidates(candidates, "seed")
+
+    assert first == second
+    assert {row["family"] for row in first[:3]} == {
+        "halogen",
+        "terminal_alkyl",
+        "aromatic_CH_N",
+    }
 
 
 def test_mixed_internal_ion_fragments_remain_one_entity():
@@ -247,6 +428,47 @@ def test_pubchem_client_retries_caches_and_supports_offline_mode(tmp_path: Path)
     offline.close()
 
 
+def test_pubchem_client_retries_incomplete_chunked_response(tmp_path: Path):
+    calls = 0
+    sleeps: list[float] = []
+    payload = json.dumps(
+        {
+            "PropertyTable": {
+                "Properties": [
+                    {"CID": 702, "SMILES": "CCO", "Charge": 0},
+                ]
+            }
+        }
+    ).encode()
+
+    def transport(_):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise IncompleteRead(b'{"PropertyTable":')
+        return 200, payload, {}
+
+    cache_path = tmp_path / "pubchem.sqlite"
+    client = PubChemClient(
+        cache_path,
+        rate_limit=0,
+        max_retries=2,
+        transport=transport,
+        sleep=sleeps.append,
+    )
+
+    assert client.similarity("CCO") == [
+        {"CID": 702, "SMILES": "CCO", "Charge": 0}
+    ]
+    assert calls == 2
+    assert sleeps == [1.0]
+    assert client.similarity("CCO") == [
+        {"CID": 702, "SMILES": "CCO", "Charge": 0}
+    ]
+    assert calls == 2
+    client.close()
+
+
 class FakePubChemClient:
     def similarity(
         self,
@@ -261,13 +483,11 @@ class FakePubChemClient:
         return [
             {"CID": 1, "SMILES": "CCF", "Charge": 0},
             {"CID": 2, "SMILES": "CCBr", "Charge": 0},
-            {"CID": 3, "SMILES": "C[NH3+]", "Charge": 1},
+            {"CID": 3, "SMILES": "CCO", "Charge": 0},
         ]
 
-    def identity(self, smiles: str) -> list[dict[str, object]]:
-        if canonicalize_smiles(smiles) == "CCCl":
-            return [{"CID": 4, "SMILES": "CCCl", "Charge": 0}]
-        return []
+    def identity(self, _smiles: str) -> list[dict[str, object]]:
+        raise AssertionError("local rules must not call PubChem identity")
 
 
 def test_augmentation_uses_global_cap_and_records_selected_provenance(
@@ -276,42 +496,53 @@ def test_augmentation_uses_global_cap_and_records_selected_provenance(
     output_root = tmp_path / "training"
     stage1 = output_root / "stage1"
     stage1.mkdir(parents=True)
+    pd.DataFrame(columns=["cation", "anion"]).to_csv(
+        stage1 / "IL.csv",
+        index=False,
+    )
+    for role in ("anion", "cation", "solute", "solvent"):
+        pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
+            stage1 / f"{role}.csv",
+            index=False,
+        )
     pd.DataFrame(
         [
             {
-                "entity_id": entity_id("molecule", "CCF"),
-                "role": "molecule",
                 "SMILES": "CCF",
                 "formal_charge": 0,
-                "is_original": True,
+                "origin_list": "dataset",
+                "seed_smiles_list": "",
+                "rule_list": "",
+                "pubchem_cid_list": "",
+                "mol_id_list": "",
             }
-        ]
-    ).to_csv(stage1 / "entities.csv", index=False)
-    pd.DataFrame(
-        [
-            {
-                "entity_id": entity_id("molecule", "CCF"),
-                "source_file": "simulation/example.csv",
-                "source_column": "SMILES",
-                "source_row": 0,
-                "fragment_index": 0,
-            }
-        ]
-    ).to_csv(stage1 / "entity_sources.csv", index=False)
+        ],
+        columns=PRETRAIN_ENTITY_COLUMNS,
+    ).to_csv(stage1 / "molecule.csv", index=False)
 
     augmented = augment_pretraining_entities(
         output_root,
-        pretrain_cap=3,
+        pretrain_cap=4,
         client=FakePubChemClient(),
     )
 
-    assert len(augmented) == 3
-    assert set(augmented["SMILES"]) == {"CCF", "CCCl", "CCBr"}
-    assert int(augmented["is_original"].sum()) == 1
-    provenance = pd.read_csv(stage1 / "augmentation_provenance.csv")
-    selected = provenance[provenance["status"].eq("selected")]
-    assert set(selected["method"]) == {"rule", "pubchem_similarity"}
-    assert set(selected["SMILES"]) == {"CCCl", "CCBr"}
+    assert len(augmented) == 4
+    assert set(augmented["SMILES"]) == {"CCF", "CCBr", "CCCF", "CCO"}
+    molecule = pd.read_csv(stage1 / "molecule.csv", keep_default_na=False)
+    assert list(molecule.columns) == PRETRAIN_ENTITY_COLUMNS
+    assert molecule.set_index("SMILES").loc["CCF", "origin_list"] == "dataset"
+    overlap = molecule.set_index("SMILES").loc["CCBr"]
+    assert overlap["origin_list"] == "pubchem;rule"
+    assert overlap["seed_smiles_list"] == "CCF"
+    assert overlap["rule_list"] == "halogen_F_to_Br"
+    assert str(overlap["pubchem_cid_list"]) == "2"
+    local_rule = molecule.set_index("SMILES").loc["CCCF"]
+    assert local_rule["origin_list"] == "rule"
+    assert local_rule["pubchem_cid_list"] == ""
+    pubchem_only = molecule.set_index("SMILES").loc["CCO"]
+    assert pubchem_only["origin_list"] == "pubchem"
+    assert str(pubchem_only["pubchem_cid_list"]) == "3"
+    assert not (stage1 / "augmentation_provenance.csv").exists()
 
 
 @pytest.mark.parametrize(
@@ -369,6 +600,102 @@ def test_charge_rows_are_deduplicated_and_conflicts_fail(tmp_path: Path):
         prepare_task_frame(final_root, task, "checksum")
 
 
+def _system_rows(
+    rows: list[tuple[str, str, int]],
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        rows,
+        columns=["_system_id", "_system_key", "row_count"],
+    )
+
+
+def test_joint_test_selection_avoids_smaller_tasks_and_reuses_shared_systems():
+    tasks = [
+        TaskSpec("large/a", 3, "a.csv", ("value",), ("SMILES",), "molecule"),
+        TaskSpec("large/b", 3, "b.csv", ("value",), ("SMILES",), "molecule"),
+        TaskSpec("small/c", 3, "c.csv", ("value",), ("SMILES",), "molecule"),
+    ]
+    profiles = {
+        "large/a": TaskProfile(10, 10, 10, "large"),
+        "large/b": TaskProfile(10, 10, 10, "large"),
+        "small/c": TaskProfile(1, 1, 1, "small"),
+    }
+    systems = {
+        "large/a": _system_rows(
+            [
+                ("shared_safe", '["shared_safe"]', 1),
+                ("shared_unsafe", '["shared_unsafe"]', 1),
+                ("only_a", '["only_a"]', 1),
+            ]
+        ),
+        "large/b": _system_rows(
+            [
+                ("shared_safe", '["shared_safe"]', 1),
+                ("shared_unsafe", '["shared_unsafe"]', 1),
+                ("only_b", '["only_b"]', 1),
+            ]
+        ),
+        "small/c": _system_rows(
+            [("shared_unsafe", '["shared_unsafe"]', 1)]
+        ),
+    }
+
+    selected = plan_joint_test_registry(
+        tasks,
+        profiles,
+        systems,
+        seed=42,
+    )
+
+    assert set(selected) == {("molecule", "shared_safe")}
+    assert selected[("molecule", "shared_safe")]["source_tasks"] == {
+        "large/a",
+        "large/b",
+    }
+    assert not selected[("molecule", "shared_safe")]["reserved_tasks"]
+
+
+def test_joint_test_selection_fallback_minimizes_reserved_systems_then_rows():
+    tasks = [
+        TaskSpec("large/a", 3, "a.csv", ("value",), ("SMILES",), "molecule"),
+        TaskSpec("small/a", 3, "s1.csv", ("value",), ("SMILES",), "molecule"),
+        TaskSpec("small/b", 3, "s2.csv", ("value",), ("SMILES",), "molecule"),
+    ]
+    profiles = {
+        "large/a": TaskProfile(10, 10, 10, "large"),
+        "small/a": TaskProfile(10, 10, 10, "small"),
+        "small/b": TaskProfile(10, 10, 10, "small"),
+    }
+    systems = {
+        "large/a": _system_rows(
+            [
+                ("one_task_many_rows", '["one_task_many_rows"]', 1),
+                ("one_task_few_rows", '["one_task_few_rows"]', 1),
+                ("two_tasks", '["two_tasks"]', 1),
+            ]
+        ),
+        "small/a": _system_rows(
+            [
+                ("one_task_many_rows", '["one_task_many_rows"]', 20),
+                ("one_task_few_rows", '["one_task_few_rows"]', 2),
+                ("two_tasks", '["two_tasks"]', 1),
+            ]
+        ),
+        "small/b": _system_rows(
+            [("two_tasks", '["two_tasks"]', 1)]
+        ),
+    }
+
+    selected = plan_joint_test_registry(
+        tasks,
+        profiles,
+        systems,
+        seed=42,
+    )
+
+    assert set(selected) == {("molecule", "one_task_few_rows")}
+
+
 def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     tmp_path: Path,
 ):
@@ -395,18 +722,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
             ],
         )
 
-    selected_indices: list[int] = []
-    unselected_indices: list[int] = []
-    for index, (cation, anion) in enumerate(large_pairs, start=1):
-        system_identifier = group_id("il", (cation, anion))
-        destination = (
-            selected_indices
-            if stable_fraction(42, "stage3_test", "il", system_identifier) < 0.1
-            else unselected_indices
-        )
-        destination.append(index)
-    small_indices = selected_indices[:10] + unselected_indices[:39]
-    assert len(small_indices) == 49
+    small_indices = list(range(1, 50))
     write_csv(
         final_root / "experiment" / "dynamic_relative_permittivity.csv",
         [
@@ -483,65 +799,107 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert stage3.loc["experiment/density", "repeats"] == 1
     assert stage3.loc["experiment/solvation", "repeats"] == 5
 
-    test_groups = pd.read_csv(output_root / "stage3" / "test_groups.csv")
-    shared_large = test_groups[
-        test_groups["source_tasks"].str.contains("experiment/density")
-        & test_groups["source_tasks"].str.contains(
-            "experiment/electrical_conductivity"
+    density_root = output_root / "stage3" / "experiment" / "density"
+    conductivity_root = (
+        output_root
+        / "stage3"
+        / "experiment"
+        / "electrical_conductivity"
+    )
+    density_test = pd.read_csv(density_root / "test.csv")
+    conductivity_test = pd.read_csv(conductivity_root / "test.csv")
+    density_test_systems = set(
+        density_test[["cation", "anion"]].itertuples(index=False, name=None)
+    )
+    conductivity_test_systems = set(
+        conductivity_test[["cation", "anion"]].itertuples(
+            index=False,
+            name=None,
         )
-    ]
-    assert not shared_large.empty
-
-    stage3_rows = pd.read_csv(output_root / "stage3" / "rows.csv")
-    small_rows = stage3_rows[
-        stage3_rows["task_id"].eq(
-            "experiment/dynamic_relative_permittivity"
-        )
-    ]
-    assert (
-        small_rows["partition"].eq("reserved_due_to_cross_task_test").sum()
-        == 10
     )
-    random_assignments = pd.read_csv(
-        output_root / "stage3" / "random_fold_assignments.csv"
-    )
-    assert set(
-        small_rows.loc[
-            small_rows["partition"].eq("reserved_due_to_cross_task_test"),
-            "row_id",
-        ]
-    ).isdisjoint(set(random_assignments["row_id"]))
-
-    medium_random = random_assignments[
-        random_assignments["task_id"].eq("experiment/solvation")
-    ]
-    assert set(medium_random["repeat"]) == set(range(5))
-    large_random = random_assignments[
-        random_assignments["task_id"].eq("experiment/density")
-    ]
-    assert set(large_random["repeat"]) == {0}
-
-    group_folds = pd.read_csv(
-        output_root / "stage3" / "group_fold_assignments.csv"
-    )
-    assert not group_folds.duplicated(
-        ["strategy", "group_id", "repeat"]
-    ).any()
-    loo = pd.read_csv(output_root / "stage3" / "loo_groups.csv")
-    assert set(loo["task_id"]) == {
-        "experiment/dynamic_relative_permittivity"
+    assert len(density_test_systems) == 50
+    assert density_test_systems == conductivity_test_systems
+    small_systems = {
+        ion_pair(index)
+        for index in small_indices
     }
-    overlap_checks = pd.read_csv(
-        output_root / "audit" / "overlap_checks.csv"
+    assert density_test_systems.isdisjoint(small_systems)
+
+    density_folds = [
+        pd.read_csv(density_root / "random" / f"fold{fold}.csv")
+        for fold in range(1, 6)
+    ]
+    assert sum(map(len, density_folds)) + len(density_test) == 501
+    density_development_systems = {
+        pair
+        for fold in density_folds
+        for pair in fold[["cation", "anion"]].itertuples(
+            index=False,
+            name=None,
+        )
+    }
+    assert density_test_systems.isdisjoint(density_development_systems)
+
+    small_root = (
+        output_root
+        / "stage3"
+        / "experiment"
+        / "dynamic_relative_permittivity"
     )
-    assert overlap_checks["passed"].all()
+    reserved = pd.read_csv(small_root / "reserved_summary.csv")
+    assert reserved.empty
+    assert len(pd.read_csv(small_root / "loo_manifest.csv")) == 49
+    for repeat in range(1, 6):
+        folds = [
+            pd.read_csv(
+                small_root
+                / "random"
+                / f"cv{repeat}"
+                / f"fold{fold}.csv"
+            )
+            for fold in range(1, 6)
+        ]
+        assert sum(map(len, folds)) == 49
+
+    medium_root = output_root / "stage3" / "experiment" / "solvation"
+    assert (
+        medium_root / "random" / "cv5" / "fold5.csv"
+    ).exists()
+
+    stage2_density = output_root / "stage2" / "density"
+    train = pd.read_csv(stage2_density / "train.csv")
+    valid = pd.read_csv(stage2_density / "valid.csv")
+    assert set(train.columns) == set(valid.columns)
+    assert len(train) + len(valid) == 100
+    assert set(
+        train[["cation", "anion"]].itertuples(index=False, name=None)
+    ).isdisjoint(
+        set(valid[["cation", "anion"]].itertuples(index=False, name=None))
+    )
+
+    legacy_paths = [
+        output_root / "task_catalog.csv",
+        output_root / "manifest.json",
+        output_root / "audit",
+        output_root / "stage2" / "rows.csv",
+        output_root / "stage3" / "rows.csv",
+        output_root / "stage3" / "test_groups.csv",
+    ]
+    assert not any(path.exists() for path in legacy_paths)
+    for path in output_root.rglob("*.csv"):
+        assert not {
+            "row_id",
+            "system_id",
+            "entity_id",
+        } & set(pd.read_csv(path, nrows=0).columns)
     assert ignored_structure.exists()
 
     checksummed_paths = [
-        output_root / "task_catalog.csv",
-        output_root / "stage2" / "group_assignments.csv",
-        output_root / "stage3" / "group_fold_assignments.csv",
-        output_root / "audit" / "label_and_fold_summary.csv",
+        output_root / "stage1" / "IL.csv",
+        output_root / "stage2" / "density" / "train.csv",
+        density_root / "test.csv",
+        density_root / "IL" / "fold1.csv",
+        small_root / "random" / "cv3" / "fold4.csv",
     ]
     first_run = {path: path.read_bytes() for path in checksummed_paths}
     build_training_splits(final_root, output_root, seed=42)
