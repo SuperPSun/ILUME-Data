@@ -25,6 +25,7 @@ from urllib import error, parse, request
 import numpy as np
 import pandas as pd
 from rdkit import Chem, rdBase
+from rdkit.Chem import inchi
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +58,20 @@ PRETRAIN_ENTITY_COLUMNS = [
     "rule_list",
     "pubchem_cid_list",
     "mol_id_list",
+]
+FOLD_BALANCE_COLUMNS = [
+    "task_id",
+    "strategy",
+    "cv",
+    "fold",
+    "row_count",
+    "group_count",
+    "total_rows",
+    "mean_rows",
+    "largest_group_rows",
+    "max_to_min",
+    "theoretical_lower_bound",
+    "unavoidable_group_dominance",
 ]
 ORIGIN_ORDER = {"dataset": 0, "pubchem": 1, "rule": 2}
 
@@ -417,6 +432,261 @@ def plan_shared_group_folds(
     return planned
 
 
+def _weighted_shared_folds_once(
+    weights_by_task: Mapping[str, Mapping[str, int]],
+    *,
+    seed: int,
+    namespace: str,
+    repeat: int,
+    candidate_index: int,
+) -> dict[str, int] | None:
+    group_tasks: dict[str, dict[str, int]] = {}
+    totals: dict[str, int] = {}
+    for task_id, weights in weights_by_task.items():
+        if len(weights) < 5:
+            raise TrainingSplitError(
+                f"Fewer than five {namespace} groups for {task_id}"
+            )
+        normalized_weights = {
+            str(group_identifier): int(weight)
+            for group_identifier, weight in weights.items()
+        }
+        if any(weight <= 0 for weight in normalized_weights.values()):
+            raise TrainingSplitError(
+                f"Non-positive group weight for {namespace}, {task_id}"
+            )
+        totals[task_id] = sum(normalized_weights.values())
+        for group_identifier, weight in normalized_weights.items():
+            group_tasks.setdefault(group_identifier, {})[task_id] = weight
+
+    targets = {
+        task_id: total / 5.0
+        for task_id, total in totals.items()
+    }
+    loads = {
+        task_id: [0, 0, 0, 0, 0]
+        for task_id in weights_by_task
+    }
+    counts = {
+        task_id: [0, 0, 0, 0, 0]
+        for task_id in weights_by_task
+    }
+    remaining = {
+        task_id: len(weights)
+        for task_id, weights in weights_by_task.items()
+    }
+    assignments: dict[str, int] = {}
+    group_order = sorted(
+        group_tasks,
+        key=lambda group_identifier: (
+            -max(
+                weight / targets[task_id]
+                for task_id, weight in group_tasks[
+                    group_identifier
+                ].items()
+            ),
+            -sum(
+                weight / targets[task_id]
+                for task_id, weight in group_tasks[
+                    group_identifier
+                ].items()
+            ),
+            -len(group_tasks[group_identifier]),
+            stable_id(
+                f"seed:{seed}:{namespace}:weighted_group_order",
+                repeat,
+                candidate_index,
+                group_identifier,
+            ),
+        ),
+    )
+
+    for group_identifier in group_order:
+        incident = group_tasks[group_identifier]
+        feasible_folds: list[int] = []
+        for fold in range(5):
+            feasible = True
+            for task_id in incident:
+                empty_after = sum(
+                    count == 0
+                    for candidate_fold, count in enumerate(counts[task_id])
+                    if candidate_fold != fold
+                )
+                if counts[task_id][fold] == 0:
+                    empty_after = sum(
+                        count == 0 for count in counts[task_id]
+                    ) - 1
+                if remaining[task_id] - 1 < empty_after:
+                    feasible = False
+                    break
+            if feasible:
+                feasible_folds.append(fold)
+        if not feasible_folds:
+            return None
+
+        def fold_score(fold: int) -> tuple[float, float, int, str]:
+            squared_load_increase = sum(
+                (
+                    (loads[task_id][fold] + weight)
+                    / targets[task_id]
+                )
+                ** 2
+                - (loads[task_id][fold] / targets[task_id]) ** 2
+                for task_id, weight in incident.items()
+            )
+            maximum_projected_load = max(
+                (loads[task_id][fold] + weight)
+                / targets[task_id]
+                for task_id, weight in incident.items()
+            )
+            return (
+                squared_load_increase,
+                maximum_projected_load,
+                sum(counts[task_id][fold] for task_id in incident),
+                stable_id(
+                    f"seed:{seed}:{namespace}:weighted_fold",
+                    repeat,
+                    candidate_index,
+                    group_identifier,
+                    fold,
+                ),
+            )
+
+        selected_fold = min(feasible_folds, key=fold_score)
+        assignments[group_identifier] = selected_fold
+        for task_id, weight in incident.items():
+            loads[task_id][selected_fold] += weight
+            counts[task_id][selected_fold] += 1
+            remaining[task_id] -= 1
+
+    if any(
+        count == 0
+        for task_counts in counts.values()
+        for count in task_counts
+    ):
+        return None
+    return assignments
+
+
+def _fold_balance_score(
+    assignments: Mapping[str, int],
+    weights_by_task: Mapping[str, Mapping[str, int]],
+    *,
+    seed: int,
+    namespace: str,
+    repeat: int,
+) -> tuple[float, float, float, float, str]:
+    excess_ratios: list[float] = []
+    squared_row_deviations = 0.0
+    squared_group_deviations = 0.0
+    for task_id, weights in weights_by_task.items():
+        row_loads = [0, 0, 0, 0, 0]
+        group_loads = [0, 0, 0, 0, 0]
+        for group_identifier, weight in weights.items():
+            fold = assignments[str(group_identifier)]
+            row_loads[fold] += int(weight)
+            group_loads[fold] += 1
+        if min(row_loads) <= 0:
+            return (
+                float("inf"),
+                float("inf"),
+                float("inf"),
+                float("inf"),
+                "",
+            )
+        total_rows = sum(row_loads)
+        mean_rows = total_rows / 5.0
+        largest_group = max(int(weight) for weight in weights.values())
+        theoretical_lower_bound = (
+            4.0 * largest_group / (total_rows - largest_group)
+            if largest_group > mean_rows and total_rows > largest_group
+            else 1.0
+        )
+        excess_ratios.append(
+            (max(row_loads) / min(row_loads))
+            / theoretical_lower_bound
+        )
+        squared_row_deviations += sum(
+            ((load - mean_rows) / mean_rows) ** 2
+            for load in row_loads
+        )
+        mean_groups = len(weights) / 5.0
+        squared_group_deviations += sum(
+            ((load - mean_groups) / mean_groups) ** 2
+            for load in group_loads
+        )
+    return (
+        max(excess_ratios),
+        sum(excess_ratios) / len(excess_ratios),
+        squared_row_deviations,
+        squared_group_deviations,
+        stable_id(
+            f"seed:{seed}:{namespace}:weighted_candidate",
+            repeat,
+            *sorted(assignments.items()),
+        ),
+    )
+
+
+def plan_shared_weighted_group_folds(
+    weights_by_task: Mapping[str, Mapping[str, int]],
+    repeats_by_task: Mapping[str, int],
+    *,
+    seed: int,
+    namespace: str,
+    candidate_count: int = 16,
+) -> dict[tuple[str, int], int]:
+    if candidate_count <= 0:
+        raise ValueError("candidate_count must be positive")
+    planned: dict[tuple[str, int], int] = {}
+    maximum_repeats = max(repeats_by_task.values(), default=0)
+    for repeat in range(maximum_repeats):
+        active = {
+            task_id: weights
+            for task_id, weights in weights_by_task.items()
+            if repeats_by_task[task_id] > repeat
+        }
+        if not active:
+            continue
+        baseline = _shared_folds_once(
+            {
+                task_id: set(weights)
+                for task_id, weights in active.items()
+            },
+            seed=seed,
+            namespace=f"{namespace}:baseline",
+            repeat=repeat,
+        )
+        candidates = [baseline]
+        for candidate_index in range(candidate_count):
+            candidate = _weighted_shared_folds_once(
+                active,
+                seed=seed,
+                namespace=namespace,
+                repeat=repeat,
+                candidate_index=candidate_index,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        selected = min(
+            candidates,
+            key=lambda candidate: _fold_balance_score(
+                candidate,
+                active,
+                seed=seed,
+                namespace=namespace,
+                repeat=repeat,
+            ),
+        )
+        planned.update(
+            {
+                (group_identifier, repeat): fold
+                for group_identifier, fold in selected.items()
+            }
+        )
+    return planned
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -434,6 +704,71 @@ def final_csv_paths(final_root: Path) -> list[Path]:
             raise TrainingSplitError(f"Missing final-data bucket: {bucket_root}")
         paths.extend(sorted(bucket_root.glob("*.csv")))
     return sorted(paths, key=lambda path: path.relative_to(final_root).as_posix())
+
+
+_FINAL_IDENTITY_VALIDATION_CACHE: set[
+    tuple[str, tuple[tuple[str, int, int], ...]]
+] = set()
+
+
+def validate_final_identity_consistency(final_root: Path) -> None:
+    final_root = Path(final_root)
+    paths = final_csv_paths(final_root)
+    signature = (
+        str(final_root.resolve()),
+        tuple(
+            (
+                path.relative_to(final_root).as_posix(),
+                path.stat().st_mtime_ns,
+                path.stat().st_size,
+            )
+            for path in paths
+        ),
+    )
+    if signature in _FINAL_IDENTITY_VALIDATION_CACHE:
+        return
+
+    identities: dict[str, tuple[str, str]] = {}
+    for path in paths:
+        relative = path.relative_to(final_root).as_posix()
+        header = list(pd.read_csv(path, nrows=0).columns)
+        columns = [
+            column for column in IDENTITY_COLUMNS if column in header
+        ]
+        if not columns:
+            continue
+        for chunk in pd.read_csv(
+            path,
+            usecols=columns,
+            chunksize=100_000,
+        ):
+            for column in columns:
+                for value in pd.unique(chunk[column]):
+                    if pd.isna(value) or not str(value).strip():
+                        raise TrainingSplitError(
+                            f"Missing identity in {relative}, column {column}"
+                        )
+                    try:
+                        canonical = canonicalize_smiles(str(value))
+                        identity_key = fixed_h_identity_key(canonical)
+                    except TrainingSplitError as exc:
+                        raise TrainingSplitError(
+                            f"{relative}, column {column}: {exc}"
+                        ) from exc
+                    context = f"{relative}:{column}"
+                    previous = identities.setdefault(
+                        identity_key,
+                        (canonical, context),
+                    )
+                    if previous[0] != canonical:
+                        raise TrainingSplitError(
+                            "Equivalent chemical identity has multiple SMILES "
+                            f"representations: {previous[0]!r} "
+                            f"({previous[1]}) and {canonical!r} ({context}). "
+                            "Rebuild data/merged with scripts/merge_data.py, "
+                            "then rebuild data/final."
+                        )
+    _FINAL_IDENTITY_VALIDATION_CACHE.add(signature)
 
 
 def replace_directory(staged: Path, destination: Path) -> None:
@@ -482,10 +817,28 @@ def canonicalize_smiles(smiles: str) -> str:
     text = str(smiles).strip()
     if not text:
         raise TrainingSplitError("Empty SMILES")
-    molecule = Chem.MolFromSmiles(text)
+    with rdBase.BlockLogs():
+        molecule = Chem.MolFromSmiles(text)
     if molecule is None:
         raise TrainingSplitError(f"Invalid SMILES: {text}")
     return Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True)
+
+
+@lru_cache(maxsize=None)
+def fixed_h_identity_key(smiles: str) -> str:
+    canonical = canonicalize_smiles(smiles)
+    with rdBase.BlockLogs():
+        molecule = Chem.MolFromSmiles(canonical)
+        key = (
+            inchi.MolToInchiKey(molecule, options="/FixedH")
+            if molecule is not None
+            else ""
+        )
+    if not key:
+        raise TrainingSplitError(
+            f"Unable to generate Fixed-H InChIKey: {canonical}"
+        )
+    return key
 
 
 @lru_cache(maxsize=None)
@@ -634,6 +987,7 @@ def extract_pretraining_entities(
     final_root = Path(final_root)
     output_root = Path(output_root)
     paths = final_csv_paths(final_root)
+    validate_final_identity_consistency(final_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
     entities: dict[tuple[str, str], dict[str, object]] = {}
@@ -699,7 +1053,8 @@ def extract_pretraining_entities(
                             else ""
                         )
                         for smiles in fragments:
-                            key = (role, smiles)
+                            identity_key = fixed_h_identity_key(smiles)
+                            key = (role, identity_key)
                             record = entities.setdefault(
                                 key,
                                 {
@@ -713,6 +1068,9 @@ def extract_pretraining_entities(
                                     "mol_id_list": set(),
                                 },
                             )
+                            if smiles < str(record["SMILES"]):
+                                record["SMILES"] = smiles
+                                record["formal_charge"] = formal_charge(smiles)
                             if not pd.isna(mol_id) and str(mol_id).strip():
                                 mol_ids = record["mol_id_list"]
                                 if isinstance(mol_ids, set):
@@ -1136,8 +1494,12 @@ def _replace_atom(
 def generate_rule_candidates(
     smiles: str,
     role: str | None = None,
+    *,
+    resonance_max_structs: int = 1_000,
 ) -> list[dict[str, str]]:
     """Generate a finite, charge-preserving catalog of chemistry-rule candidates."""
+    if resonance_max_structs <= 0:
+        raise ValueError("resonance_max_structs must be positive")
     canonical = canonicalize_smiles(smiles)
     molecule = Chem.MolFromSmiles(canonical)
     if molecule is None:  # pragma: no cover - protected by canonicalize_smiles
@@ -1145,6 +1507,27 @@ def generate_rule_candidates(
     target_charge = formal_charge(canonical)
     candidates: dict[tuple[str, str], dict[str, str]] = {}
     ion_role = role in {"cation", "anion"}
+
+    if fragment_count(canonical) == 1:
+        seed_identity = fixed_h_identity_key(canonical)
+        supplier = Chem.ResonanceMolSupplier(
+            molecule,
+            0,
+            resonance_max_structs,
+        )
+        for resonance_molecule in supplier:
+            candidate = _sanitized_smiles(resonance_molecule)
+            if (
+                candidate
+                and candidate != canonical
+                and formal_charge(candidate) == target_charge
+                and fixed_h_identity_key(candidate) == seed_identity
+            ):
+                candidates[("resonance_equivalent", candidate)] = {
+                    "SMILES": candidate,
+                    "rule": "resonance_equivalent",
+                    "family": "resonance",
+                }
 
     for chain in _terminal_alkyl_chains(molecule):
         terminal_index = chain[0]
@@ -1659,6 +2042,7 @@ def augment_pretraining_entities(
         rate_limit=rate_limit,
     )
     incomplete: list[str] = []
+    resonance_generated = 0
 
     try:
         with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
@@ -1729,10 +2113,16 @@ def augment_pretraining_entities(
                     )
 
                 local_rules: list[dict[str, object]] = []
-                for generated in generate_rule_candidates(seed_smiles, role):
+                for generated in generate_rule_candidates(
+                    seed_smiles,
+                    role,
+                    resonance_max_structs=remaining + 1,
+                ):
                     generated_smiles = generated["SMILES"]
                     if not candidate_allowed(seed_smiles, generated_smiles, role):
                         continue
+                    if generated["rule"] == "resonance_equivalent":
+                        resonance_generated += 1
                     local_rules.append(
                         {
                             "candidate_smiles": generated_smiles,
@@ -1902,6 +2292,12 @@ def augment_pretraining_entities(
                     }
                 )
             all_rows.extend(selected.values())
+            resonance_selected = sum(
+                "resonance_equivalent"
+                in record["rule_list"]
+                for record in selected.values()
+                if isinstance(record["rule_list"], set)
+            )
             augmented = pd.DataFrame(
                 [
                     {
@@ -1919,6 +2315,12 @@ def augment_pretraining_entities(
                 columns=["role", *PRETRAIN_ENTITY_COLUMNS],
             )
             _write_stage1_entity_files(stage1_root, augmented)
+            print(
+                "Resonance augmentation: "
+                f"generated={resonance_generated:,} "
+                f"selected={resonance_selected:,} "
+                f"not_selected={max(0, resonance_generated - resonance_selected):,}"
+            )
     finally:
         if owns_client:
             active_client.close()
@@ -2278,6 +2680,58 @@ def _profile_task(
         system_count=system_count,
         tier=tier_for_system_count(system_count),
     )
+
+
+def fold_balance_audit_rows(
+    task_id: str,
+    strategy: str,
+    repeat: int,
+    group_values: pd.Series,
+    folds: pd.Series,
+) -> list[dict[str, object]]:
+    row_counts = [
+        int(folds.eq(fold).sum())
+        for fold in range(5)
+    ]
+    group_counts = [
+        int(group_values.loc[folds.eq(fold)].nunique())
+        for fold in range(5)
+    ]
+    total_rows = sum(row_counts)
+    mean_rows = total_rows / 5.0
+    largest_group_rows = int(group_values.value_counts().max())
+    maximum_to_minimum = (
+        max(row_counts) / min(row_counts)
+        if min(row_counts) > 0
+        else float("inf")
+    )
+    theoretical_lower_bound = (
+        4.0
+        * largest_group_rows
+        / (total_rows - largest_group_rows)
+        if largest_group_rows > mean_rows
+        and total_rows > largest_group_rows
+        else 1.0
+    )
+    return [
+        {
+            "task_id": task_id,
+            "strategy": strategy,
+            "cv": repeat + 1,
+            "fold": fold + 1,
+            "row_count": row_counts[fold],
+            "group_count": group_counts[fold],
+            "total_rows": total_rows,
+            "mean_rows": mean_rows,
+            "largest_group_rows": largest_group_rows,
+            "max_to_min": maximum_to_minimum,
+            "theoretical_lower_bound": theoretical_lower_bound,
+            "unavoidable_group_dominance": (
+                largest_group_rows > mean_rows
+            ),
+        }
+        for fold in range(5)
+    ]
 
 
 def _system_table(frame: pd.DataFrame) -> pd.DataFrame:
@@ -3401,6 +3855,7 @@ def build_training_splits(
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     _migrate_pubchem_cache(output_root)
+    validate_final_identity_consistency(final_root)
 
     tasks = discover_tasks(final_root)
     paths = final_csv_paths(final_root)
@@ -3436,6 +3891,10 @@ def build_training_splits(
     }
 
     groups_by_strategy: dict[str, dict[str, set[str]]] = {}
+    weighted_groups_by_strategy: dict[
+        str,
+        dict[str, dict[str, int]],
+    ] = {}
     single_random_groups: dict[str, dict[str, set[str]]] = {}
     for task in stage3_tasks:
         frame, raw_rows = prepare_task_frame(
@@ -3462,24 +3921,40 @@ def build_training_splits(
         for strategy, columns in GROUP_STRATEGY_COLUMNS[
             task.system_type
         ].items():
+            group_values = _group_series(
+                development,
+                strategy,
+                columns,
+            ).astype(str)
             groups_by_strategy.setdefault(strategy, {})[
                 task.task_id
-            ] = set(
-                _group_series(
-                    development,
-                    strategy,
-                    columns,
-                ).astype(str)
-            )
+            ] = set(group_values)
+            if strategy in {"cation", "anion"}:
+                weighted_groups_by_strategy.setdefault(strategy, {})[
+                    task.task_id
+                ] = {
+                    str(group_identifier): int(row_count)
+                    for group_identifier, row_count in (
+                        group_values.value_counts().items()
+                    )
+                }
 
     stage3_group_assignments: dict[tuple[str, str, int], int] = {}
     for strategy, task_groups in groups_by_strategy.items():
-        planned = plan_shared_group_folds(
-            task_groups,
-            repeats_by_task,
-            seed=seed,
-            namespace=f"stage3_group:{strategy}",
-        )
+        if strategy in weighted_groups_by_strategy:
+            planned = plan_shared_weighted_group_folds(
+                weighted_groups_by_strategy[strategy],
+                repeats_by_task,
+                seed=seed,
+                namespace=f"stage3_group:{strategy}",
+            )
+        else:
+            planned = plan_shared_group_folds(
+                task_groups,
+                repeats_by_task,
+                seed=seed,
+                namespace=f"stage3_group:{strategy}",
+            )
         stage3_group_assignments.update(
             {
                 (strategy, group_identifier, repeat): fold
@@ -3503,13 +3978,16 @@ def build_training_splits(
         )
 
     task_catalog_rows: list[dict[str, object]] = []
+    fold_balance_rows: list[dict[str, object]] = []
     stage2_groups: dict[tuple[str, str], str] = {}
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
         staged_root = Path(temporary_dir) / "training_splits"
         stage2_root = staged_root / "stage2"
         stage3_root = staged_root / "stage3"
+        audit_root = staged_root / "_audit"
         stage2_root.mkdir(parents=True)
         stage3_root.mkdir()
+        audit_root.mkdir()
 
         for task in stage2_tasks:
             frame, raw_rows = prepare_task_frame(
@@ -3716,6 +4194,16 @@ def build_training_splits(
                             f"{strategy} five-fold split has empty folds for "
                             f"{task.task_id}, repeat {repeat_index}"
                         )
+                    if strategy in {"cation", "anion"}:
+                        fold_balance_rows.extend(
+                            fold_balance_audit_rows(
+                                task.task_id,
+                                strategy,
+                                repeat_index,
+                                group_values,
+                                folds,
+                            )
+                        )
                     strategy_root = (
                         task_root / STRATEGY_DIRECTORY_NAMES[strategy]
                     )
@@ -3780,8 +4268,16 @@ def build_training_splits(
                 }
             )
 
+        write_dataframe(
+            audit_root / "fold_balance.csv",
+            pd.DataFrame(
+                fold_balance_rows,
+                columns=FOLD_BALANCE_COLUMNS,
+            ),
+        )
         replace_directory(stage2_root, output_root / "stage2")
         replace_directory(stage3_root, output_root / "stage3")
+        replace_directory(audit_root, output_root / "_audit")
 
     (output_root / "task_catalog.csv").unlink(missing_ok=True)
     (output_root / "manifest.json").unlink(missing_ok=True)
