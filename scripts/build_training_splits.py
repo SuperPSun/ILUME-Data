@@ -1,4 +1,4 @@
-"""Build three-stage training corpora and deterministic split manifests.
+"""Build readable three-stage training corpora and deterministic splits.
 
 The script reads only top-level CSV files under ``data/final/experiment`` and
 ``data/final/simulation``. It never traverses or parses molecular structure
@@ -8,10 +8,10 @@ files such as ``.mol`` or ``.mol2``.
 from __future__ import annotations
 
 import argparse
-import csv
 from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
+from http import client as http_client
 import json
 import os
 from pathlib import Path
@@ -24,7 +24,7 @@ from urllib import error, parse, request
 
 import numpy as np
 import pandas as pd
-from rdkit import Chem
+from rdkit import Chem, rdBase
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +49,16 @@ CONDITION_COLUMNS = {
     "phase",
 }
 METADATA_COLUMNS = {"source_list", "mol_id"}
+PRETRAIN_ENTITY_COLUMNS = [
+    "SMILES",
+    "formal_charge",
+    "origin_list",
+    "seed_smiles_list",
+    "rule_list",
+    "pubchem_cid_list",
+    "mol_id_list",
+]
+ORIGIN_ORDER = {"dataset": 0, "pubchem": 1, "rule": 2}
 
 STAGE2_FILES = {
     "simulation/density.csv",
@@ -106,6 +116,16 @@ GROUP_STRATEGY_COLUMNS = {
     "molecule": {},
 }
 SINGLE_SYSTEM_TYPES = {"cation", "anion", "solute", "solvent", "molecule"}
+STRATEGY_DIRECTORY_NAMES = {
+    "random": "random",
+    "il": "IL",
+    "il_solute": "IL-solute",
+    "solute_solvent": "solute-solvent",
+    "cation": "cation",
+    "anion": "anion",
+    "solute": "solute",
+    "solvent": "solvent",
+}
 
 ROW_CATALOG_COLUMNS = [
     "row_id",
@@ -528,6 +548,81 @@ def entity_id(role: str, smiles: str) -> str:
     return stable_id("entity", role, canonicalize_smiles(smiles))
 
 
+def _joined(values: Iterable[object], *, origin: bool = False) -> str:
+    normalized = {
+        str(value).strip()
+        for value in values
+        if not pd.isna(value) and str(value).strip()
+    }
+    if origin:
+        ordered = sorted(
+            normalized,
+            key=lambda value: (ORIGIN_ORDER.get(value, len(ORIGIN_ORDER)), value),
+        )
+    else:
+        ordered = sorted(normalized)
+    return ";".join(ordered)
+
+
+def _split_joined(value: object) -> set[str]:
+    if pd.isna(value):
+        return set()
+    return {
+        item.strip()
+        for item in str(value).split(";")
+        if item.strip()
+    }
+
+
+def _entity_output_frame(
+    records: Iterable[Mapping[str, object]],
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for record in records:
+        rows.append(
+            {
+                "SMILES": str(record["SMILES"]),
+                "formal_charge": int(record["formal_charge"]),
+                "origin_list": _joined(
+                    record.get("origin_list", set()),
+                    origin=True,
+                ),
+                "seed_smiles_list": _joined(
+                    record.get("seed_smiles_list", set())
+                ),
+                "rule_list": _joined(record.get("rule_list", set())),
+                "pubchem_cid_list": _joined(
+                    record.get("pubchem_cid_list", set())
+                ),
+                "mol_id_list": _joined(record.get("mol_id_list", set())),
+            }
+        )
+    return pd.DataFrame(rows, columns=PRETRAIN_ENTITY_COLUMNS).sort_values(
+        "SMILES",
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def _combined_entity_frame(stage1_root: Path) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for role in ROLE_BY_COLUMN.values():
+        path = stage1_root / f"{role}.csv"
+        if not path.exists():
+            raise TrainingSplitError(
+                f"Run extract-pretrain before augment-pretrain; missing {path}"
+            )
+        frame = pd.read_csv(path, keep_default_na=False)
+        missing = set(PRETRAIN_ENTITY_COLUMNS) - set(frame.columns)
+        if missing:
+            raise TrainingSplitError(
+                f"Missing Stage-1 columns in {path}: {sorted(missing)}"
+            )
+        frame = frame.loc[:, PRETRAIN_ENTITY_COLUMNS].copy()
+        frame.insert(0, "role", role)
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True)
+
+
 def extract_pretraining_entities(
     final_root: Path,
     output_root: Path,
@@ -535,127 +630,127 @@ def extract_pretraining_entities(
     pretrain_cap: int = 500_000,
     chunk_size: int = 100_000,
 ) -> pd.DataFrame:
-    """Extract canonical role-specific entities and complete source provenance."""
+    """Extract readable role-specific entities and observed ionic-liquid pairs."""
     final_root = Path(final_root)
     output_root = Path(output_root)
     paths = final_csv_paths(final_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
     entities: dict[tuple[str, str], dict[str, object]] = {}
+    ionic_liquids: set[tuple[str, str]] = set()
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
         staged_stage1 = Path(temporary_dir) / "stage1"
         staged_stage1.mkdir()
-        source_path = staged_stage1 / "entity_sources.csv"
-        with source_path.open("w", newline="", encoding="utf-8") as source_handle:
-            source_writer = csv.DictWriter(
-                source_handle,
-                fieldnames=[
-                    "entity_id",
-                    "source_file",
-                    "source_column",
-                    "source_row",
-                    "fragment_index",
-                ],
-                lineterminator="\n",
-            )
-            source_writer.writeheader()
 
-            for path in paths:
-                relative = path.relative_to(final_root).as_posix()
-                header = pd.read_csv(path, nrows=0).columns
-                columns = [column for column in IDENTITY_COLUMNS if column in header]
-                if not columns:
-                    continue
-                row_offset = 0
-                for chunk in pd.read_csv(path, usecols=columns, chunksize=chunk_size):
-                    for column in columns:
-                        role = ROLE_BY_COLUMN[column]
-                        for local_row, value in enumerate(chunk[column].tolist()):
-                            if pd.isna(value) or not str(value).strip():
-                                raise TrainingSplitError(
-                                    f"Missing {column} in {relative} row "
-                                    f"{row_offset + local_row}"
+        for path in paths:
+            relative = path.relative_to(final_root).as_posix()
+            header = list(pd.read_csv(path, nrows=0).columns)
+            columns = [
+                column for column in IDENTITY_COLUMNS if column in header
+            ]
+            if not columns:
+                continue
+            usecols = [*columns]
+            if "mol_id" in header:
+                usecols.append("mol_id")
+            row_offset = 0
+            for chunk in pd.read_csv(
+                path,
+                usecols=usecols,
+                chunksize=chunk_size,
+            ):
+                if {"cation", "anion"}.issubset(chunk.columns):
+                    for local_row, values in enumerate(
+                        chunk[["cation", "anion"]].itertuples(
+                            index=False,
+                            name=None,
+                        )
+                    ):
+                        try:
+                            ionic_liquids.add(
+                                (
+                                    canonicalize_smiles(str(values[0])),
+                                    canonicalize_smiles(str(values[1])),
                                 )
-                            try:
-                                fragments = role_fragments(str(value), role)
-                            except TrainingSplitError as exc:
-                                raise TrainingSplitError(
-                                    f"{relative} row {row_offset + local_row}, "
-                                    f"column {column}: {exc}"
-                                ) from exc
-                            for fragment_index, smiles in enumerate(fragments):
-                                key = (role, smiles)
-                                identifier = entity_id(role, smiles)
-                                entities.setdefault(
-                                    key,
-                                    {
-                                        "entity_id": identifier,
-                                        "role": role,
-                                        "SMILES": smiles,
-                                        "formal_charge": formal_charge(smiles),
-                                        "is_original": True,
-                                    },
-                                )
-                                source_writer.writerow(
-                                    {
-                                        "entity_id": identifier,
-                                        "source_file": relative,
-                                        "source_column": column,
-                                        "source_row": row_offset + local_row,
-                                        "fragment_index": fragment_index,
-                                    }
-                                )
-                    row_offset += len(chunk)
+                            )
+                        except TrainingSplitError as exc:
+                            raise TrainingSplitError(
+                                f"{relative} row {row_offset + local_row}: {exc}"
+                            ) from exc
+
+                for column in columns:
+                    role = ROLE_BY_COLUMN[column]
+                    for local_row, value in enumerate(chunk[column].tolist()):
+                        if pd.isna(value) or not str(value).strip():
+                            raise TrainingSplitError(
+                                f"Missing {column} in {relative} row "
+                                f"{row_offset + local_row}"
+                            )
+                        try:
+                            fragments = role_fragments(str(value), role)
+                        except TrainingSplitError as exc:
+                            raise TrainingSplitError(
+                                f"{relative} row {row_offset + local_row}, "
+                                f"column {column}: {exc}"
+                            ) from exc
+                        mol_id = (
+                            chunk.iloc[local_row]["mol_id"]
+                            if "mol_id" in chunk.columns
+                            else ""
+                        )
+                        for smiles in fragments:
+                            key = (role, smiles)
+                            record = entities.setdefault(
+                                key,
+                                {
+                                    "role": role,
+                                    "SMILES": smiles,
+                                    "formal_charge": formal_charge(smiles),
+                                    "origin_list": {"dataset"},
+                                    "seed_smiles_list": set(),
+                                    "rule_list": set(),
+                                    "pubchem_cid_list": set(),
+                                    "mol_id_list": set(),
+                                },
+                            )
+                            if not pd.isna(mol_id) and str(mol_id).strip():
+                                mol_ids = record["mol_id_list"]
+                                if isinstance(mol_ids, set):
+                                    mol_ids.add(str(mol_id).strip())
+                row_offset += len(chunk)
 
         if len(entities) > pretrain_cap:
             raise TrainingSplitError(
                 f"Base pretraining corpus has {len(entities)} entities, "
                 f"exceeding cap {pretrain_cap}"
             )
-        entity_frame = pd.DataFrame(
-            sorted(entities.values(), key=lambda row: (str(row["role"]), str(row["SMILES"]))),
-            columns=["entity_id", "role", "SMILES", "formal_charge", "is_original"],
-        )
-        entity_frame.to_csv(
-            staged_stage1 / "entities.csv",
-            index=False,
-            lineterminator="\n",
-        )
+        combined_rows: list[pd.DataFrame] = []
+        for role in ROLE_BY_COLUMN.values():
+            role_frame = _entity_output_frame(
+                record
+                for (record_role, _), record in entities.items()
+                if record_role == role
+            )
+            role_frame.to_csv(
+                staged_stage1 / f"{role}.csv",
+                index=False,
+                lineterminator="\n",
+            )
+            with_role = role_frame.copy()
+            with_role.insert(0, "role", role)
+            combined_rows.append(with_role)
         pd.DataFrame(
-            columns=[
-                "entity_id",
-                "role",
-                "SMILES",
-                "seed_entity_id",
-                "seed_SMILES",
-                "method",
-                "pubchem_cid",
-                "rule",
-                "method_rank",
-                "status",
-                "reason",
-            ]
+            sorted(ionic_liquids),
+            columns=["cation", "anion"],
         ).to_csv(
-            staged_stage1 / "augmentation_provenance.csv",
+            staged_stage1 / "IL.csv",
             index=False,
             lineterminator="\n",
         )
+        entity_frame = pd.concat(combined_rows, ignore_index=True)
         replace_directory(staged_stage1, output_root / "stage1")
 
-    checksums = {
-        path.relative_to(final_root).as_posix(): file_sha256(path)
-        for path in paths
-    }
-    update_manifest(
-        output_root,
-        "stage1_extraction",
-        {
-            "final_root": str(final_root),
-            "pretrain_cap": pretrain_cap,
-            "base_entities": len(entity_frame),
-            "input_checksums": checksums,
-        },
-    )
+    (output_root / "manifest.json").unlink(missing_ok=True)
     return entity_frame
 
 
@@ -813,7 +908,13 @@ class PubChemClient:
                     break
                 retry_after = headers.get("Retry-After")
                 delay = float(retry_after) if retry_after else min(30.0, 2.0**attempt)
-            except (OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            except (
+                OSError,
+                TimeoutError,
+                ValueError,
+                json.JSONDecodeError,
+                http_client.IncompleteRead,
+            ) as exc:
                 last_error = str(exc)
                 delay = min(30.0, 2.0**attempt)
             if attempt < self.max_retries:
@@ -854,30 +955,6 @@ class PubChemClient:
         )
         return self._properties(self._query(request_key, url, smiles))
 
-    def identity(
-        self,
-        smiles: str,
-        *,
-        max_records: int = 20,
-    ) -> list[dict[str, object]]:
-        query = parse.urlencode(
-            {
-                "identity_type": "same_stereo_isotope",
-                "MaxRecords": max_records,
-            }
-        )
-        url = (
-            f"{self.BASE_URL}/compound/fastidentity/smiles/"
-            f"property/SMILES,Charge/JSON?{query}"
-        )
-        request_key = stable_id(
-            "pubchem_identity",
-            canonicalize_smiles(smiles),
-            max_records,
-        )
-        return self._properties(self._query(request_key, url, smiles))
-
-
 def smiles_from_pubchem_record(record: Mapping[str, object]) -> str | None:
     for field in ("SMILES", "IsomericSMILES", "CanonicalSMILES", "ConnectivitySMILES"):
         value = record.get(field)
@@ -888,8 +965,15 @@ def smiles_from_pubchem_record(record: Mapping[str, object]) -> str | None:
 
 def _sanitized_smiles(molecule: Chem.Mol) -> str | None:
     try:
-        Chem.SanitizeMol(molecule)
-        return Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True)
+        with rdBase.BlockLogs():
+            Chem.SanitizeMol(molecule)
+            if len(Chem.GetMolFrags(molecule)) != 1:
+                return None
+            return Chem.MolToSmiles(
+                molecule,
+                canonical=True,
+                isomericSmiles=True,
+            )
     except (ValueError, RuntimeError):
         return None
 
@@ -938,7 +1022,121 @@ def _terminal_alkyl_chains(molecule: Chem.Mol) -> list[tuple[int, ...]]:
     return chains
 
 
-def generate_rule_candidates(smiles: str) -> list[dict[str, str]]:
+def _perfluoroalkyl_chains(molecule: Chem.Mol) -> list[tuple[int, ...]]:
+    chains: list[tuple[int, ...]] = []
+    for atom in molecule.GetAtoms():
+        if not _is_alkyl_carbon(atom):
+            continue
+        carbon_neighbors = [
+            neighbor
+            for neighbor in atom.GetNeighbors()
+            if neighbor.GetAtomicNum() == 6
+        ]
+        anchor_neighbors = [
+            neighbor
+            for neighbor in atom.GetNeighbors()
+            if neighbor.GetAtomicNum() not in {6, 9}
+        ]
+        if len(anchor_neighbors) != 1 or len(carbon_neighbors) > 1:
+            continue
+
+        chain = [atom.GetIdx()]
+        previous_index: int | None = None
+        current = atom
+        valid = True
+        while True:
+            neighbors = list(current.GetNeighbors())
+            if (
+                not _is_alkyl_carbon(current)
+                or any(
+                    bond.GetBondType() != Chem.BondType.SINGLE
+                    for bond in current.GetBonds()
+                )
+            ):
+                valid = False
+                break
+            fluorines = [
+                neighbor for neighbor in neighbors if neighbor.GetAtomicNum() == 9
+            ]
+            external = [
+                neighbor
+                for neighbor in neighbors
+                if neighbor.GetAtomicNum() not in {6, 9}
+            ]
+            if current.GetIdx() == atom.GetIdx():
+                if len(external) != 1:
+                    valid = False
+                    break
+            elif external:
+                valid = False
+                break
+
+            next_carbons = [
+                neighbor
+                for neighbor in neighbors
+                if neighbor.GetAtomicNum() == 6
+                and neighbor.GetIdx() != previous_index
+            ]
+            if not next_carbons:
+                if len(fluorines) != 3:
+                    valid = False
+                break
+            if len(next_carbons) != 1 or len(fluorines) != 2:
+                valid = False
+                break
+            previous_index = current.GetIdx()
+            current = next_carbons[0]
+            if current.GetIdx() in chain:
+                valid = False
+                break
+            chain.append(current.GetIdx())
+        if valid:
+            chains.append(tuple(chain))
+    return chains
+
+
+def _record_rule_candidate(
+    candidates: dict[tuple[str, str], dict[str, str]],
+    molecule: Chem.Mol,
+    *,
+    canonical: str,
+    target_charge: int,
+    rule: str,
+    family: str,
+) -> None:
+    candidate = _sanitized_smiles(molecule)
+    if (
+        candidate
+        and candidate != canonical
+        and formal_charge(candidate) == target_charge
+    ):
+        candidates[(rule, candidate)] = {
+            "SMILES": candidate,
+            "rule": rule,
+            "family": family,
+        }
+
+
+def _replace_atom(
+    molecule: Chem.Mol,
+    atom_index: int,
+    atomic_number: int,
+    *,
+    no_implicit: bool | None = None,
+) -> Chem.Mol:
+    editable = Chem.RWMol(molecule)
+    atom = editable.GetAtomWithIdx(atom_index)
+    atom.SetAtomicNum(atomic_number)
+    atom.SetNumExplicitHs(0)
+    if no_implicit is not None:
+        atom.SetNoImplicit(no_implicit)
+    return editable.GetMol()
+
+
+def generate_rule_candidates(
+    smiles: str,
+    role: str | None = None,
+) -> list[dict[str, str]]:
     """Generate a finite, charge-preserving catalog of chemistry-rule candidates."""
     canonical = canonicalize_smiles(smiles)
     molecule = Chem.MolFromSmiles(canonical)
@@ -946,47 +1144,104 @@ def generate_rule_candidates(smiles: str) -> list[dict[str, str]]:
         return []
     target_charge = formal_charge(canonical)
     candidates: dict[tuple[str, str], dict[str, str]] = {}
+    ion_role = role in {"cation", "anion"}
 
     for chain in _terminal_alkyl_chains(molecule):
         terminal_index = chain[0]
-        for carbon_count in (1, 2):
+        carbon_counts = (1, 2, 3, 4) if ion_role else (1, 2)
+        for carbon_count in carbon_counts:
+            if molecule.GetAtomWithIdx(terminal_index).GetTotalNumHs() < 1:
+                continue
             editable = Chem.RWMol(molecule)
             previous = terminal_index
             for _ in range(carbon_count):
                 added = editable.AddAtom(Chem.Atom(6))
                 editable.AddBond(previous, added, Chem.BondType.SINGLE)
                 previous = added
-            candidate = _sanitized_smiles(editable.GetMol())
             rule = f"terminal_alkyl_extend_{carbon_count}"
-            if (
-                candidate
-                and candidate != canonical
-                and formal_charge(candidate) == target_charge
-            ):
-                candidates[(rule, candidate)] = {
-                    "SMILES": candidate,
-                    "rule": rule,
-                }
+            _record_rule_candidate(
+                candidates,
+                editable.GetMol(),
+                canonical=canonical,
+                target_charge=target_charge,
+                rule=rule,
+                family="terminal_alkyl",
+            )
 
-        for carbon_count in (1, 2):
+        for carbon_count in carbon_counts:
             if len(chain) <= carbon_count:
                 continue
             editable = Chem.RWMol(molecule)
             for atom_index in sorted(chain[:carbon_count], reverse=True):
                 editable.RemoveAtom(atom_index)
-            candidate = _sanitized_smiles(editable.GetMol())
             rule = f"terminal_alkyl_shorten_{carbon_count}"
-            if (
-                candidate
-                and candidate != canonical
-                and formal_charge(candidate) == target_charge
-            ):
-                candidates[(rule, candidate)] = {
-                    "SMILES": candidate,
-                    "rule": rule,
-                }
+            _record_rule_candidate(
+                candidates,
+                editable.GetMol(),
+                canonical=canonical,
+                target_charge=target_charge,
+                rule=rule,
+                family="terminal_alkyl",
+            )
+
+        if ion_role and len(chain) >= 3:
+            editable = Chem.RWMol(molecule)
+            editable.RemoveBond(chain[0], chain[1])
+            editable.AddBond(chain[0], chain[2], Chem.BondType.SINGLE)
+            _record_rule_candidate(
+                candidates,
+                editable.GetMol(),
+                canonical=canonical,
+                target_charge=target_charge,
+                rule="terminal_alkyl_linear_to_branch",
+                family="alkyl_branching",
+            )
+
+    if ion_role:
+        for branch_atom in molecule.GetAtoms():
+            if not _is_alkyl_carbon(branch_atom):
+                continue
+            heavy_neighbors = [
+                neighbor
+                for neighbor in branch_atom.GetNeighbors()
+                if neighbor.GetAtomicNum() > 1
+            ]
+            if len(heavy_neighbors) != 3:
+                continue
+            terminal_neighbors = [
+                neighbor
+                for neighbor in heavy_neighbors
+                if _is_alkyl_carbon(neighbor)
+                and len(
+                    [
+                        candidate
+                        for candidate in neighbor.GetNeighbors()
+                        if candidate.GetAtomicNum() > 1
+                    ]
+                )
+                == 1
+            ]
+            if len(terminal_neighbors) != 2:
+                continue
+            first, second = sorted(
+                (neighbor.GetIdx() for neighbor in terminal_neighbors)
+            )
+            editable = Chem.RWMol(molecule)
+            editable.RemoveBond(branch_atom.GetIdx(), second)
+            editable.AddBond(first, second, Chem.BondType.SINGLE)
+            _record_rule_candidate(
+                candidates,
+                editable.GetMol(),
+                canonical=canonical,
+                target_charge=target_charge,
+                rule="terminal_alkyl_branch_to_linear",
+                family="alkyl_branching",
+            )
 
     halogen_symbols = {9: "F", 17: "Cl", 35: "Br"}
+    if ion_role:
+        halogen_symbols[53] = "I"
+
     for atom in molecule.GetAtoms():
         source_atomic_number = atom.GetAtomicNum()
         if source_atomic_number not in halogen_symbols:
@@ -994,21 +1249,266 @@ def generate_rule_candidates(smiles: str) -> list[dict[str, str]]:
         for target_atomic_number, target_symbol in halogen_symbols.items():
             if target_atomic_number == source_atomic_number:
                 continue
-            editable = Chem.RWMol(molecule)
-            editable.GetAtomWithIdx(atom.GetIdx()).SetAtomicNum(target_atomic_number)
-            candidate = _sanitized_smiles(editable.GetMol())
+            if 53 in {source_atomic_number, target_atomic_number}:
+                carbon_bound_or_isolated = (
+                    atom.GetDegree() == 0
+                    or (
+                        atom.GetDegree() == 1
+                        and atom.GetNeighbors()[0].GetAtomicNum() == 6
+                    )
+                )
+                if not carbon_bound_or_isolated:
+                    continue
             rule = (
                 f"halogen_{halogen_symbols[source_atomic_number]}_to_{target_symbol}"
             )
+            _record_rule_candidate(
+                candidates,
+                _replace_atom(
+                    molecule,
+                    atom.GetIdx(),
+                    target_atomic_number,
+                ),
+                canonical=canonical,
+                target_charge=target_charge,
+                rule=rule,
+                family="halogen",
+            )
+
+    if role == "cation":
+        headgroup_symbols = {7: "N", 15: "P"}
+        for atom in molecule.GetAtoms():
             if (
-                candidate
-                and candidate != canonical
-                and formal_charge(candidate) == target_charge
+                atom.GetAtomicNum() not in headgroup_symbols
+                or atom.GetFormalCharge() != 1
+                or atom.GetIsAromatic()
+                or atom.GetDegree() != 4
+                or atom.GetTotalNumHs() != 0
+                or any(
+                    bond.GetBondType() != Chem.BondType.SINGLE
+                    for bond in atom.GetBonds()
+                )
             ):
-                candidates[(rule, candidate)] = {
-                    "SMILES": candidate,
-                    "rule": rule,
-                }
+                continue
+            target_atomic_number = 15 if atom.GetAtomicNum() == 7 else 7
+            rule = (
+                f"cation_headgroup_{headgroup_symbols[atom.GetAtomicNum()]}"
+                f"_to_{headgroup_symbols[target_atomic_number]}"
+            )
+            _record_rule_candidate(
+                candidates,
+                _replace_atom(
+                    molecule,
+                    atom.GetIdx(),
+                    target_atomic_number,
+                    no_implicit=True,
+                ),
+                canonical=canonical,
+                target_charge=target_charge,
+                rule=rule,
+                family="cation_headgroup",
+            )
+
+    if role == "anion":
+        for chain in _perfluoroalkyl_chains(molecule):
+            terminal_index = chain[-1]
+            terminal_fluorines = sorted(
+                neighbor.GetIdx()
+                for neighbor in molecule.GetAtomWithIdx(
+                    terminal_index
+                ).GetNeighbors()
+                if neighbor.GetAtomicNum() == 9
+            )
+            if len(terminal_fluorines) != 3:
+                continue
+            for unit_count in (1, 2):
+                editable = Chem.RWMol(molecule)
+                first_carbon = editable.GetAtomWithIdx(terminal_fluorines[0])
+                first_carbon.SetAtomicNum(6)
+                first_carbon.SetFormalCharge(0)
+                first_carbon.SetNumExplicitHs(0)
+                first_carbon.SetNoImplicit(True)
+                previous_index = terminal_fluorines[0]
+                for _ in range(2):
+                    fluorine = editable.AddAtom(Chem.Atom(9))
+                    editable.AddBond(
+                        previous_index,
+                        fluorine,
+                        Chem.BondType.SINGLE,
+                    )
+                for _ in range(unit_count - 1):
+                    carbon = Chem.Atom(6)
+                    carbon.SetNoImplicit(True)
+                    carbon_index = editable.AddAtom(carbon)
+                    editable.AddBond(
+                        previous_index,
+                        carbon_index,
+                        Chem.BondType.SINGLE,
+                    )
+                    previous_index = carbon_index
+                    for _ in range(2):
+                        fluorine = editable.AddAtom(Chem.Atom(9))
+                        editable.AddBond(
+                            previous_index,
+                            fluorine,
+                            Chem.BondType.SINGLE,
+                        )
+                terminal_fluorine = editable.AddAtom(Chem.Atom(9))
+                editable.AddBond(
+                    previous_index,
+                    terminal_fluorine,
+                    Chem.BondType.SINGLE,
+                )
+                rule = f"perfluoroalkyl_extend_{unit_count}"
+                _record_rule_candidate(
+                    candidates,
+                    editable.GetMol(),
+                    canonical=canonical,
+                    target_charge=target_charge,
+                    rule=rule,
+                    family="perfluoroalkyl",
+                )
+
+            for unit_count in (1, 2):
+                if len(chain) <= unit_count:
+                    continue
+                removed_indices: set[int] = set(chain[-unit_count:])
+                for carbon_index in chain[-unit_count:]:
+                    removed_indices.update(
+                        neighbor.GetIdx()
+                        for neighbor in molecule.GetAtomWithIdx(
+                            carbon_index
+                        ).GetNeighbors()
+                        if neighbor.GetAtomicNum() == 9
+                    )
+                new_terminal_index = chain[-unit_count - 1]
+                shifted_terminal_index = new_terminal_index - sum(
+                    index < new_terminal_index
+                    for index in removed_indices
+                )
+                editable = Chem.RWMol(molecule)
+                for atom_index in sorted(removed_indices, reverse=True):
+                    editable.RemoveAtom(atom_index)
+                fluorine = editable.AddAtom(Chem.Atom(9))
+                editable.AddBond(
+                    shifted_terminal_index,
+                    fluorine,
+                    Chem.BondType.SINGLE,
+                )
+                rule = f"perfluoroalkyl_shorten_{unit_count}"
+                _record_rule_candidate(
+                    candidates,
+                    editable.GetMol(),
+                    canonical=canonical,
+                    target_charge=target_charge,
+                    rule=rule,
+                    family="perfluoroalkyl",
+                )
+
+    if ion_role:
+        chalcogen_symbols = {8: "O", 16: "S"}
+        for atom in molecule.GetAtoms():
+            if atom.GetAtomicNum() not in chalcogen_symbols:
+                continue
+            bonds = list(atom.GetBonds())
+            family: str | None = None
+            if (
+                atom.GetFormalCharge() == -1
+                and atom.GetDegree() == 1
+                and len(bonds) == 1
+                and bonds[0].GetBondType() == Chem.BondType.SINGLE
+            ):
+                family = "anionic_chalcogen"
+            elif atom.GetFormalCharge() == 0:
+                if (
+                    atom.GetDegree() == 1
+                    and atom.GetTotalNumHs() == 1
+                    and len(bonds) == 1
+                    and bonds[0].GetBondType() == Chem.BondType.SINGLE
+                ):
+                    family = "hydroxyl_thiol"
+                elif (
+                    atom.GetDegree() == 2
+                    and atom.GetTotalNumHs() == 0
+                    and all(
+                        bond.GetBondType() == Chem.BondType.SINGLE
+                        for bond in bonds
+                    )
+                ):
+                    family = "ether_thioether"
+                elif (
+                    atom.GetDegree() == 1
+                    and len(bonds) == 1
+                    and bonds[0].GetBondType() == Chem.BondType.DOUBLE
+                    and bonds[0].GetOtherAtom(atom).GetAtomicNum() == 6
+                ):
+                    family = "carbonyl_thiocarbonyl"
+            if family is None:
+                continue
+            target_atomic_number = 16 if atom.GetAtomicNum() == 8 else 8
+            rule = (
+                f"{family}_{chalcogen_symbols[atom.GetAtomicNum()]}"
+                f"_to_{chalcogen_symbols[target_atomic_number]}"
+            )
+            _record_rule_candidate(
+                candidates,
+                _replace_atom(
+                    molecule,
+                    atom.GetIdx(),
+                    target_atomic_number,
+                ),
+                canonical=canonical,
+                target_charge=target_charge,
+                rule=rule,
+                family=family,
+            )
+
+        atom_rings = molecule.GetRingInfo().AtomRings()
+        for atom in molecule.GetAtoms():
+            memberships = [
+                ring
+                for ring in atom_rings
+                if atom.GetIdx() in ring and len(ring) in {5, 6}
+            ]
+            if (
+                len(memberships) != 1
+                or molecule.GetRingInfo().NumAtomRings(atom.GetIdx()) != 1
+                or not atom.GetIsAromatic()
+            ):
+                continue
+            if (
+                atom.GetAtomicNum() == 6
+                and atom.GetFormalCharge() == 0
+                and atom.GetDegree() == 2
+                and atom.GetTotalNumHs() == 1
+            ):
+                target_atomic_number = 7
+                rule = "aromatic_C_to_N"
+                no_implicit = True
+            elif (
+                atom.GetAtomicNum() == 7
+                and atom.GetFormalCharge() == 0
+                and atom.GetDegree() == 2
+                and atom.GetTotalNumHs() == 0
+            ):
+                target_atomic_number = 6
+                rule = "aromatic_N_to_C"
+                no_implicit = False
+            else:
+                continue
+            _record_rule_candidate(
+                candidates,
+                _replace_atom(
+                    molecule,
+                    atom.GetIdx(),
+                    target_atomic_number,
+                    no_implicit=no_implicit,
+                ),
+                canonical=canonical,
+                target_charge=target_charge,
+                rule=rule,
+                family="aromatic_CH_N",
+            )
 
     return [
         candidates[key]
@@ -1049,6 +1549,80 @@ def _interleave(
     return interleaved
 
 
+def _round_robin_rule_candidates(
+    candidates: Sequence[dict[str, object]],
+    seed_identifier: str,
+) -> list[dict[str, object]]:
+    by_family: dict[str, list[dict[str, object]]] = {}
+    for candidate in candidates:
+        family = str(candidate["family"])
+        by_family.setdefault(family, []).append(dict(candidate))
+    for family_candidates in by_family.values():
+        family_candidates.sort(
+            key=lambda candidate: (
+                str(candidate["rule"]),
+                str(candidate["candidate_smiles"]),
+            )
+        )
+    families = sorted(
+        by_family,
+        key=lambda family: stable_id(
+            "stage1_rule_family",
+            seed_identifier,
+            family,
+        ),
+    )
+    ordered: list[dict[str, object]] = []
+    longest = max((len(rows) for rows in by_family.values()), default=0)
+    for index in range(longest):
+        for family in families:
+            rows = by_family[family]
+            if index < len(rows):
+                ordered.append(rows[index])
+    return ordered
+
+
+def _migrate_pubchem_cache(output_root: Path) -> Path:
+    cache_path = output_root / ".cache" / "pubchem.sqlite"
+    legacy_root = output_root / "cache"
+    legacy_path = legacy_root / "pubchem.sqlite"
+    if not cache_path.exists() and legacy_path.exists():
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(legacy_path), str(cache_path))
+        shutil.rmtree(legacy_root)
+    return cache_path
+
+
+def _write_stage1_entity_files(
+    stage1_root: Path,
+    combined: pd.DataFrame,
+) -> None:
+    il_path = stage1_root / "IL.csv"
+    if not il_path.exists():
+        raise TrainingSplitError(
+            "Run extract-pretrain before augment-pretrain; missing "
+            f"{il_path}"
+        )
+    with tempfile.TemporaryDirectory(
+        dir=stage1_root.parent.parent
+    ) as temporary_dir:
+        staged_stage1 = Path(temporary_dir) / "stage1"
+        staged_stage1.mkdir()
+        shutil.copy2(il_path, staged_stage1 / "IL.csv")
+        for role in ROLE_BY_COLUMN.values():
+            role_frame = (
+                combined.loc[combined["role"].eq(role), PRETRAIN_ENTITY_COLUMNS]
+                .sort_values("SMILES", kind="stable")
+                .reset_index(drop=True)
+            )
+            role_frame.to_csv(
+                staged_stage1 / f"{role}.csv",
+                index=False,
+                lineterminator="\n",
+            )
+        replace_directory(staged_stage1, stage1_root)
+
+
 def augment_pretraining_entities(
     output_root: Path,
     *,
@@ -1059,16 +1633,13 @@ def augment_pretraining_entities(
     rate_limit: float = 4.0,
     client: PubChemClient | None = None,
 ) -> pd.DataFrame:
-    """Augment extracted entities using cached PubChem and verified rule candidates."""
+    """Augment entities using PubChem similarity and local chemistry rules."""
     output_root = Path(output_root)
     stage1_root = output_root / "stage1"
-    entity_path = stage1_root / "entities.csv"
-    source_path = stage1_root / "entity_sources.csv"
-    if not entity_path.exists() or not source_path.exists():
-        raise TrainingSplitError("Run extract-pretrain before augment-pretrain")
-
-    existing = pd.read_csv(entity_path)
-    original_mask = existing["is_original"].astype(str).str.lower().isin({"true", "1"})
+    existing = _combined_entity_frame(stage1_root)
+    original_mask = existing["origin_list"].map(
+        lambda value: "dataset" in _split_joined(value)
+    )
     base = existing.loc[original_mask].copy()
     base = base.sort_values(["role", "SMILES"], kind="stable").reset_index(drop=True)
     if len(base) > pretrain_cap:
@@ -1078,35 +1649,16 @@ def augment_pretraining_entities(
         )
     remaining = pretrain_cap - len(base)
     if remaining == 0:
-        write_dataframe(entity_path, base)
-        write_dataframe(
-            stage1_root / "augmentation_provenance.csv",
-            pd.DataFrame(
-                columns=[
-                    "entity_id",
-                    "role",
-                    "SMILES",
-                    "seed_entity_id",
-                    "seed_SMILES",
-                    "method",
-                    "pubchem_cid",
-                    "rule",
-                    "method_rank",
-                    "status",
-                    "reason",
-                ]
-            ),
-        )
+        _write_stage1_entity_files(stage1_root, base)
         return base
 
     owns_client = client is None
     active_client = client or PubChemClient(
-        output_root / "cache" / "pubchem.sqlite",
+        _migrate_pubchem_cache(output_root),
         offline=offline,
         rate_limit=rate_limit,
     )
     incomplete: list[str] = []
-    seed_status: list[dict[str, object]] = []
 
     try:
         with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
@@ -1137,22 +1689,8 @@ def augment_pretraining_entities(
             for seed in base.itertuples(index=False):
                 seed_smiles = canonicalize_smiles(str(seed.SMILES))
                 role = str(seed.role)
+                seed_identifier = entity_id(role, seed_smiles)
                 if fragment_count(seed_smiles) != 1:
-                    seed_status.append(
-                        {
-                            "entity_id": "",
-                            "role": role,
-                            "SMILES": "",
-                            "seed_entity_id": seed.entity_id,
-                            "seed_SMILES": seed_smiles,
-                            "method": "",
-                            "pubchem_cid": "",
-                            "rule": "",
-                            "method_rank": "",
-                            "status": "skipped",
-                            "reason": "multi_fragment_seed",
-                        }
-                    )
                     continue
 
                 similarity_candidates: list[dict[str, object]] = []
@@ -1190,57 +1728,28 @@ def augment_pretraining_entities(
                         }
                     )
 
-                verified_rules: list[dict[str, object]] = []
-                for rank, generated in enumerate(generate_rule_candidates(seed_smiles)):
+                local_rules: list[dict[str, object]] = []
+                for generated in generate_rule_candidates(seed_smiles, role):
                     generated_smiles = generated["SMILES"]
                     if not candidate_allowed(seed_smiles, generated_smiles, role):
                         continue
-                    try:
-                        identity_records = active_client.identity(generated_smiles)
-                    except IncompletePubChemQuery as exc:
-                        incomplete.append(str(exc))
-                        continue
-                    matched_record: Mapping[str, object] | None = None
-                    for record in identity_records:
-                        raw_identity = smiles_from_pubchem_record(record)
-                        if raw_identity is None:
-                            continue
-                        try:
-                            identity_smiles = canonicalize_smiles(raw_identity)
-                        except TrainingSplitError:
-                            continue
-                        if identity_smiles == generated_smiles:
-                            matched_record = record
-                            break
-                    if matched_record is None:
-                        continue
-                    verified_rules.append(
+                    local_rules.append(
                         {
                             "candidate_smiles": generated_smiles,
                             "method": "rule",
-                            "pubchem_cid": str(matched_record.get("CID", "")),
+                            "pubchem_cid": "",
                             "rule": generated["rule"],
-                            "method_rank": rank,
+                            "family": generated["family"],
                         }
                     )
 
-                ordered = _interleave(verified_rules, similarity_candidates)
-                if not ordered and not incomplete:
-                    seed_status.append(
-                        {
-                            "entity_id": "",
-                            "role": role,
-                            "SMILES": "",
-                            "seed_entity_id": seed.entity_id,
-                            "seed_SMILES": seed_smiles,
-                            "method": "",
-                            "pubchem_cid": "",
-                            "rule": "",
-                            "method_rank": "",
-                            "status": "no_valid_candidate",
-                            "reason": "",
-                        }
-                    )
+                ordered_rules = _round_robin_rule_candidates(
+                    local_rules,
+                    seed_identifier,
+                )
+                for rank, candidate in enumerate(ordered_rules):
+                    candidate["method_rank"] = rank
+                ordered = _interleave(ordered_rules, similarity_candidates)
                 for seed_rank, candidate in enumerate(ordered):
                     candidate_database.execute(
                         """
@@ -1257,7 +1766,7 @@ def augment_pretraining_entities(
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            seed.entity_id,
+                            seed_identifier,
                             role,
                             seed_smiles,
                             candidate["candidate_smiles"],
@@ -1295,11 +1804,14 @@ def augment_pretraining_entities(
                 if key in base_keys or key in selected:
                     continue
                 selected[key] = {
-                    "entity_id": entity_id(role, candidate_smiles),
                     "role": role,
                     "SMILES": candidate_smiles,
                     "formal_charge": formal_charge(candidate_smiles),
-                    "is_original": False,
+                    "origin_list": set(),
+                    "seed_smiles_list": set(),
+                    "rule_list": set(),
+                    "pubchem_cid_list": set(),
+                    "mol_id_list": set(),
                 }
                 if len(selected) >= remaining:
                     break
@@ -1317,7 +1829,6 @@ def augment_pretraining_entities(
                 "INSERT INTO selected(role, candidate_smiles) VALUES (?, ?)",
                 selected,
             )
-            provenance_rows = list(seed_status)
             for row in candidate_database.execute(
                 """
                 SELECT
@@ -1349,92 +1860,70 @@ def augment_pretraining_entities(
                     method,
                     pubchem_cid,
                     rule,
-                    method_rank,
+                    _method_rank,
                 ) = row
-                provenance_rows.append(
-                    {
-                        "entity_id": entity_id(role, candidate_smiles),
-                        "role": role,
-                        "SMILES": candidate_smiles,
-                        "seed_entity_id": seed_entity_identifier,
-                        "seed_SMILES": seed_smiles,
-                        "method": method,
-                        "pubchem_cid": pubchem_cid,
-                        "rule": rule,
-                        "method_rank": method_rank,
-                        "status": "selected",
-                        "reason": "",
-                    }
-                )
+                record = selected[(role, candidate_smiles)]
+                origins = record["origin_list"]
+                seeds = record["seed_smiles_list"]
+                pubchem_cids = record["pubchem_cid_list"]
+                rules = record["rule_list"]
+                if isinstance(origins, set):
+                    if method == "rule":
+                        origins.add("rule")
+                    elif method == "pubchem_similarity":
+                        origins.add("pubchem")
+                if isinstance(seeds, set):
+                    seeds.add(seed_smiles)
+                if (
+                    isinstance(pubchem_cids, set)
+                    and str(pubchem_cid).strip()
+                ):
+                    pubchem_cids.add(str(pubchem_cid).strip())
+                if isinstance(rules, set) and str(rule).strip():
+                    rules.add(str(rule).strip())
             candidate_database.close()
 
-            all_rows = [
-                {
-                    "entity_id": str(row.entity_id),
-                    "role": str(row.role),
-                    "SMILES": canonicalize_smiles(str(row.SMILES)),
-                    "formal_charge": int(row.formal_charge),
-                    "is_original": True,
-                }
-                for row in base.itertuples(index=False)
-            ]
+            all_rows: list[dict[str, object]] = []
+            for row in base.to_dict(orient="records"):
+                all_rows.append(
+                    {
+                        "role": str(row["role"]),
+                        "SMILES": canonicalize_smiles(str(row["SMILES"])),
+                        "formal_charge": int(row["formal_charge"]),
+                        "origin_list": _split_joined(row["origin_list"]),
+                        "seed_smiles_list": _split_joined(
+                            row["seed_smiles_list"]
+                        ),
+                        "rule_list": _split_joined(row["rule_list"]),
+                        "pubchem_cid_list": _split_joined(
+                            row["pubchem_cid_list"]
+                        ),
+                        "mol_id_list": _split_joined(row["mol_id_list"]),
+                    }
+                )
             all_rows.extend(selected.values())
             augmented = pd.DataFrame(
-                sorted(all_rows, key=lambda row: (str(row["role"]), str(row["SMILES"]))),
-                columns=["entity_id", "role", "SMILES", "formal_charge", "is_original"],
-            )
-            provenance = pd.DataFrame(
-                provenance_rows,
-                columns=[
-                    "entity_id",
-                    "role",
-                    "SMILES",
-                    "seed_entity_id",
-                    "seed_SMILES",
-                    "method",
-                    "pubchem_cid",
-                    "rule",
-                    "method_rank",
-                    "status",
-                    "reason",
+                [
+                    {
+                        "role": row["role"],
+                        **_entity_output_frame([row]).iloc[0].to_dict(),
+                    }
+                    for row in sorted(
+                        all_rows,
+                        key=lambda item: (
+                            str(item["role"]),
+                            str(item["SMILES"]),
+                        ),
+                    )
                 ],
+                columns=["role", *PRETRAIN_ENTITY_COLUMNS],
             )
-            provenance = provenance.sort_values(
-                ["status", "role", "SMILES", "seed_entity_id", "method", "rule"],
-                kind="stable",
-            ).reset_index(drop=True)
-
-            staged_stage1 = temporary_root / "stage1"
-            staged_stage1.mkdir()
-            augmented.to_csv(
-                staged_stage1 / "entities.csv",
-                index=False,
-                lineterminator="\n",
-            )
-            shutil.copy2(source_path, staged_stage1 / "entity_sources.csv")
-            provenance.to_csv(
-                staged_stage1 / "augmentation_provenance.csv",
-                index=False,
-                lineterminator="\n",
-            )
-            replace_directory(staged_stage1, stage1_root)
+            _write_stage1_entity_files(stage1_root, augmented)
     finally:
         if owns_client:
             active_client.close()
 
-    update_manifest(
-        output_root,
-        "stage1_augmentation",
-        {
-            "pretrain_cap": pretrain_cap,
-            "similarity_threshold": threshold,
-            "pubchem_max_records": max_records,
-            "pubchem_rate_limit": rate_limit,
-            "base_entities": len(base),
-            "augmented_entities": len(augmented) - len(base),
-            "total_entities": len(augmented),
-        },
-    )
+    (output_root / "manifest.json").unlink(missing_ok=True)
     return augmented
 
 
@@ -1791,6 +2280,275 @@ def _profile_task(
     )
 
 
+def _system_table(frame: pd.DataFrame) -> pd.DataFrame:
+    return (
+        frame.groupby(
+            ["_system_id", "_system_key"],
+            sort=False,
+            dropna=False,
+        )
+        .size()
+        .rename("row_count")
+        .reset_index()
+    )
+
+
+def plan_joint_test_registry(
+    stage3_tasks: Sequence[TaskSpec],
+    profiles: Mapping[str, TaskProfile],
+    systems_by_task: Mapping[str, pd.DataFrame],
+    *,
+    seed: int,
+) -> dict[tuple[str, str], dict[str, object]]:
+    """Select shared large-task test systems while avoiding smaller tasks."""
+    candidates: dict[tuple[str, str], dict[str, object]] = {}
+    targets = {
+        task.task_id: max(
+            1,
+            int(round(profiles[task.task_id].system_count * 0.1)),
+        )
+        for task in stage3_tasks
+        if profiles[task.task_id].tier == "large"
+    }
+    task_by_id = {task.task_id: task for task in stage3_tasks}
+
+    for task in stage3_tasks:
+        tier = profiles[task.task_id].tier
+        for system_id_value, system_key, row_count in systems_by_task[
+            task.task_id
+        ].itertuples(index=False, name=None):
+            key = (task.system_type, str(system_id_value))
+            entry = candidates.setdefault(
+                key,
+                {
+                    "system_type": task.system_type,
+                    "system_id": str(system_id_value),
+                    "system_key": str(system_key),
+                    "large_tasks": set(),
+                    "other_tasks": set(),
+                    "other_rows": 0,
+                },
+            )
+            if tier == "large":
+                large_tasks = entry["large_tasks"]
+                if isinstance(large_tasks, set):
+                    large_tasks.add(task.task_id)
+            else:
+                other_tasks = entry["other_tasks"]
+                if isinstance(other_tasks, set):
+                    other_tasks.add(task.task_id)
+                entry["other_rows"] = int(entry["other_rows"]) + int(row_count)
+
+    candidates = {
+        key: entry
+        for key, entry in candidates.items()
+        if entry["large_tasks"]
+    }
+    selected: dict[tuple[str, str], dict[str, object]] = {}
+    selected_counts = {task_id: 0 for task_id in targets}
+
+    for entry in candidates.values():
+        entry["selection_hash"] = stable_id(
+            f"seed:{seed}:stage3_joint_test",
+            entry["system_type"],
+            entry["system_key"],
+        )
+
+    def choose(
+        key: tuple[str, str],
+        entry: dict[str, object],
+    ) -> None:
+        selected[key] = {
+            "system_type": entry["system_type"],
+            "system_id": entry["system_id"],
+            "system_key": entry["system_key"],
+            "source_tasks": set(entry["large_tasks"]),
+            "reserved_tasks": set(entry["other_tasks"]),
+        }
+        large_tasks = entry["large_tasks"]
+        if isinstance(large_tasks, set):
+            for task_id in large_tasks:
+                selected_counts[task_id] += 1
+
+    def fill_without_overshoot(*, unsafe: bool) -> None:
+        pool = [
+            (key, entry)
+            for key, entry in candidates.items()
+            if bool(entry["other_tasks"]) == unsafe
+        ]
+        pool.sort(
+            key=lambda item: (
+                len(item[1]["other_tasks"]) if unsafe else 0,
+                int(item[1]["other_rows"]) if unsafe else 0,
+                -len(item[1]["large_tasks"]),
+                str(item[1]["selection_hash"]),
+            )
+        )
+        for key, entry in pool:
+            if key in selected:
+                continue
+            large_tasks = entry["large_tasks"]
+            if not isinstance(large_tasks, set):
+                continue
+            underfilled = {
+                task_id
+                for task_id in large_tasks
+                if selected_counts[task_id] < targets[task_id]
+            }
+            if underfilled and underfilled == large_tasks:
+                choose(key, entry)
+
+    def fill_with_minimum_overshoot(*, unsafe: bool) -> None:
+        while any(
+            selected_counts[task_id] < target
+            for task_id, target in targets.items()
+        ):
+            eligible: list[
+                tuple[
+                    tuple[object, ...],
+                    tuple[str, str],
+                    dict[str, object],
+                ]
+            ] = []
+            for key, entry in candidates.items():
+                if key in selected or bool(entry["other_tasks"]) != unsafe:
+                    continue
+                large_tasks = entry["large_tasks"]
+                if not isinstance(large_tasks, set):
+                    continue
+                underfilled = {
+                    task_id
+                    for task_id in large_tasks
+                    if selected_counts[task_id] < targets[task_id]
+                }
+                if not underfilled:
+                    continue
+                overshoot = sum(
+                    max(
+                        0,
+                        selected_counts[task_id] + 1 - targets[task_id],
+                    )
+                    for task_id in large_tasks
+                )
+                eligible.append(
+                    (
+                        (
+                            overshoot,
+                            len(entry["other_tasks"]),
+                            int(entry["other_rows"]),
+                            -len(underfilled),
+                            -len(large_tasks),
+                            str(entry["selection_hash"]),
+                        ),
+                        key,
+                        entry,
+                    )
+                )
+            if not eligible:
+                return
+            _, key, entry = min(eligible, key=lambda item: item[0])
+            choose(key, entry)
+
+    fill_without_overshoot(unsafe=False)
+    fill_with_minimum_overshoot(unsafe=False)
+    if any(
+        selected_counts[task_id] < target
+        for task_id, target in targets.items()
+    ):
+        fill_without_overshoot(unsafe=True)
+        fill_with_minimum_overshoot(unsafe=True)
+    if any(
+        selected_counts[task_id] < target
+        for task_id, target in targets.items()
+    ):
+        missing = {
+            task_id: targets[task_id] - selected_counts[task_id]
+            for task_id in targets
+            if selected_counts[task_id] < targets[task_id]
+        }
+        raise TrainingSplitError(
+            f"Unable to fill Stage-3 fixed-test targets: {missing}"
+        )
+
+    for task_id, count in sorted(selected_counts.items()):
+        target = targets[task_id]
+        if count > target:
+            print(
+                f"Warning: {task_id} fixed test contains {count} systems; "
+                f"target was {target} (+{count - target})"
+            )
+
+    for task_id, target in targets.items():
+        task = task_by_id[task_id]
+        actual = sum(
+            task_id in entry["source_tasks"]
+            for (system_type, _), entry in selected.items()
+            if system_type == task.system_type
+        )
+        if actual < target:
+            raise TrainingSplitError(
+                f"Fixed test target not met for {task_id}: {actual} < {target}"
+            )
+    return selected
+
+
+def _materialized_task_frame(
+    frame: pd.DataFrame,
+    task: TaskSpec,
+) -> pd.DataFrame:
+    visible_columns = [
+        column for column in frame.columns if not column.startswith("_")
+    ]
+    result = frame.loc[:, visible_columns].copy()
+    if task.source_file == "simulation/charge.csv":
+        result = result.drop(columns=["mol_id"])
+        result["mol_id_list"] = frame["_mol_ids"].astype(str).to_numpy()
+    elif "mol_id" in result.columns:
+        mol_ids = result.pop("mol_id")
+        result["mol_id"] = mol_ids
+    return result.reset_index(drop=True)
+
+
+def _reserved_summary(
+    frame: pd.DataFrame,
+    task: TaskSpec,
+    mask: pd.Series,
+) -> pd.DataFrame:
+    columns = list(SYSTEM_COLUMNS[task.system_type])
+    if not mask.any():
+        return pd.DataFrame(
+            columns=[*columns, "row_count", "reason"]
+        )
+    summary = (
+        frame.loc[mask]
+        .groupby(columns, sort=True, dropna=False)
+        .size()
+        .rename("row_count")
+        .reset_index()
+    )
+    summary["reason"] = "reserved_due_to_cross_task_test"
+    return summary.loc[:, [*columns, "row_count", "reason"]]
+
+
+def _loo_manifest(
+    development: pd.DataFrame,
+    task: TaskSpec,
+) -> pd.DataFrame:
+    columns = list(SYSTEM_COLUMNS[task.system_type])
+    summary = (
+        development.groupby(columns, sort=True, dropna=False)
+        .size()
+        .rename("row_count")
+        .reset_index()
+    )
+    summary.insert(
+        0,
+        "loo_fold",
+        np.arange(1, len(summary) + 1, dtype=np.int64),
+    )
+    return summary.loc[:, ["loo_fold", *columns, "row_count"]]
+
+
 def _stage3_partitions(
     frame: pd.DataFrame,
     task: TaskSpec,
@@ -1880,7 +2638,7 @@ def _overlap_audit_rows(
     return rows
 
 
-def build_training_splits(
+def _build_training_split_indexes_legacy(
     final_root: Path,
     output_root: Path,
     *,
@@ -2630,6 +3388,413 @@ def build_training_splits(
     return task_catalog
 
 
+def build_training_splits(
+    final_root: Path,
+    output_root: Path,
+    *,
+    seed: int = 42,
+    pretrain_cap: int = 500_000,
+) -> pd.DataFrame:
+    """Build readable Stage-2 and Stage-3 task datasets."""
+    _ = pretrain_cap  # Kept for CLI compatibility.
+    final_root = Path(final_root)
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    _migrate_pubchem_cache(output_root)
+
+    tasks = discover_tasks(final_root)
+    paths = final_csv_paths(final_root)
+    checksums = {
+        path.relative_to(final_root).as_posix(): file_sha256(path)
+        for path in paths
+    }
+    stage2_tasks = [task for task in tasks if task.stage == 2]
+    stage3_tasks = [task for task in tasks if task.stage == 3]
+
+    stage3_profiles: dict[str, TaskProfile] = {}
+    systems_by_task: dict[str, pd.DataFrame] = {}
+    for task in stage3_tasks:
+        frame, raw_rows = prepare_task_frame(
+            final_root,
+            task,
+            checksums[task.source_file],
+        )
+        stage3_profiles[task.task_id] = _profile_task(frame, raw_rows)
+        systems_by_task[task.task_id] = _system_table(frame)
+
+    test_registry = plan_joint_test_registry(
+        stage3_tasks,
+        stage3_profiles,
+        systems_by_task,
+        seed=seed,
+    )
+    repeats_by_task = {
+        task.task_id: (
+            1 if stage3_profiles[task.task_id].tier == "large" else 5
+        )
+        for task in stage3_tasks
+    }
+
+    groups_by_strategy: dict[str, dict[str, set[str]]] = {}
+    single_random_groups: dict[str, dict[str, set[str]]] = {}
+    for task in stage3_tasks:
+        frame, raw_rows = prepare_task_frame(
+            final_root,
+            task,
+            checksums[task.source_file],
+        )
+        profile = stage3_profiles[task.task_id]
+        if raw_rows != profile.raw_rows or len(frame) != profile.rows:
+            raise TrainingSplitError(
+                f"Input changed while planning folds for {task.task_id}"
+            )
+        partitions = _stage3_partitions(
+            frame,
+            task,
+            profile,
+            test_registry,
+        )
+        development = frame.loc[partitions.eq("development")]
+        if task.system_type in SINGLE_SYSTEM_TYPES:
+            single_random_groups.setdefault(task.system_type, {})[
+                task.task_id
+            ] = set(development["_system_id"].astype(str))
+        for strategy, columns in GROUP_STRATEGY_COLUMNS[
+            task.system_type
+        ].items():
+            groups_by_strategy.setdefault(strategy, {})[
+                task.task_id
+            ] = set(
+                _group_series(
+                    development,
+                    strategy,
+                    columns,
+                ).astype(str)
+            )
+
+    stage3_group_assignments: dict[tuple[str, str, int], int] = {}
+    for strategy, task_groups in groups_by_strategy.items():
+        planned = plan_shared_group_folds(
+            task_groups,
+            repeats_by_task,
+            seed=seed,
+            namespace=f"stage3_group:{strategy}",
+        )
+        stage3_group_assignments.update(
+            {
+                (strategy, group_identifier, repeat): fold
+                for (group_identifier, repeat), fold in planned.items()
+            }
+        )
+
+    single_random_assignments: dict[tuple[str, str, int], int] = {}
+    for system_type, task_groups in single_random_groups.items():
+        planned = plan_shared_group_folds(
+            task_groups,
+            repeats_by_task,
+            seed=seed,
+            namespace=f"stage3_random_single:{system_type}",
+        )
+        single_random_assignments.update(
+            {
+                (system_type, group_identifier, repeat): fold
+                for (group_identifier, repeat), fold in planned.items()
+            }
+        )
+
+    task_catalog_rows: list[dict[str, object]] = []
+    stage2_groups: dict[tuple[str, str], str] = {}
+    with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
+        staged_root = Path(temporary_dir) / "training_splits"
+        stage2_root = staged_root / "stage2"
+        stage3_root = staged_root / "stage3"
+        stage2_root.mkdir(parents=True)
+        stage3_root.mkdir()
+
+        for task in stage2_tasks:
+            frame, raw_rows = prepare_task_frame(
+                final_root,
+                task,
+                checksums[task.source_file],
+            )
+            profile = _profile_task(frame, raw_rows)
+            partitions = frame["_system_id"].map(
+                lambda system_id_value: (
+                    "validation"
+                    if stable_fraction(
+                        seed,
+                        "stage2_validation",
+                        task.system_type,
+                        system_id_value,
+                    )
+                    < 0.1
+                    else "train"
+                )
+            )
+            if not {"train", "validation"}.issubset(set(partitions)):
+                raise TrainingSplitError(
+                    f"Stage-2 split is empty for {task.task_id}: "
+                    f"{sorted(set(partitions))}"
+                )
+            assignments = pd.DataFrame(
+                {
+                    "system_id": frame["_system_id"],
+                    "partition": partitions,
+                }
+            ).drop_duplicates()
+            for system_id_value, partition in assignments.itertuples(
+                index=False,
+                name=None,
+            ):
+                key = (task.system_type, str(system_id_value))
+                value = str(partition)
+                previous = stage2_groups.setdefault(key, value)
+                if previous != value:
+                    raise TrainingSplitError(
+                        f"Inconsistent shared Stage-2 assignment for {key}"
+                    )
+
+            task_root = stage2_root / Path(task.source_file).stem
+            materialized = _materialized_task_frame(frame, task)
+            write_dataframe(
+                task_root / "train.csv",
+                materialized.loc[
+                    partitions.eq("train").to_numpy()
+                ].reset_index(drop=True),
+            )
+            write_dataframe(
+                task_root / "valid.csv",
+                materialized.loc[
+                    partitions.eq("validation").to_numpy()
+                ].reset_index(drop=True),
+            )
+            task_catalog_rows.append(
+                {
+                    "stage": 2,
+                    "task_id": task.task_id,
+                    "source_file": task.source_file,
+                    "target_columns": ";".join(task.target_columns),
+                    "identity_columns": ";".join(task.identity_columns),
+                    "system_type": task.system_type,
+                    "raw_rows": profile.raw_rows,
+                    "rows": profile.rows,
+                    "unique_systems": profile.system_count,
+                    "tier": "physics_guided",
+                    "test_systems": 0,
+                    "reserved_systems": 0,
+                    "development_systems": profile.system_count,
+                    "strategies": "system_holdout",
+                    "repeats": 1,
+                    "strategy_units": json.dumps(
+                        {"system_holdout": "system_id"},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                }
+            )
+
+        for task in stage3_tasks:
+            frame, raw_rows = prepare_task_frame(
+                final_root,
+                task,
+                checksums[task.source_file],
+            )
+            profile = stage3_profiles[task.task_id]
+            if raw_rows != profile.raw_rows or len(frame) != profile.rows:
+                raise TrainingSplitError(
+                    f"Input changed while building task {task.task_id}"
+                )
+            partitions = _stage3_partitions(
+                frame,
+                task,
+                profile,
+                test_registry,
+            )
+            development_mask = partitions.eq("development")
+            if not development_mask.any():
+                raise TrainingSplitError(
+                    f"No development rows remain for {task.task_id}"
+                )
+            development = frame.loc[development_mask]
+            if len(development) < 5:
+                raise TrainingSplitError(
+                    f"Fewer than five development rows for {task.task_id}"
+                )
+            task_root = stage3_root / task.task_id
+            task_root.mkdir(parents=True)
+
+            test_mask = partitions.eq("test")
+            if profile.tier == "large":
+                write_dataframe(
+                    task_root / "test.csv",
+                    _materialized_task_frame(frame.loc[test_mask], task),
+                )
+            reserved_mask = partitions.eq(
+                "reserved_due_to_cross_task_test"
+            )
+            write_dataframe(
+                task_root / "reserved_summary.csv",
+                _reserved_summary(frame, task, reserved_mask),
+            )
+            if profile.tier == "small":
+                write_dataframe(
+                    task_root / "loo_manifest.csv",
+                    _loo_manifest(development, task),
+                )
+
+            repeats = 1 if profile.tier == "large" else 5
+            strategies = ["random", *GROUP_STRATEGY_COLUMNS[task.system_type]]
+            random_unit = (
+                development["_system_id"]
+                if task.system_type in SINGLE_SYSTEM_TYPES
+                else development["_row_id"]
+            )
+            for repeat_index in range(repeats):
+                if task.system_type in SINGLE_SYSTEM_TYPES:
+                    folds = random_unit.map(
+                        lambda unit_id: single_random_assignments[
+                            (
+                                task.system_type,
+                                str(unit_id),
+                                repeat_index,
+                            )
+                        ]
+                    )
+                else:
+                    random_fold_map = balanced_unit_folds(
+                        random_unit.astype(str),
+                        seed=seed,
+                        namespace=f"stage3_random:{task.task_id}",
+                        repeat=repeat_index,
+                    )
+                    folds = random_unit.map(
+                        lambda unit_id: random_fold_map[str(unit_id)]
+                    )
+                if set(folds) != set(range(5)):
+                    raise TrainingSplitError(
+                        f"Random five-fold split has empty folds for "
+                        f"{task.task_id}, repeat {repeat_index}"
+                    )
+                strategy_root = (
+                    task_root / STRATEGY_DIRECTORY_NAMES["random"]
+                )
+                if repeats > 1:
+                    strategy_root = strategy_root / f"cv{repeat_index + 1}"
+                for fold_index in range(5):
+                    write_dataframe(
+                        strategy_root / f"fold{fold_index + 1}.csv",
+                        _materialized_task_frame(
+                            development.loc[folds.eq(fold_index)],
+                            task,
+                        ),
+                    )
+
+            for strategy, columns in GROUP_STRATEGY_COLUMNS[
+                task.system_type
+            ].items():
+                group_values = _group_series(
+                    development,
+                    strategy,
+                    columns,
+                )
+                if group_values.nunique() < 5:
+                    raise TrainingSplitError(
+                        f"Fewer than five {strategy} groups for {task.task_id}"
+                    )
+                for repeat_index in range(repeats):
+                    folds = group_values.map(
+                        lambda unit_id: stage3_group_assignments[
+                            (
+                                strategy,
+                                str(unit_id),
+                                repeat_index,
+                            )
+                        ]
+                    )
+                    if set(folds) != set(range(5)):
+                        raise TrainingSplitError(
+                            f"{strategy} five-fold split has empty folds for "
+                            f"{task.task_id}, repeat {repeat_index}"
+                        )
+                    strategy_root = (
+                        task_root / STRATEGY_DIRECTORY_NAMES[strategy]
+                    )
+                    if repeats > 1:
+                        strategy_root = (
+                            strategy_root / f"cv{repeat_index + 1}"
+                        )
+                    for fold_index in range(5):
+                        write_dataframe(
+                            strategy_root / f"fold{fold_index + 1}.csv",
+                            _materialized_task_frame(
+                                development.loc[folds.eq(fold_index)],
+                                task,
+                            ),
+                        )
+
+            test_systems = int(
+                frame.loc[test_mask, "_system_id"].nunique()
+            )
+            reserved_systems = int(
+                frame.loc[reserved_mask, "_system_id"].nunique()
+            )
+            development_systems = int(
+                development["_system_id"].nunique()
+            )
+            if profile.tier == "large":
+                target = max(1, int(round(profile.system_count * 0.1)))
+                if test_systems < target:
+                    raise TrainingSplitError(
+                        f"Test target not met for {task.task_id}: "
+                        f"{test_systems} < {target}"
+                    )
+                test_development_overlap = set(
+                    frame.loc[test_mask, "_system_id"]
+                ) & set(development["_system_id"])
+                if test_development_overlap:
+                    raise TrainingSplitError(
+                        f"Test/development overlap in {task.task_id}"
+                    )
+            task_catalog_rows.append(
+                {
+                    "stage": 3,
+                    "task_id": task.task_id,
+                    "source_file": task.source_file,
+                    "target_columns": ";".join(task.target_columns),
+                    "identity_columns": ";".join(task.identity_columns),
+                    "system_type": task.system_type,
+                    "raw_rows": profile.raw_rows,
+                    "rows": profile.rows,
+                    "unique_systems": profile.system_count,
+                    "tier": profile.tier,
+                    "test_systems": test_systems,
+                    "reserved_systems": reserved_systems,
+                    "development_systems": development_systems,
+                    "strategies": ";".join(strategies),
+                    "repeats": repeats,
+                    "strategy_units": json.dumps(
+                        _task_strategy_units(task),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                }
+            )
+
+        replace_directory(stage2_root, output_root / "stage2")
+        replace_directory(stage3_root, output_root / "stage3")
+
+    (output_root / "task_catalog.csv").unlink(missing_ok=True)
+    (output_root / "manifest.json").unlink(missing_ok=True)
+    legacy_audit = output_root / "audit"
+    if legacy_audit.exists():
+        shutil.rmtree(legacy_audit)
+
+    return pd.DataFrame(task_catalog_rows).sort_values(
+        ["stage", "task_id"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -2701,7 +3866,7 @@ def main() -> None:
         stage2_count = int(catalog["stage"].eq(2).sum())
         stage3_count = int(catalog["stage"].eq(3).sum())
         print(
-            f"Built split manifests for {stage2_count} stage-2 tasks and "
+            f"Built readable datasets for {stage2_count} stage-2 tasks and "
             f"{stage3_count} stage-3 tasks"
         )
 
