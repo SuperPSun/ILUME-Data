@@ -22,10 +22,9 @@ from scripts.build_training_splits import (
     formal_charge,
     generate_rule_candidates,
     plan_joint_test_registry,
-    plan_shared_group_folds,
-    plan_shared_weighted_group_folds,
     prepare_task_frame,
     role_fragments,
+    task_group_kfold_assignments,
     tier_for_system_count,
     validate_final_identity_consistency,
 )
@@ -715,63 +714,90 @@ def test_tier_boundaries(systems: int, expected: str):
     assert tier_for_system_count(systems) == expected
 
 
-def test_weighted_shared_folds_improve_skewed_row_balance():
-    weights = {
-        "task_a": {
-            f"group_{index}": weight
-            for index, weight in enumerate(
-                [50, 40, 30, 20, 10, 1, 1, 1, 1, 1]
-            )
-        },
-        "task_b": {
-            f"group_{index}": weight
-            for index, weight in enumerate(
-                [1, 1, 1, 1, 1, 10, 20, 30, 40, 50]
-            )
-        },
+def _group_partition_signature(
+    groups: pd.Series,
+    folds: pd.Series,
+) -> frozenset[frozenset[str]]:
+    return frozenset(
+        frozenset(groups.loc[folds.eq(fold)].astype(str))
+        for fold in range(5)
+    )
+
+
+def test_task_group_kfold_is_disjoint_distinct_and_deterministic():
+    groups = pd.Series(
+        [
+            group
+            for index in range(24)
+            for group in [f"group_{index}"] * (index % 5 + 1)
+        ]
+    )
+    first = task_group_kfold_assignments(
+        groups,
+        task_id="experiment/task_a",
+        strategy="cation",
+        repeats=5,
+        seed=42,
+    )
+    repeated = task_group_kfold_assignments(
+        groups,
+        task_id="experiment/task_a",
+        strategy="cation",
+        repeats=5,
+        seed=42,
+    )
+
+    assert len(first) == 5
+    assert [folds.tolist() for folds in first] == [
+        folds.tolist() for folds in repeated
+    ]
+    signatures = {
+        _group_partition_signature(groups, folds)
+        for folds in first
     }
-    repeats = {"task_a": 1, "task_b": 1}
-    baseline = plan_shared_group_folds(
-        {
-            task_id: set(task_weights)
-            for task_id, task_weights in weights.items()
-        },
-        repeats,
-        seed=42,
-        namespace="test_weighted",
-    )
-    weighted = plan_shared_weighted_group_folds(
-        weights,
-        repeats,
-        seed=42,
-        namespace="test_weighted",
-    )
-    repeated = plan_shared_weighted_group_folds(
-        weights,
-        repeats,
-        seed=42,
-        namespace="test_weighted",
-    )
+    assert len(signatures) == 5
+    for folds in first:
+        assert set(folds) == set(range(5))
+        assignments = pd.DataFrame(
+            {"group": groups, "fold": folds}
+        ).drop_duplicates()
+        assert assignments.groupby("group")["fold"].nunique().eq(1).all()
 
-    def squared_deviation(
-        assignments: dict[tuple[str, int], int],
-    ) -> float:
-        total = 0.0
-        for task_weights in weights.values():
-            loads = [0, 0, 0, 0, 0]
-            for group_identifier, row_count in task_weights.items():
-                loads[assignments[(group_identifier, 0)]] += row_count
-            assert min(loads) > 0
-            mean = sum(loads) / 5.0
-            total += sum((load - mean) ** 2 for load in loads)
-        return total
-
-    assert weighted == repeated
-    assert squared_deviation(weighted) < squared_deviation(baseline)
+    other_task = task_group_kfold_assignments(
+        groups,
+        task_id="experiment/task_b",
+        strategy="cation",
+        repeats=5,
+        seed=42,
+    )
     assert {
-        weighted[(group_identifier, 0)]
-        for group_identifier in weights["task_a"]
-    } == set(range(5))
+        _group_partition_signature(groups, folds)
+        for folds in other_task
+    } != signatures
+
+
+def test_task_group_kfold_rejects_too_few_or_indistinguishable_groups():
+    with pytest.raises(TrainingSplitError, match="Fewer than five"):
+        task_group_kfold_assignments(
+            pd.Series(["a", "b", "c", "d"]),
+            task_id="experiment/task",
+            strategy="anion",
+            repeats=1,
+            seed=42,
+        )
+
+    with pytest.raises(
+        TrainingSplitError,
+        match="Unable to build 2 distinct",
+    ):
+        task_group_kfold_assignments(
+            pd.Series(["a", "b", "c", "d", "e"]),
+            task_id="experiment/task",
+            strategy="anion",
+            repeats=2,
+            seed=42,
+            max_candidates=8,
+        )
 
 
 def test_charge_rows_are_deduplicated_and_conflicts_fail(tmp_path: Path):
@@ -1056,6 +1082,19 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     }
     assert density_test_systems.isdisjoint(density_development_systems)
 
+    def il_fold_assignment(task_root: Path) -> dict[tuple[str, str], int]:
+        return {
+            pair: fold
+            for fold in range(1, 6)
+            for pair in pd.read_csv(
+                task_root / "IL" / f"fold{fold}.csv"
+            )[["cation", "anion"]].itertuples(index=False, name=None)
+        }
+
+    assert il_fold_assignment(density_root) != il_fold_assignment(
+        conductivity_root
+    )
+
     small_root = (
         output_root
         / "stage3"
@@ -1076,6 +1115,31 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
             for fold in range(1, 6)
         ]
         assert sum(map(len, folds)) == 49
+    for strategy in ("IL", "cation", "anion"):
+        signatures = set()
+        for repeat in range(1, 6):
+            fold_groups = []
+            for fold in range(1, 6):
+                frame = pd.read_csv(
+                    small_root
+                    / strategy
+                    / f"cv{repeat}"
+                    / f"fold{fold}.csv"
+                )
+                columns = {
+                    "IL": ["cation", "anion"],
+                    "cation": ["cation"],
+                    "anion": ["anion"],
+                }[strategy]
+                fold_groups.append(
+                    frozenset(
+                        frame[columns]
+                        .astype(str)
+                        .agg("\x1f".join, axis=1)
+                    )
+                )
+            signatures.add(frozenset(fold_groups))
+        assert len(signatures) == 5
 
     medium_root = output_root / "stage3" / "experiment" / "solvation"
     assert (
