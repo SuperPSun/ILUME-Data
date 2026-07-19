@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from rdkit import Chem
 
 from scripts.build_training_splits import (
     PRETRAIN_ENTITY_COLUMNS,
@@ -17,11 +18,16 @@ from scripts.build_training_splits import (
     candidate_allowed,
     canonicalize_smiles,
     extract_pretraining_entities,
+    fixed_h_identity_key,
+    formal_charge,
     generate_rule_candidates,
     plan_joint_test_registry,
+    plan_shared_group_folds,
+    plan_shared_weighted_group_folds,
     prepare_task_frame,
     role_fragments,
     tier_for_system_count,
+    validate_final_identity_consistency,
 )
 
 
@@ -46,15 +52,20 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def ion_pair(index: int) -> tuple[str, str]:
-    return f"[{index}Na+]", f"[{index}Cl-]"
+    cation_chain = (index - 1) % 23 + 1
+    anion_chain = ((index - 1) * 7) % 25 + 1
+    return (
+        f"{'C' * cation_chain}[N+](C)(C)C",
+        f"{'C' * anion_chain}(=O)[O-]",
+    )
 
 
 def neutral_carbon(index: int) -> str:
-    return f"[{index}CH4]"
+    return "C" * index
 
 
 def neutral_oxygen(index: int) -> str:
-    return f"[{index}OH2]"
+    return "O" + ("C" * index)
 
 
 def write_stage2_files(final_root: Path, count: int = 100) -> None:
@@ -207,6 +218,86 @@ def test_rule_candidates_are_finite_and_preserve_charge():
     assert all(candidate_allowed("C[NH3+]", row["SMILES"], "cation") for row in charged)
     assert not candidate_allowed("C[NH3+]", "CCN", "cation")
     assert not candidate_allowed("[Cl-]", "[Na+]", "anion")
+
+
+def test_rule_candidates_include_all_valid_resonance_forms():
+    seed = canonicalize_smiles("CCCC[n+]1ccn(C)c1")
+    molecule = Chem.MolFromSmiles(seed)
+    assert molecule is not None
+    expected = {
+        canonicalize_smiles(
+            Chem.MolToSmiles(
+                resonance,
+                canonical=True,
+                isomericSmiles=True,
+            )
+        )
+        for resonance in Chem.ResonanceMolSupplier(
+            molecule,
+            0,
+            100,
+        )
+    }
+    expected.discard(seed)
+    expected = {
+        smiles
+        for smiles in expected
+        if fixed_h_identity_key(smiles) == fixed_h_identity_key(seed)
+    }
+
+    generated = generate_rule_candidates(
+        seed,
+        "cation",
+        resonance_max_structs=100,
+    )
+    resonance = {
+        row["SMILES"]
+        for row in generated
+        if row["rule"] == "resonance_equivalent"
+    }
+
+    assert resonance == expected
+    assert resonance
+    assert all(
+        fixed_h_identity_key(smiles) == fixed_h_identity_key(seed)
+        for smiles in resonance
+    )
+    assert all(
+        formal_charge(smiles) == formal_charge(seed)
+        for smiles in resonance
+    )
+
+
+def test_final_identity_validation_rejects_equivalent_smiles_variants(
+    tmp_path: Path,
+):
+    final_root = tmp_path / "final"
+    write_csv(
+        final_root / "experiment" / "density.csv",
+        [
+            {
+                "cation": "CCCC[n+]1ccn(C)c1",
+                "anion": "[Cl-]",
+                "density_g/cm^3": 1.0,
+            }
+        ],
+    )
+    write_csv(
+        final_root / "simulation" / "density.csv",
+        [
+            {
+                "cation": "CCCCn1cc[n+](C)c1",
+                "anion": "[Cl-]",
+                "density_g/cm^3": 1.0,
+            }
+        ],
+    )
+
+    with pytest.raises(
+        TrainingSplitError,
+        match="Rebuild data/merged",
+    ):
+        validate_final_identity_consistency(final_root)
 
 
 def test_ion_rules_extend_and_branch_terminal_alkyl_chains():
@@ -490,6 +581,72 @@ class FakePubChemClient:
         raise AssertionError("local rules must not call PubChem identity")
 
 
+class EmptyPubChemClient:
+    def similarity(
+        self,
+        _smiles: str,
+        *,
+        threshold: int,
+        max_records: int,
+    ) -> list[dict[str, object]]:
+        assert threshold == 90
+        assert max_records == 100
+        return []
+
+    def identity(self, _smiles: str) -> list[dict[str, object]]:
+        raise AssertionError("resonance rules must not call PubChem identity")
+
+
+def test_augmentation_keeps_resonance_forms_as_independent_rows(
+    tmp_path: Path,
+):
+    output_root = tmp_path / "training"
+    stage1 = output_root / "stage1"
+    stage1.mkdir(parents=True)
+    pd.DataFrame(
+        [{"cation": "CCCC[n+]1ccn(C)c1", "anion": "[Cl-]"}]
+    ).to_csv(stage1 / "IL.csv", index=False)
+    for role in ("anion", "solute", "solvent", "molecule"):
+        pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
+            stage1 / f"{role}.csv",
+            index=False,
+        )
+    pd.DataFrame(
+        [
+            {
+                "SMILES": "CCCC[n+]1ccn(C)c1",
+                "formal_charge": 1,
+                "origin_list": "dataset",
+                "seed_smiles_list": "",
+                "rule_list": "",
+                "pubchem_cid_list": "",
+                "mol_id_list": "",
+            }
+        ],
+        columns=PRETRAIN_ENTITY_COLUMNS,
+    ).to_csv(stage1 / "cation.csv", index=False)
+    original_il = (stage1 / "IL.csv").read_bytes()
+
+    augmented = augment_pretraining_entities(
+        output_root,
+        pretrain_cap=100,
+        client=EmptyPubChemClient(),
+    )
+
+    resonance = augmented[
+        augmented["rule_list"].map(
+            lambda value: "resonance_equivalent" in str(value)
+        )
+    ]
+    assert len(resonance) == 1
+    assert resonance.iloc[0]["origin_list"] == "rule"
+    assert resonance.iloc[0]["seed_smiles_list"] == "CCCC[n+]1ccn(C)c1"
+    assert fixed_h_identity_key(resonance.iloc[0]["SMILES"]) == (
+        fixed_h_identity_key("CCCC[n+]1ccn(C)c1")
+    )
+    assert (stage1 / "IL.csv").read_bytes() == original_il
+
+
 def test_augmentation_uses_global_cap_and_records_selected_provenance(
     tmp_path: Path,
 ):
@@ -556,6 +713,65 @@ def test_augmentation_uses_global_cap_and_records_selected_provenance(
 )
 def test_tier_boundaries(systems: int, expected: str):
     assert tier_for_system_count(systems) == expected
+
+
+def test_weighted_shared_folds_improve_skewed_row_balance():
+    weights = {
+        "task_a": {
+            f"group_{index}": weight
+            for index, weight in enumerate(
+                [50, 40, 30, 20, 10, 1, 1, 1, 1, 1]
+            )
+        },
+        "task_b": {
+            f"group_{index}": weight
+            for index, weight in enumerate(
+                [1, 1, 1, 1, 1, 10, 20, 30, 40, 50]
+            )
+        },
+    }
+    repeats = {"task_a": 1, "task_b": 1}
+    baseline = plan_shared_group_folds(
+        {
+            task_id: set(task_weights)
+            for task_id, task_weights in weights.items()
+        },
+        repeats,
+        seed=42,
+        namespace="test_weighted",
+    )
+    weighted = plan_shared_weighted_group_folds(
+        weights,
+        repeats,
+        seed=42,
+        namespace="test_weighted",
+    )
+    repeated = plan_shared_weighted_group_folds(
+        weights,
+        repeats,
+        seed=42,
+        namespace="test_weighted",
+    )
+
+    def squared_deviation(
+        assignments: dict[tuple[str, int], int],
+    ) -> float:
+        total = 0.0
+        for task_weights in weights.values():
+            loads = [0, 0, 0, 0, 0]
+            for group_identifier, row_count in task_weights.items():
+                loads[assignments[(group_identifier, 0)]] += row_count
+            assert min(loads) > 0
+            mean = sum(loads) / 5.0
+            total += sum((load - mean) ** 2 for load in loads)
+        return total
+
+    assert weighted == repeated
+    assert squared_deviation(weighted) < squared_deviation(baseline)
+    assert {
+        weighted[(group_identifier, 0)]
+        for group_identifier in weights["task_a"]
+    } == set(range(5))
 
 
 def test_charge_rows_are_deduplicated_and_conflicts_fail(tmp_path: Path):
@@ -865,6 +1081,23 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert (
         medium_root / "random" / "cv5" / "fold5.csv"
     ).exists()
+    balance = pd.read_csv(output_root / "_audit" / "fold_balance.csv")
+    assert list(balance.columns) == [
+        "task_id",
+        "strategy",
+        "cv",
+        "fold",
+        "row_count",
+        "group_count",
+        "total_rows",
+        "mean_rows",
+        "largest_group_rows",
+        "max_to_min",
+        "theoretical_lower_bound",
+        "unavoidable_group_dominance",
+    ]
+    assert set(balance["strategy"]) == {"cation", "anion"}
+    assert balance["row_count"].gt(0).all()
 
     stage2_density = output_root / "stage2" / "density"
     train = pd.read_csv(stage2_density / "train.csv")
