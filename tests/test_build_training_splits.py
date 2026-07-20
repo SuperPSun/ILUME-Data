@@ -6,7 +6,9 @@ import pandas as pd
 import pytest
 from rdkit import Chem
 
+import scripts.build_training_splits as training_splits
 from scripts.build_training_splits import (
+    IncompletePubChemQuery,
     PRETRAIN_ENTITY_COLUMNS,
     PubChemClient,
     TaskProfile,
@@ -23,6 +25,7 @@ from scripts.build_training_splits import (
     generate_rule_candidates,
     plan_joint_test_registry,
     prepare_task_frame,
+    resonance_eligibility,
     role_fragments,
     task_group_kfold_assignments,
     tier_for_system_count,
@@ -112,7 +115,7 @@ def write_stage2_files(final_root: Path, count: int = 100) -> None:
     )
 
 
-def test_extract_pretraining_entities_splits_ion_fragments_and_preserves_roles(
+def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
     tmp_path: Path,
 ):
     final_root = tmp_path / "final"
@@ -126,7 +129,15 @@ def test_extract_pretraining_entities_splits_ion_fragments_and_preserves_roles(
                 "temperature_K": 298.15,
                 "solvation_kcal/mol": -2.0,
                 "source_list": "test",
-            }
+            },
+            {
+                "cation": "[Na+].[K+]",
+                "anion": "[Cl-].[Br-]",
+                "solute": "CC(=O)[O-]",
+                "temperature_K": 298.15,
+                "solvation_kcal/mol": -3.0,
+                "source_list": "test",
+            },
         ],
     )
     write_csv(
@@ -136,7 +147,19 @@ def test_extract_pretraining_entities_splits_ion_fragments_and_preserves_roles(
                 "SMILES": "OCC",
                 "value": 1.0,
                 "source_list": "test",
-            }
+            },
+            {
+                "SMILES": "CC(=O)[O-]",
+                "mol_id": "negative_molecule",
+                "value": 2.0,
+                "source_list": "test",
+            },
+            {
+                "SMILES": "C[NH3+]",
+                "mol_id": "positive_molecule",
+                "value": 3.0,
+                "source_list": "test",
+            },
         ],
     )
     structure_path = final_root / "simulation" / "charge_20260514" / "bad.mol"
@@ -157,15 +180,23 @@ def test_extract_pretraining_entities_splits_ion_fragments_and_preserves_roles(
         "molecule",
     }
     assert set(entities.loc[entities["role"].eq("cation"), "SMILES"]) == {
+        "C[NH3+]",
         "[K+]",
         "[Na+]",
     }
     assert set(entities.loc[entities["role"].eq("anion"), "SMILES"]) == {
+        "CC(=O)[O-]",
         "[Br-]",
         "[Cl-]",
     }
     ethanol = entities[entities["SMILES"].eq("CCO")]
     assert set(ethanol["role"]) == {"solute", "molecule"}
+    acetate = entities[entities["SMILES"].eq("CC(=O)[O-]")]
+    assert set(acetate["role"]) == {"anion"}
+    assert acetate.iloc[0]["mol_id_list"] == "negative_molecule"
+    methylammonium = entities[entities["SMILES"].eq("C[NH3+]")]
+    assert set(methylammonium["role"]) == {"cation"}
+    assert methylammonium.iloc[0]["mol_id_list"] == "positive_molecule"
     assert "il" not in set(entities["role"])
 
     assert {
@@ -195,26 +226,28 @@ def test_extract_pretraining_entities_splits_ion_fragments_and_preserves_roles(
     assert structure_path.exists()
 
 
-def test_rule_candidates_are_finite_and_preserve_charge():
-    butane = {
-        (row["rule"], row["SMILES"])
-        for row in generate_rule_candidates("CCCC")
-    }
-    assert ("terminal_alkyl_shorten_1", "CCC") in butane
-    assert ("terminal_alkyl_shorten_2", "CC") in butane
-    assert ("terminal_alkyl_extend_1", "CCCCC") in butane
-    assert ("terminal_alkyl_extend_2", "CCCCCC") in butane
+def test_rule_candidates_keep_only_resonance_for_neutral_entities():
+    assert generate_rule_candidates("CCCC", "molecule") == []
+    assert generate_rule_candidates("CCF", "molecule") == []
 
-    fluoroethane = {
+    neutral_resonance = generate_rule_candidates(
+        "N#[N+][O-]",
+        "molecule",
+    )
+    assert {
         (row["rule"], row["SMILES"])
-        for row in generate_rule_candidates("CCF")
+        for row in neutral_resonance
+    } == {
+        ("resonance_equivalent", "[N-]=[N+]=O"),
     }
-    assert ("halogen_F_to_Cl", "CCCl") in fluoroethane
-    assert ("halogen_F_to_Br", "CCBr") in fluoroethane
 
-    charged = generate_rule_candidates("C[NH3+]")
+    charged = generate_rule_candidates("C[NH3+]", "molecule")
     assert charged
     assert all(candidate_allowed("C[NH3+]", row["SMILES"], "cation") for row in charged)
+    assert any(
+        row["rule"] == "terminal_alkyl_extend_4"
+        for row in charged
+    )
     assert not candidate_allowed("C[NH3+]", "CCN", "cation")
     assert not candidate_allowed("[Cl-]", "[Na+]", "anion")
 
@@ -328,12 +361,7 @@ def test_ion_rules_extend_and_branch_terminal_alkyl_chains():
         canonicalize_smiles("CCC[N+](C)(C)C"),
     ) in branched
 
-    neutral_rules = {
-        row["rule"]
-        for row in generate_rule_candidates("CCCC", "molecule")
-    }
-    assert "terminal_alkyl_extend_3" not in neutral_rules
-    assert "terminal_alkyl_linear_to_branch" not in neutral_rules
+    assert generate_rule_candidates("CCCC", "molecule") == []
 
 
 def test_rule_candidates_drop_disconnected_explicit_hydrogen_fragments(capfd):
@@ -366,8 +394,8 @@ def test_ion_rules_cover_headgroups_and_perfluoroalkyl_chains():
         "cation_headgroup_P_to_N",
         canonicalize_smiles("C[N+](C)(C)C"),
     ) in phosphonium
-    assert not any(
-        row["rule"].startswith("cation_headgroup")
+    assert any(
+        row["rule"] == "cation_headgroup_N_to_P"
         for row in generate_rule_candidates("C[N+](C)(C)C", "molecule")
     )
 
@@ -596,6 +624,367 @@ class EmptyPubChemClient:
         raise AssertionError("resonance rules must not call PubChem identity")
 
 
+class NeutralResonancePubChemClient:
+    def similarity(
+        self,
+        smiles: str,
+        *,
+        threshold: int,
+        max_records: int,
+    ) -> list[dict[str, object]]:
+        assert threshold == 90
+        assert max_records == 100
+        assert canonicalize_smiles(smiles) == "N#[N+][O-]"
+        return [
+            {"CID": 1, "SMILES": "N#[N+][O-]", "Charge": 0},
+            {"CID": 2, "SMILES": "[N-]=[N+]=O", "Charge": 0},
+        ]
+
+    def identity(self, _smiles: str) -> list[dict[str, object]]:
+        raise AssertionError("resonance rules must not call PubChem identity")
+
+
+def write_stage1_molecules(
+    output_root: Path,
+    smiles_values: list[str],
+) -> bytes:
+    stage1 = output_root / "stage1"
+    stage1.mkdir(parents=True)
+    pd.DataFrame(columns=["cation", "anion"]).to_csv(
+        stage1 / "IL.csv",
+        index=False,
+    )
+    for role in ("anion", "cation", "solute", "solvent"):
+        pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
+            stage1 / f"{role}.csv",
+            index=False,
+        )
+    pd.DataFrame(
+        [
+            {
+                "SMILES": smiles,
+                "formal_charge": formal_charge(smiles),
+                "origin_list": "dataset",
+                "seed_smiles_list": "",
+                "rule_list": "",
+                "pubchem_cid_list": "",
+                "mol_id_list": "",
+            }
+            for smiles in smiles_values
+        ],
+        columns=PRETRAIN_ENTITY_COLUMNS,
+    ).to_csv(stage1 / "molecule.csv", index=False)
+    return (stage1 / "molecule.csv").read_bytes()
+
+
+def test_resonance_eligibility_has_conservative_boundaries():
+    assert resonance_eligibility("C" * 50, 50, 2).eligible
+    heavy = resonance_eligibility("C" * 51, 50, 2)
+    assert not heavy.eligible
+    assert heavy.reason == "heavy_atom_limit"
+
+    assert resonance_eligibility("[Fe+2]", 50, 2).eligible
+    charge = resonance_eligibility("[Fe+3]", 50, 2)
+    assert not charge.eligible
+    assert charge.reason == "charge_limit"
+
+
+def test_complex_multicharged_ion_skips_resonance_supplier(monkeypatch):
+    complex_anion = (
+        "O=C([O-])c1cc2c(C(=O)[O-])cc1Oc1nnc(c3c1CCC3)"
+        "Oc1cc(C(=O)[O-])c(cc1C(=O)[O-])Oc1nnc(c3c1CCC3)"
+        "Oc1cc(C(=O)[O-])c(cc1C(=O)[O-])Oc1nnc(c3c1CCC3)O2"
+    )
+
+    def forbidden_supplier(*_args, **_kwargs):
+        raise AssertionError("ineligible molecule must not enumerate resonance")
+
+    monkeypatch.setattr(Chem, "ResonanceMolSupplier", forbidden_supplier)
+    generated, audit = training_splits._generate_rule_candidates_with_audit(
+        complex_anion,
+        "anion",
+        resonance_max_structs=256,
+        resonance_max_heavy_atoms=50,
+        resonance_max_abs_charge=2,
+    )
+
+    assert audit["resonance_status"] == "skipped"
+    assert set(audit["resonance_skip_reason"].split(";")) == {
+        "charge_limit",
+        "heavy_atom_limit",
+    }
+    assert all(row["rule"] != "resonance_equivalent" for row in generated)
+
+
+def test_resonance_cap_is_reported_as_truncated():
+    _generated, audit = training_splits._generate_rule_candidates_with_audit(
+        "N#[N+][O-]",
+        "molecule",
+        resonance_max_structs=1,
+        resonance_max_heavy_atoms=50,
+        resonance_max_abs_charge=2,
+    )
+
+    assert audit["resonance_examined"] == 1
+    assert audit["resonance_truncated"]
+
+
+class PartiallyFailingPubChemClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def similarity(
+        self,
+        smiles: str,
+        *,
+        threshold: int,
+        max_records: int,
+    ) -> list[dict[str, object]]:
+        canonical = canonicalize_smiles(smiles)
+        self.calls.append(canonical)
+        if canonical == "CCO":
+            raise IncompletePubChemQuery("HTTP 500 for ethanol")
+        assert canonical == "CCF"
+        return [{"CID": 7, "SMILES": "CCCl", "Charge": 0}]
+
+    def close(self) -> None:
+        pass
+
+
+class RecoveringPubChemClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def similarity(
+        self,
+        smiles: str,
+        *,
+        threshold: int,
+        max_records: int,
+    ) -> list[dict[str, object]]:
+        canonical = canonicalize_smiles(smiles)
+        self.calls.append(canonical)
+        assert canonical == "CCO"
+        return [{"CID": 8, "SMILES": "CO", "Charge": 0}]
+
+    def close(self) -> None:
+        pass
+
+
+def test_partial_pubchem_failure_writes_output_and_resumes_only_failure(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_root = tmp_path / "training"
+    write_stage1_molecules(output_root, ["CCO", "CCF"])
+    first_client = PartiallyFailingPubChemClient()
+
+    first = augment_pretraining_entities(
+        output_root,
+        pretrain_cap=100,
+        client=first_client,
+    )
+
+    assert set(first["SMILES"]) == {"CCF", "CCO", "CCCl"}
+    audit_root = output_root / "stage1" / "_audit"
+    summary = json.loads(
+        (audit_root / "augmentation_summary.json").read_text()
+    )
+    assert summary["completion_status"] == "partial_pubchem"
+    failures = pd.read_csv(audit_root / "pubchem_failures.csv")
+    assert failures["seed_smiles"].tolist() == ["CCO"]
+
+    def forbidden_local_rules(*_args, **_kwargs):
+        raise AssertionError("completed local rules must be resumed from cache")
+
+    monkeypatch.setattr(
+        training_splits,
+        "_generate_rule_candidates_with_audit",
+        forbidden_local_rules,
+    )
+    second_client = RecoveringPubChemClient()
+    second = augment_pretraining_entities(
+        output_root,
+        pretrain_cap=100,
+        client=second_client,
+    )
+
+    assert second_client.calls == ["CCO"]
+    assert set(second["SMILES"]) == {"CCF", "CCO", "CCCl", "CO"}
+    summary = json.loads(
+        (audit_root / "augmentation_summary.json").read_text()
+    )
+    assert summary["completion_status"] == "complete"
+    assert pd.read_csv(audit_root / "pubchem_failures.csv").empty
+
+
+def test_offline_missing_cache_fails_without_replacing_stage1(tmp_path: Path):
+    output_root = tmp_path / "training"
+    original = write_stage1_molecules(output_root, ["CCO"])
+
+    with pytest.raises(IncompletePubChemQuery, match="offline"):
+        augment_pretraining_entities(
+            output_root,
+            pretrain_cap=100,
+            offline=True,
+            client=PartiallyFailingPubChemClient(),
+        )
+
+    assert (output_root / "stage1" / "molecule.csv").read_bytes() == original
+
+
+def test_interruption_preserves_stage1_and_local_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_root = tmp_path / "training"
+    original = write_stage1_molecules(output_root, ["CCO"])
+
+    class InterruptingClient:
+        def similarity(self, *_args, **_kwargs):
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        augment_pretraining_entities(
+            output_root,
+            pretrain_cap=100,
+            client=InterruptingClient(),
+        )
+    assert (output_root / "stage1" / "molecule.csv").read_bytes() == original
+
+    def forbidden_local_rules(*_args, **_kwargs):
+        raise AssertionError("completed local rules must survive interruption")
+
+    monkeypatch.setattr(
+        training_splits,
+        "_generate_rule_candidates_with_audit",
+        forbidden_local_rules,
+    )
+    augment_pretraining_entities(
+        output_root,
+        pretrain_cap=100,
+        client=EmptyPubChemClient(),
+    )
+
+
+def test_augmentation_parameter_change_invalidates_candidate_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_root = tmp_path / "training"
+    write_stage1_molecules(output_root, ["CCO"])
+    augment_pretraining_entities(
+        output_root,
+        pretrain_cap=100,
+        resonance_max_structs=8,
+        client=EmptyPubChemClient(),
+    )
+
+    original_generator = (
+        training_splits._generate_rule_candidates_with_audit
+    )
+    calls = 0
+
+    def counting_generator(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_generator(*args, **kwargs)
+
+    monkeypatch.setattr(
+        training_splits,
+        "_generate_rule_candidates_with_audit",
+        counting_generator,
+    )
+    augment_pretraining_entities(
+        output_root,
+        pretrain_cap=100,
+        resonance_max_structs=9,
+        client=EmptyPubChemClient(),
+    )
+
+    assert calls == 1
+
+
+def test_augmentation_migrates_old_stage1_roles_and_merges_identity_metadata(
+    tmp_path: Path,
+):
+    output_root = tmp_path / "training"
+    stage1 = output_root / "stage1"
+    stage1.mkdir(parents=True)
+    pd.DataFrame(
+        [{"cation": "C[NH3+]", "anion": "CC(=O)[O-]"}]
+    ).to_csv(stage1 / "IL.csv", index=False)
+    original_il = (stage1 / "IL.csv").read_bytes()
+
+    rows_by_role = {
+        "anion": [
+            {
+                "SMILES": "CC(=O)[O-]",
+                "formal_charge": -1,
+                "origin_list": "dataset",
+                "seed_smiles_list": "",
+                "rule_list": "",
+                "pubchem_cid_list": "",
+                "mol_id_list": "anion_id",
+            }
+        ],
+        "cation": [],
+        "solute": [],
+        "solvent": [],
+        "molecule": [
+            {
+                "SMILES": "CC(=O)[O-]",
+                "formal_charge": -1,
+                "origin_list": "dataset",
+                "seed_smiles_list": "",
+                "rule_list": "",
+                "pubchem_cid_list": "",
+                "mol_id_list": "molecule_id",
+            },
+            {
+                "SMILES": "C[NH3+]",
+                "formal_charge": 1,
+                "origin_list": "dataset",
+                "seed_smiles_list": "",
+                "rule_list": "",
+                "pubchem_cid_list": "",
+                "mol_id_list": "positive_id",
+            },
+            {
+                "SMILES": "CCF",
+                "formal_charge": 0,
+                "origin_list": "dataset",
+                "seed_smiles_list": "",
+                "rule_list": "",
+                "pubchem_cid_list": "",
+                "mol_id_list": "neutral_id",
+            },
+        ],
+    }
+    for role, rows in rows_by_role.items():
+        pd.DataFrame(rows, columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
+            stage1 / f"{role}.csv",
+            index=False,
+        )
+
+    augmented = augment_pretraining_entities(
+        output_root,
+        pretrain_cap=3,
+        client=EmptyPubChemClient(),
+    )
+
+    assert len(augmented) == 3
+    anion = pd.read_csv(stage1 / "anion.csv", keep_default_na=False)
+    assert anion.to_dict(orient="records")[0]["mol_id_list"] == (
+        "anion_id;molecule_id"
+    )
+    cation = pd.read_csv(stage1 / "cation.csv", keep_default_na=False)
+    assert cation["SMILES"].tolist() == ["C[NH3+]"]
+    molecule = pd.read_csv(stage1 / "molecule.csv", keep_default_na=False)
+    assert molecule["SMILES"].tolist() == ["CCF"]
+    assert (stage1 / "IL.csv").read_bytes() == original_il
+
+
 def test_augmentation_keeps_resonance_forms_as_independent_rows(
     tmp_path: Path,
 ):
@@ -646,7 +1035,7 @@ def test_augmentation_keeps_resonance_forms_as_independent_rows(
     assert (stage1 / "IL.csv").read_bytes() == original_il
 
 
-def test_augmentation_uses_global_cap_and_records_selected_provenance(
+def test_neutral_augmentation_uses_pubchem_without_structural_rules(
     tmp_path: Path,
 ):
     output_root = tmp_path / "training"
@@ -682,23 +1071,66 @@ def test_augmentation_uses_global_cap_and_records_selected_provenance(
         client=FakePubChemClient(),
     )
 
-    assert len(augmented) == 4
-    assert set(augmented["SMILES"]) == {"CCF", "CCBr", "CCCF", "CCO"}
+    assert len(augmented) == 3
+    assert set(augmented["SMILES"]) == {"CCF", "CCBr", "CCO"}
     molecule = pd.read_csv(stage1 / "molecule.csv", keep_default_na=False)
     assert list(molecule.columns) == PRETRAIN_ENTITY_COLUMNS
     assert molecule.set_index("SMILES").loc["CCF", "origin_list"] == "dataset"
-    overlap = molecule.set_index("SMILES").loc["CCBr"]
-    assert overlap["origin_list"] == "pubchem;rule"
-    assert overlap["seed_smiles_list"] == "CCF"
-    assert overlap["rule_list"] == "halogen_F_to_Br"
-    assert str(overlap["pubchem_cid_list"]) == "2"
-    local_rule = molecule.set_index("SMILES").loc["CCCF"]
-    assert local_rule["origin_list"] == "rule"
-    assert local_rule["pubchem_cid_list"] == ""
+    pubchem_halogen = molecule.set_index("SMILES").loc["CCBr"]
+    assert pubchem_halogen["origin_list"] == "pubchem"
+    assert pubchem_halogen["seed_smiles_list"] == "CCF"
+    assert pubchem_halogen["rule_list"] == ""
+    assert str(pubchem_halogen["pubchem_cid_list"]) == "2"
     pubchem_only = molecule.set_index("SMILES").loc["CCO"]
     assert pubchem_only["origin_list"] == "pubchem"
     assert str(pubchem_only["pubchem_cid_list"]) == "3"
     assert not (stage1 / "augmentation_provenance.csv").exists()
+
+
+def test_neutral_resonance_overlap_merges_rule_and_pubchem_provenance(
+    tmp_path: Path,
+):
+    output_root = tmp_path / "training"
+    stage1 = output_root / "stage1"
+    stage1.mkdir(parents=True)
+    pd.DataFrame(columns=["cation", "anion"]).to_csv(
+        stage1 / "IL.csv",
+        index=False,
+    )
+    original_il = (stage1 / "IL.csv").read_bytes()
+    for role in ("anion", "cation", "solute", "solvent"):
+        pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
+            stage1 / f"{role}.csv",
+            index=False,
+        )
+    pd.DataFrame(
+        [
+            {
+                "SMILES": "N#[N+][O-]",
+                "formal_charge": 0,
+                "origin_list": "dataset",
+                "seed_smiles_list": "",
+                "rule_list": "",
+                "pubchem_cid_list": "",
+                "mol_id_list": "",
+            }
+        ],
+        columns=PRETRAIN_ENTITY_COLUMNS,
+    ).to_csv(stage1 / "molecule.csv", index=False)
+
+    augment_pretraining_entities(
+        output_root,
+        pretrain_cap=10,
+        client=NeutralResonancePubChemClient(),
+    )
+
+    molecule = pd.read_csv(stage1 / "molecule.csv", keep_default_na=False)
+    resonance = molecule.set_index("SMILES").loc["[N-]=[N+]=O"]
+    assert resonance["origin_list"] == "pubchem;rule"
+    assert resonance["rule_list"] == "resonance_equivalent"
+    assert resonance["seed_smiles_list"] == "N#[N+][O-]"
+    assert str(resonance["pubchem_cid_list"]) == "2"
+    assert (stage1 / "IL.csv").read_bytes() == original_il
 
 
 @pytest.mark.parametrize(
