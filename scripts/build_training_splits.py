@@ -15,6 +15,7 @@ from http import client as http_client
 import json
 import os
 from pathlib import Path
+import signal
 import shutil
 import sqlite3
 import tempfile
@@ -74,6 +75,10 @@ FOLD_BALANCE_COLUMNS = [
     "unavoidable_group_dominance",
 ]
 ORIGIN_ORDER = {"dataset": 0, "pubchem": 1, "rule": 2}
+DEFAULT_RESONANCE_MAX_STRUCTS = 256
+DEFAULT_RESONANCE_MAX_HEAVY_ATOMS = 50
+DEFAULT_RESONANCE_MAX_ABS_CHARGE = 2
+AUGMENTATION_CACHE_VERSION = 1
 
 STAGE2_FILES = {
     "simulation/density.csv",
@@ -148,6 +153,14 @@ class TrainingSplitError(RuntimeError):
 
 class IncompletePubChemQuery(TrainingSplitError):
     """Raised when a PubChem request is unavailable or unfinished."""
+
+
+@dataclass(frozen=True)
+class ResonanceEligibility:
+    eligible: bool
+    heavy_atom_count: int
+    formal_charge: int
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -540,6 +553,89 @@ def _entity_output_frame(
     ).reset_index(drop=True)
 
 
+def _normalized_pretrain_role(role: str, charge: int) -> str:
+    if role not in set(ROLE_BY_COLUMN.values()):
+        raise TrainingSplitError(f"Unknown Stage-1 entity role: {role}")
+    if charge > 0:
+        return "cation"
+    if charge < 0:
+        return "anion"
+    if role in {"cation", "anion"}:
+        raise TrainingSplitError(
+            f"Neutral entity cannot be assigned to {role}"
+        )
+    return role
+
+
+def _normalize_base_entity_roles(frame: pd.DataFrame) -> pd.DataFrame:
+    records: dict[tuple[str, str], dict[str, object]] = {}
+    for row in frame.itertuples(index=False):
+        canonical = canonicalize_smiles(str(row.SMILES))
+        charge = formal_charge(canonical)
+        try:
+            stored_charge = float(row.formal_charge)
+        except (TypeError, ValueError) as exc:
+            raise TrainingSplitError(
+                f"Invalid Stage-1 formal_charge for {canonical}: "
+                f"{row.formal_charge!r}"
+            ) from exc
+        if not np.isfinite(stored_charge) or not stored_charge.is_integer():
+            raise TrainingSplitError(
+                f"Invalid Stage-1 formal_charge for {canonical}: "
+                f"{row.formal_charge!r}"
+            )
+        if int(stored_charge) != charge:
+            raise TrainingSplitError(
+                f"Stage-1 formal_charge mismatch for {canonical}: "
+                f"stored {int(stored_charge)}, calculated {charge}"
+            )
+
+        role = _normalized_pretrain_role(str(row.role), charge)
+        key = (role, fixed_h_identity_key(canonical))
+        record = records.setdefault(
+            key,
+            {
+                "role": role,
+                "SMILES": canonical,
+                "formal_charge": charge,
+                "origin_list": set(),
+                "seed_smiles_list": set(),
+                "rule_list": set(),
+                "pubchem_cid_list": set(),
+                "mol_id_list": set(),
+            },
+        )
+        if canonical < str(record["SMILES"]):
+            record["SMILES"] = canonical
+        for column in (
+            "origin_list",
+            "seed_smiles_list",
+            "rule_list",
+            "pubchem_cid_list",
+            "mol_id_list",
+        ):
+            values = record[column]
+            if isinstance(values, set):
+                values.update(_split_joined(getattr(row, column)))
+
+    return pd.DataFrame(
+        [
+            {
+                "role": record["role"],
+                **_entity_output_frame([record]).iloc[0].to_dict(),
+            }
+            for record in sorted(
+                records.values(),
+                key=lambda item: (
+                    str(item["role"]),
+                    str(item["SMILES"]),
+                ),
+            )
+        ],
+        columns=["role", *PRETRAIN_ENTITY_COLUMNS],
+    )
+
+
 def _combined_entity_frame(stage1_root: Path) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for role in ROLE_BY_COLUMN.values():
@@ -637,14 +733,19 @@ def extract_pretraining_entities(
                             else ""
                         )
                         for smiles in fragments:
+                            charge = formal_charge(smiles)
+                            normalized_role = _normalized_pretrain_role(
+                                role,
+                                charge,
+                            )
                             identity_key = fixed_h_identity_key(smiles)
-                            key = (role, identity_key)
+                            key = (normalized_role, identity_key)
                             record = entities.setdefault(
                                 key,
                                 {
-                                    "role": role,
+                                    "role": normalized_role,
                                     "SMILES": smiles,
-                                    "formal_charge": formal_charge(smiles),
+                                    "formal_charge": charge,
                                     "origin_list": {"dataset"},
                                     "seed_smiles_list": set(),
                                     "rule_list": set(),
@@ -1075,12 +1176,39 @@ def _replace_atom(
     return editable.GetMol()
 
 
-def generate_rule_candidates(
+def resonance_eligibility(
+    smiles: str,
+    max_heavy_atoms: int,
+    max_abs_charge: int,
+) -> ResonanceEligibility:
+    canonical = canonicalize_smiles(smiles)
+    molecule = Chem.MolFromSmiles(canonical)
+    if molecule is None:  # pragma: no cover - protected by canonicalize_smiles
+        raise TrainingSplitError(f"Invalid SMILES: {smiles}")
+    charge = formal_charge(canonical)
+    reasons: list[str] = []
+    if len(Chem.GetMolFrags(molecule)) != 1:
+        reasons.append("multiple_fragments")
+    if molecule.GetNumHeavyAtoms() > max_heavy_atoms:
+        reasons.append("heavy_atom_limit")
+    if abs(charge) > max_abs_charge:
+        reasons.append("charge_limit")
+    return ResonanceEligibility(
+        eligible=not reasons,
+        heavy_atom_count=molecule.GetNumHeavyAtoms(),
+        formal_charge=charge,
+        reason=";".join(reasons),
+    )
+
+
+def _generate_rule_candidates_with_audit(
     smiles: str,
     role: str | None = None,
     *,
-    resonance_max_structs: int = 1_000,
-) -> list[dict[str, str]]:
+    resonance_max_structs: int = DEFAULT_RESONANCE_MAX_STRUCTS,
+    resonance_max_heavy_atoms: int = DEFAULT_RESONANCE_MAX_HEAVY_ATOMS,
+    resonance_max_abs_charge: int = DEFAULT_RESONANCE_MAX_ABS_CHARGE,
+) -> tuple[list[dict[str, str]], dict[str, object]]:
     """Generate a finite, charge-preserving catalog of chemistry-rule candidates."""
     if resonance_max_structs <= 0:
         raise ValueError("resonance_max_structs must be positive")
@@ -1089,10 +1217,20 @@ def generate_rule_candidates(
     if molecule is None:  # pragma: no cover - protected by canonicalize_smiles
         return []
     target_charge = formal_charge(canonical)
+    effective_role = _normalized_pretrain_role(
+        role or "molecule",
+        target_charge,
+    )
     candidates: dict[tuple[str, str], dict[str, str]] = {}
-    ion_role = role in {"cation", "anion"}
+    ion_role = target_charge != 0
+    eligibility = resonance_eligibility(
+        canonical,
+        resonance_max_heavy_atoms,
+        resonance_max_abs_charge,
+    )
+    resonance_examined = 0
 
-    if fragment_count(canonical) == 1:
+    if eligibility.eligible:
         seed_identity = fixed_h_identity_key(canonical)
         supplier = Chem.ResonanceMolSupplier(
             molecule,
@@ -1100,6 +1238,9 @@ def generate_rule_candidates(
             resonance_max_structs,
         )
         for resonance_molecule in supplier:
+            resonance_examined += 1
+            if resonance_molecule is None:
+                continue
             candidate = _sanitized_smiles(resonance_molecule)
             if (
                 candidate
@@ -1112,6 +1253,38 @@ def generate_rule_candidates(
                     "rule": "resonance_equivalent",
                     "family": "resonance",
                 }
+
+    def result() -> tuple[list[dict[str, str]], dict[str, object]]:
+        rows = [
+            candidates[key]
+            for key in sorted(candidates, key=lambda item: (item[0], item[1]))
+        ]
+        truncated = (
+            eligibility.eligible
+            and resonance_examined >= resonance_max_structs
+        )
+        status = (
+            "skipped"
+            if not eligibility.eligible
+            else "truncated"
+            if truncated
+            else "complete"
+        )
+        return rows, {
+            "heavy_atom_count": eligibility.heavy_atom_count,
+            "formal_charge": eligibility.formal_charge,
+            "resonance_status": status,
+            "resonance_skip_reason": eligibility.reason,
+            "resonance_examined": resonance_examined,
+            "resonance_generated": sum(
+                row["rule"] == "resonance_equivalent"
+                for row in rows
+            ),
+            "resonance_truncated": truncated,
+        }
+
+    if target_charge == 0:
+        return result()
 
     for chain in _terminal_alkyl_chains(molecule):
         terminal_index = chain[0]
@@ -1242,7 +1415,7 @@ def generate_rule_candidates(
                 family="halogen",
             )
 
-    if role == "cation":
+    if effective_role == "cation":
         headgroup_symbols = {7: "N", 15: "P"}
         for atom in molecule.GetAtoms():
             if (
@@ -1276,7 +1449,7 @@ def generate_rule_candidates(
                 family="cation_headgroup",
             )
 
-    if role == "anion":
+    if effective_role == "anion":
         for chain in _perfluoroalkyl_chains(molecule):
             terminal_index = chain[-1]
             terminal_fluorines = sorted(
@@ -1477,10 +1650,25 @@ def generate_rule_candidates(
                 family="aromatic_CH_N",
             )
 
-    return [
-        candidates[key]
-        for key in sorted(candidates, key=lambda item: (item[0], item[1]))
-    ]
+    return result()
+
+
+def generate_rule_candidates(
+    smiles: str,
+    role: str | None = None,
+    *,
+    resonance_max_structs: int = DEFAULT_RESONANCE_MAX_STRUCTS,
+    resonance_max_heavy_atoms: int = DEFAULT_RESONANCE_MAX_HEAVY_ATOMS,
+    resonance_max_abs_charge: int = DEFAULT_RESONANCE_MAX_ABS_CHARGE,
+) -> list[dict[str, str]]:
+    candidates, _audit = _generate_rule_candidates_with_audit(
+        smiles,
+        role,
+        resonance_max_structs=resonance_max_structs,
+        resonance_max_heavy_atoms=resonance_max_heavy_atoms,
+        resonance_max_abs_charge=resonance_max_abs_charge,
+    )
+    return candidates
 
 
 def candidate_allowed(seed_smiles: str, candidate_smiles: str, role: str) -> bool:
@@ -1500,20 +1688,6 @@ def candidate_allowed(seed_smiles: str, candidate_smiles: str, role: str) -> boo
     if role == "anion" and candidate_charge >= 0:
         return False
     return True
-
-
-def _interleave(
-    rule_candidates: Sequence[dict[str, object]],
-    similarity_candidates: Sequence[dict[str, object]],
-) -> list[dict[str, object]]:
-    interleaved: list[dict[str, object]] = []
-    longest = max(len(rule_candidates), len(similarity_candidates), 0)
-    for index in range(longest):
-        if index < len(rule_candidates):
-            interleaved.append(rule_candidates[index])
-        if index < len(similarity_candidates):
-            interleaved.append(similarity_candidates[index])
-    return interleaved
 
 
 def _round_robin_rule_candidates(
@@ -1560,9 +1734,219 @@ def _migrate_pubchem_cache(output_root: Path) -> Path:
     return cache_path
 
 
+def _augmentation_fingerprint(
+    base: pd.DataFrame,
+    *,
+    threshold: int,
+    max_records: int,
+    resonance_max_structs: int,
+    resonance_max_heavy_atoms: int,
+    resonance_max_abs_charge: int,
+) -> tuple[str, dict[str, int]]:
+    config = {
+        "cache_version": AUGMENTATION_CACHE_VERSION,
+        "pubchem_threshold": threshold,
+        "pubchem_max_records": max_records,
+        "resonance_max_structs": resonance_max_structs,
+        "resonance_max_heavy_atoms": resonance_max_heavy_atoms,
+        "resonance_max_abs_charge": resonance_max_abs_charge,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    for row in base.itertuples(index=False):
+        digest.update(
+            f"\n{row.role}\t{row.SMILES}\t{int(row.formal_charge)}".encode(
+                "utf-8"
+            )
+        )
+    return digest.hexdigest(), config
+
+
+def _open_augmentation_database(
+    path: Path,
+    *,
+    fingerprint: str,
+    config: Mapping[str, int],
+) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    stored_version = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'cache_version'"
+    ).fetchone()
+    if stored_version is not None and stored_version[0] != str(
+        AUGMENTATION_CACHE_VERSION
+    ):
+        connection.execute("DROP TABLE IF EXISTS candidates")
+        connection.execute("DROP TABLE IF EXISTS seed_status")
+        connection.execute("DELETE FROM metadata")
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS candidates (
+            seed_entity_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            seed_smiles TEXT NOT NULL,
+            candidate_smiles TEXT NOT NULL,
+            method TEXT NOT NULL,
+            pubchem_cid TEXT NOT NULL,
+            rule TEXT NOT NULL,
+            method_rank INTEGER NOT NULL,
+            seed_rank INTEGER NOT NULL,
+            PRIMARY KEY (
+                seed_entity_id,
+                candidate_smiles,
+                method,
+                rule
+            )
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS seed_status (
+            seed_entity_id TEXT PRIMARY KEY,
+            role TEXT NOT NULL,
+            seed_smiles TEXT NOT NULL,
+            local_status TEXT NOT NULL DEFAULT 'pending',
+            pubchem_status TEXT NOT NULL DEFAULT 'pending',
+            pubchem_error TEXT NOT NULL DEFAULT '',
+            heavy_atom_count INTEGER,
+            formal_charge INTEGER,
+            resonance_status TEXT NOT NULL DEFAULT 'pending',
+            resonance_skip_reason TEXT NOT NULL DEFAULT '',
+            resonance_examined INTEGER NOT NULL DEFAULT 0,
+            resonance_generated INTEGER NOT NULL DEFAULT 0,
+            resonance_truncated INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    stored_fingerprint = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'fingerprint'"
+    ).fetchone()
+    if stored_fingerprint is not None and stored_fingerprint[0] != fingerprint:
+        connection.execute("DELETE FROM candidates")
+        connection.execute("DELETE FROM seed_status")
+    connection.executemany(
+        """
+        INSERT INTO metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (
+            ("cache_version", str(AUGMENTATION_CACHE_VERSION)),
+            ("fingerprint", fingerprint),
+            (
+                "config",
+                json.dumps(
+                    dict(config),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        ),
+    )
+    connection.commit()
+    return connection
+
+
+def _replace_seed_candidates(
+    connection: sqlite3.Connection,
+    *,
+    seed_identifier: str,
+    role: str,
+    seed_smiles: str,
+    method: str,
+    candidates: Sequence[Mapping[str, object]],
+) -> None:
+    connection.execute(
+        "DELETE FROM candidates WHERE seed_entity_id = ? AND method = ?",
+        (seed_identifier, method),
+    )
+    method_offset = 0 if method == "rule" else 1
+    connection.executemany(
+        """
+        INSERT INTO candidates(
+            seed_entity_id,
+            role,
+            seed_smiles,
+            candidate_smiles,
+            method,
+            pubchem_cid,
+            rule,
+            method_rank,
+            seed_rank
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                seed_identifier,
+                role,
+                seed_smiles,
+                str(candidate["candidate_smiles"]),
+                method,
+                str(candidate.get("pubchem_cid", "")),
+                str(candidate.get("rule", "")),
+                int(candidate["method_rank"]),
+                2 * int(candidate["method_rank"]) + method_offset,
+            )
+            for candidate in candidates
+        ),
+    )
+
+
+def _augmentation_audit_frames(
+    connection: sqlite3.Connection,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    failures = pd.read_sql_query(
+        """
+        SELECT role, seed_smiles, pubchem_error AS error
+        FROM seed_status
+        WHERE pubchem_status = 'failed'
+        ORDER BY role, seed_smiles
+        """,
+        connection,
+    )
+    resonance = pd.read_sql_query(
+        """
+        SELECT
+            role,
+            seed_smiles,
+            heavy_atom_count,
+            formal_charge,
+            resonance_status,
+            resonance_skip_reason AS reason,
+            resonance_examined,
+            resonance_generated,
+            resonance_truncated
+        FROM seed_status
+        WHERE resonance_status IN ('skipped', 'truncated')
+        ORDER BY role, seed_smiles
+        """,
+        connection,
+    )
+    return failures, resonance
+
+
 def _write_stage1_entity_files(
     stage1_root: Path,
     combined: pd.DataFrame,
+    *,
+    summary: Mapping[str, object] | None = None,
+    failures: pd.DataFrame | None = None,
+    resonance_audit: pd.DataFrame | None = None,
 ) -> None:
     il_path = stage1_root / "IL.csv"
     if not il_path.exists():
@@ -1587,6 +1971,33 @@ def _write_stage1_entity_files(
                 index=False,
                 lineterminator="\n",
             )
+        if summary is not None:
+            audit_root = staged_stage1 / "_audit"
+            audit_root.mkdir()
+            (audit_root / "augmentation_summary.json").write_text(
+                json.dumps(
+                    dict(summary),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (failures if failures is not None else pd.DataFrame()).to_csv(
+                audit_root / "pubchem_failures.csv",
+                index=False,
+                lineterminator="\n",
+            )
+            (
+                resonance_audit
+                if resonance_audit is not None
+                else pd.DataFrame()
+            ).to_csv(
+                audit_root / "resonance_skips.csv",
+                index=False,
+                lineterminator="\n",
+            )
         replace_directory(staged_stage1, stage1_root)
 
 
@@ -1598,17 +2009,30 @@ def augment_pretraining_entities(
     max_records: int = 100,
     offline: bool = False,
     rate_limit: float = 4.0,
+    resonance_max_structs: int = DEFAULT_RESONANCE_MAX_STRUCTS,
+    resonance_max_heavy_atoms: int = DEFAULT_RESONANCE_MAX_HEAVY_ATOMS,
+    resonance_max_abs_charge: int = DEFAULT_RESONANCE_MAX_ABS_CHARGE,
     client: PubChemClient | None = None,
 ) -> pd.DataFrame:
     """Augment entities using PubChem similarity and local chemistry rules."""
+    if resonance_max_structs <= 0:
+        raise TrainingSplitError("resonance_max_structs must be positive")
+    if resonance_max_heavy_atoms <= 0:
+        raise TrainingSplitError(
+            "resonance_max_heavy_atoms must be positive"
+        )
+    if resonance_max_abs_charge < 0:
+        raise TrainingSplitError(
+            "resonance_max_abs_charge cannot be negative"
+        )
+
     output_root = Path(output_root)
     stage1_root = output_root / "stage1"
     existing = _combined_entity_frame(stage1_root)
     original_mask = existing["origin_list"].map(
         lambda value: "dataset" in _split_joined(value)
     )
-    base = existing.loc[original_mask].copy()
-    base = base.sort_values(["role", "SMILES"], kind="stable").reset_index(drop=True)
+    base = _normalize_base_entity_roles(existing.loc[original_mask].copy())
     if len(base) > pretrain_cap:
         raise TrainingSplitError(
             f"Base pretraining corpus has {len(base)} entities, exceeding cap "
@@ -1619,48 +2043,199 @@ def augment_pretraining_entities(
         _write_stage1_entity_files(stage1_root, base)
         return base
 
+    fingerprint, config = _augmentation_fingerprint(
+        base,
+        threshold=threshold,
+        max_records=max_records,
+        resonance_max_structs=resonance_max_structs,
+        resonance_max_heavy_atoms=resonance_max_heavy_atoms,
+        resonance_max_abs_charge=resonance_max_abs_charge,
+    )
+    candidate_database = _open_augmentation_database(
+        output_root / ".cache" / "stage1_augmentation.sqlite",
+        fingerprint=fingerprint,
+        config=config,
+    )
     owns_client = client is None
     active_client = client or PubChemClient(
         _migrate_pubchem_cache(output_root),
         offline=offline,
         rate_limit=rate_limit,
     )
-    incomplete: list[str] = []
-    resonance_generated = 0
+    previous_sigterm: object | None = None
+
+    def interrupt_for_sigterm(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
 
     try:
-        with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
-            temporary_root = Path(temporary_dir)
-            candidate_database = sqlite3.connect(temporary_root / "candidates.sqlite")
+        previous_sigterm = signal.signal(
+            signal.SIGTERM,
+            interrupt_for_sigterm,
+        )
+    except ValueError:
+        previous_sigterm = None
+
+    try:
+        total_seeds = len(base)
+        for processed, seed in enumerate(
+            base.itertuples(index=False),
+            start=1,
+        ):
+            seed_smiles = canonicalize_smiles(str(seed.SMILES))
+            role = str(seed.role)
+            seed_identifier = entity_id(role, seed_smiles)
             candidate_database.execute(
                 """
-                CREATE TABLE candidates (
-                    seed_entity_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    seed_smiles TEXT NOT NULL,
-                    candidate_smiles TEXT NOT NULL,
-                    method TEXT NOT NULL,
-                    pubchem_cid TEXT,
-                    rule TEXT,
-                    method_rank INTEGER NOT NULL,
-                    seed_rank INTEGER NOT NULL,
-                    PRIMARY KEY (
-                        seed_entity_id,
-                        candidate_smiles,
-                        method,
-                        rule
+                INSERT OR IGNORE INTO seed_status(
+                    seed_entity_id,
+                    role,
+                    seed_smiles
+                ) VALUES (?, ?, ?)
+                """,
+                (seed_identifier, role, seed_smiles),
+            )
+            local_status, pubchem_status = candidate_database.execute(
+                """
+                SELECT local_status, pubchem_status
+                FROM seed_status
+                WHERE seed_entity_id = ?
+                """,
+                (seed_identifier,),
+            ).fetchone()
+
+            if fragment_count(seed_smiles) != 1:
+                molecule = Chem.MolFromSmiles(seed_smiles)
+                heavy_atoms = (
+                    molecule.GetNumHeavyAtoms()
+                    if molecule is not None
+                    else 0
+                )
+                candidate_database.execute(
+                    """
+                    UPDATE seed_status
+                    SET
+                        local_status = 'resonance_skipped',
+                        pubchem_status = 'skipped',
+                        pubchem_error = '',
+                        heavy_atom_count = ?,
+                        formal_charge = ?,
+                        resonance_status = 'skipped',
+                        resonance_skip_reason = 'multiple_fragments'
+                    WHERE seed_entity_id = ?
+                    """,
+                    (
+                        heavy_atoms,
+                        formal_charge(seed_smiles),
+                        seed_identifier,
+                    ),
+                )
+                candidate_database.commit()
+                continue
+
+            if local_status not in {"complete", "resonance_skipped"}:
+                eligibility = resonance_eligibility(
+                    seed_smiles,
+                    resonance_max_heavy_atoms,
+                    resonance_max_abs_charge,
+                )
+                if not eligibility.eligible:
+                    candidate_database.execute(
+                        """
+                        UPDATE seed_status
+                        SET
+                            heavy_atom_count = ?,
+                            formal_charge = ?,
+                            resonance_status = 'skipped',
+                            resonance_skip_reason = ?
+                        WHERE seed_entity_id = ?
+                        """,
+                        (
+                            eligibility.heavy_atom_count,
+                            eligibility.formal_charge,
+                            eligibility.reason,
+                            seed_identifier,
+                        ),
+                    )
+                    candidate_database.commit()
+
+                generated_rows, resonance_audit = (
+                    _generate_rule_candidates_with_audit(
+                        seed_smiles,
+                        role,
+                        resonance_max_structs=resonance_max_structs,
+                        resonance_max_heavy_atoms=(
+                            resonance_max_heavy_atoms
+                        ),
+                        resonance_max_abs_charge=(
+                            resonance_max_abs_charge
+                        ),
                     )
                 )
-                """
-            )
+                local_rules: list[dict[str, object]] = []
+                for generated in generated_rows:
+                    generated_smiles = generated["SMILES"]
+                    if not candidate_allowed(
+                        seed_smiles,
+                        generated_smiles,
+                        role,
+                    ):
+                        continue
+                    local_rules.append(
+                        {
+                            "candidate_smiles": generated_smiles,
+                            "pubchem_cid": "",
+                            "rule": generated["rule"],
+                            "family": generated["family"],
+                        }
+                    )
+                ordered_rules = _round_robin_rule_candidates(
+                    local_rules,
+                    seed_identifier,
+                )
+                for rank, candidate in enumerate(ordered_rules):
+                    candidate["method_rank"] = rank
+                _replace_seed_candidates(
+                    candidate_database,
+                    seed_identifier=seed_identifier,
+                    role=role,
+                    seed_smiles=seed_smiles,
+                    method="rule",
+                    candidates=ordered_rules,
+                )
+                local_status = (
+                    "resonance_skipped"
+                    if resonance_audit["resonance_status"] == "skipped"
+                    else "complete"
+                )
+                candidate_database.execute(
+                    """
+                    UPDATE seed_status
+                    SET
+                        local_status = ?,
+                        heavy_atom_count = ?,
+                        formal_charge = ?,
+                        resonance_status = ?,
+                        resonance_skip_reason = ?,
+                        resonance_examined = ?,
+                        resonance_generated = ?,
+                        resonance_truncated = ?
+                    WHERE seed_entity_id = ?
+                    """,
+                    (
+                        local_status,
+                        resonance_audit["heavy_atom_count"],
+                        resonance_audit["formal_charge"],
+                        resonance_audit["resonance_status"],
+                        resonance_audit["resonance_skip_reason"],
+                        resonance_audit["resonance_examined"],
+                        resonance_audit["resonance_generated"],
+                        int(resonance_audit["resonance_truncated"]),
+                        seed_identifier,
+                    ),
+                )
+                candidate_database.commit()
 
-            for seed in base.itertuples(index=False):
-                seed_smiles = canonicalize_smiles(str(seed.SMILES))
-                role = str(seed.role)
-                seed_identifier = entity_id(role, seed_smiles)
-                if fragment_count(seed_smiles) != 1:
-                    continue
-
+            if pubchem_status != "ok":
                 similarity_candidates: list[dict[str, object]] = []
                 try:
                     records = active_client.similarity(
@@ -1669,245 +2244,317 @@ def augment_pretraining_entities(
                         max_records=max_records,
                     )
                 except IncompletePubChemQuery as exc:
-                    incomplete.append(str(exc))
-                    records = []
-                seen_similarity: set[str] = set()
-                for rank, record in enumerate(records):
-                    raw_candidate = smiles_from_pubchem_record(record)
-                    if raw_candidate is None:
-                        continue
-                    try:
-                        candidate = canonicalize_smiles(raw_candidate)
-                    except TrainingSplitError:
-                        continue
-                    if (
-                        candidate in seen_similarity
-                        or not candidate_allowed(seed_smiles, candidate, role)
-                    ):
-                        continue
-                    seen_similarity.add(candidate)
-                    similarity_candidates.append(
-                        {
-                            "candidate_smiles": candidate,
-                            "method": "pubchem_similarity",
-                            "pubchem_cid": str(record.get("CID", "")),
-                            "rule": "",
-                            "method_rank": rank,
-                        }
-                    )
-
-                local_rules: list[dict[str, object]] = []
-                for generated in generate_rule_candidates(
-                    seed_smiles,
-                    role,
-                    resonance_max_structs=remaining + 1,
-                ):
-                    generated_smiles = generated["SMILES"]
-                    if not candidate_allowed(seed_smiles, generated_smiles, role):
-                        continue
-                    if generated["rule"] == "resonance_equivalent":
-                        resonance_generated += 1
-                    local_rules.append(
-                        {
-                            "candidate_smiles": generated_smiles,
-                            "method": "rule",
-                            "pubchem_cid": "",
-                            "rule": generated["rule"],
-                            "family": generated["family"],
-                        }
-                    )
-
-                ordered_rules = _round_robin_rule_candidates(
-                    local_rules,
-                    seed_identifier,
-                )
-                for rank, candidate in enumerate(ordered_rules):
-                    candidate["method_rank"] = rank
-                ordered = _interleave(ordered_rules, similarity_candidates)
-                for seed_rank, candidate in enumerate(ordered):
                     candidate_database.execute(
                         """
-                        INSERT OR IGNORE INTO candidates(
-                            seed_entity_id,
-                            role,
-                            seed_smiles,
-                            candidate_smiles,
-                            method,
-                            pubchem_cid,
-                            rule,
-                            method_rank,
-                            seed_rank
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        UPDATE seed_status
+                        SET
+                            pubchem_status = 'failed',
+                            pubchem_error = ?
+                        WHERE seed_entity_id = ?
                         """,
-                        (
-                            seed_identifier,
-                            role,
-                            seed_smiles,
-                            candidate["candidate_smiles"],
-                            candidate["method"],
-                            candidate["pubchem_cid"],
-                            candidate["rule"],
-                            candidate["method_rank"],
-                            seed_rank,
-                        ),
+                        (str(exc), seed_identifier),
                     )
-                candidate_database.commit()
+                    candidate_database.commit()
+                    if offline:
+                        raise IncompletePubChemQuery(
+                            "offline PubChem cache is incomplete for "
+                            f"{seed_smiles}: {exc}"
+                        ) from exc
+                    records = None
+                seen_similarity: set[str] = set()
+                if records is not None:
+                    for rank, record in enumerate(records):
+                        raw_candidate = smiles_from_pubchem_record(record)
+                        if raw_candidate is None:
+                            continue
+                        try:
+                            candidate = canonicalize_smiles(raw_candidate)
+                        except TrainingSplitError:
+                            continue
+                        if (
+                            candidate in seen_similarity
+                            or not candidate_allowed(
+                                seed_smiles,
+                                candidate,
+                                role,
+                            )
+                        ):
+                            continue
+                        seen_similarity.add(candidate)
+                        similarity_candidates.append(
+                            {
+                                "candidate_smiles": candidate,
+                                "pubchem_cid": str(record.get("CID", "")),
+                                "rule": "",
+                                "method_rank": rank,
+                            }
+                        )
+                    _replace_seed_candidates(
+                        candidate_database,
+                        seed_identifier=seed_identifier,
+                        role=role,
+                        seed_smiles=seed_smiles,
+                        method="pubchem_similarity",
+                        candidates=similarity_candidates,
+                    )
+                    candidate_database.execute(
+                        """
+                        UPDATE seed_status
+                        SET
+                            pubchem_status = 'ok',
+                            pubchem_error = ''
+                        WHERE seed_entity_id = ?
+                        """,
+                        (seed_identifier,),
+                    )
+                    candidate_database.commit()
 
-            if incomplete:
-                candidate_database.close()
-                examples = "; ".join(sorted(set(incomplete))[:3])
-                raise IncompletePubChemQuery(
-                    f"{len(incomplete)} PubChem requests are incomplete; "
-                    f"rerun to resume. Examples: {examples}"
+            if processed % 100 == 0 or processed == total_seeds:
+                candidate_count = candidate_database.execute(
+                    "SELECT COUNT(*) FROM candidates"
+                ).fetchone()[0]
+                status_counts = dict(
+                    candidate_database.execute(
+                        """
+                        SELECT pubchem_status, COUNT(*)
+                        FROM seed_status
+                        GROUP BY pubchem_status
+                        """
+                    )
+                )
+                resonance_counts = dict(
+                    candidate_database.execute(
+                        """
+                        SELECT resonance_status, COUNT(*)
+                        FROM seed_status
+                        GROUP BY resonance_status
+                        """
+                    )
+                )
+                print(
+                    "Stage1 augmentation: "
+                    f"{processed:,}/{total_seeds:,} "
+                    f"role={role} candidates={candidate_count:,} "
+                    f"pubchem_ok={status_counts.get('ok', 0):,} "
+                    f"pubchem_failed={status_counts.get('failed', 0):,} "
+                    f"resonance_skipped="
+                    f"{resonance_counts.get('skipped', 0):,} "
+                    f"resonance_truncated="
+                    f"{resonance_counts.get('truncated', 0):,}",
+                    flush=True,
                 )
 
-            base_keys = {
-                (str(row.role), canonicalize_smiles(str(row.SMILES)))
-                for row in base.itertuples(index=False)
+        base_keys = {
+            (str(row.role), canonicalize_smiles(str(row.SMILES)))
+            for row in base.itertuples(index=False)
+        }
+        selected: dict[tuple[str, str], dict[str, object]] = {}
+        cursor = candidate_database.execute(
+            """
+            SELECT role, candidate_smiles
+            FROM candidates
+            ORDER BY seed_rank, seed_entity_id, method, candidate_smiles
+            """
+        )
+        for role, candidate_smiles in cursor:
+            key = (role, candidate_smiles)
+            if key in base_keys or key in selected:
+                continue
+            selected[key] = {
+                "role": role,
+                "SMILES": candidate_smiles,
+                "formal_charge": formal_charge(candidate_smiles),
+                "origin_list": set(),
+                "seed_smiles_list": set(),
+                "rule_list": set(),
+                "pubchem_cid_list": set(),
+                "mol_id_list": set(),
             }
-            selected: dict[tuple[str, str], dict[str, object]] = {}
-            cursor = candidate_database.execute(
-                """
-                SELECT role, candidate_smiles
-                FROM candidates
-                ORDER BY seed_rank, seed_entity_id, method, candidate_smiles
-                """
-            )
-            for role, candidate_smiles in cursor:
-                key = (role, candidate_smiles)
-                if key in base_keys or key in selected:
-                    continue
-                selected[key] = {
-                    "role": role,
-                    "SMILES": candidate_smiles,
-                    "formal_charge": formal_charge(candidate_smiles),
-                    "origin_list": set(),
-                    "seed_smiles_list": set(),
-                    "rule_list": set(),
-                    "pubchem_cid_list": set(),
-                    "mol_id_list": set(),
-                }
-                if len(selected) >= remaining:
-                    break
+            if len(selected) >= remaining:
+                break
 
+        candidate_database.execute("DROP TABLE IF EXISTS temp.selected")
+        candidate_database.execute(
+            """
+            CREATE TEMP TABLE selected (
+                role TEXT NOT NULL,
+                candidate_smiles TEXT NOT NULL,
+                PRIMARY KEY(role, candidate_smiles)
+            )
+            """
+        )
+        candidate_database.executemany(
+            "INSERT INTO selected(role, candidate_smiles) VALUES (?, ?)",
+            selected,
+        )
+        for row in candidate_database.execute(
+            """
+            SELECT
+                c.seed_entity_id,
+                c.role,
+                c.seed_smiles,
+                c.candidate_smiles,
+                c.method,
+                c.pubchem_cid,
+                c.rule,
+                c.method_rank
+            FROM candidates c
+            INNER JOIN selected s
+                ON c.role = s.role
+                AND c.candidate_smiles = s.candidate_smiles
+            ORDER BY
+                c.role,
+                c.candidate_smiles,
+                c.seed_entity_id,
+                c.method,
+                c.rule
+            """
+        ):
+            (
+                _seed_entity_identifier,
+                role,
+                seed_smiles,
+                candidate_smiles,
+                method,
+                pubchem_cid,
+                rule,
+                _method_rank,
+            ) = row
+            record = selected[(role, candidate_smiles)]
+            origins = record["origin_list"]
+            seeds = record["seed_smiles_list"]
+            pubchem_cids = record["pubchem_cid_list"]
+            rules = record["rule_list"]
+            if isinstance(origins, set):
+                if method == "rule":
+                    origins.add("rule")
+                elif method == "pubchem_similarity":
+                    origins.add("pubchem")
+            if isinstance(seeds, set):
+                seeds.add(seed_smiles)
+            if isinstance(pubchem_cids, set) and str(pubchem_cid).strip():
+                pubchem_cids.add(str(pubchem_cid).strip())
+            if isinstance(rules, set) and str(rule).strip():
+                rules.add(str(rule).strip())
+
+        all_rows: list[dict[str, object]] = []
+        for row in base.to_dict(orient="records"):
+            all_rows.append(
+                {
+                    "role": str(row["role"]),
+                    "SMILES": canonicalize_smiles(str(row["SMILES"])),
+                    "formal_charge": int(row["formal_charge"]),
+                    "origin_list": _split_joined(row["origin_list"]),
+                    "seed_smiles_list": _split_joined(
+                        row["seed_smiles_list"]
+                    ),
+                    "rule_list": _split_joined(row["rule_list"]),
+                    "pubchem_cid_list": _split_joined(
+                        row["pubchem_cid_list"]
+                    ),
+                    "mol_id_list": _split_joined(row["mol_id_list"]),
+                }
+            )
+        all_rows.extend(selected.values())
+        augmented = pd.DataFrame(
+            [
+                {
+                    "role": row["role"],
+                    **_entity_output_frame([row]).iloc[0].to_dict(),
+                }
+                for row in sorted(
+                    all_rows,
+                    key=lambda item: (
+                        str(item["role"]),
+                        str(item["SMILES"]),
+                    ),
+                )
+            ],
+            columns=["role", *PRETRAIN_ENTITY_COLUMNS],
+        )
+
+        failures, resonance_audit = _augmentation_audit_frames(
+            candidate_database
+        )
+        pubchem_ok = candidate_database.execute(
+            """
+            SELECT COUNT(*) FROM seed_status
+            WHERE pubchem_status = 'ok'
+            """
+        ).fetchone()[0]
+        resonance_generated = candidate_database.execute(
+            """
+            SELECT COALESCE(SUM(resonance_generated), 0)
+            FROM seed_status
+            """
+        ).fetchone()[0]
+        resonance_selected = sum(
+            "resonance_equivalent" in record["rule_list"]
+            for record in selected.values()
+            if isinstance(record["rule_list"], set)
+        )
+        method_counts = dict(
             candidate_database.execute(
                 """
-                CREATE TABLE selected (
-                    role TEXT NOT NULL,
-                    candidate_smiles TEXT NOT NULL,
-                    PRIMARY KEY(role, candidate_smiles)
-                )
+                SELECT method, COUNT(*)
+                FROM candidates
+                GROUP BY method
                 """
             )
-            candidate_database.executemany(
-                "INSERT INTO selected(role, candidate_smiles) VALUES (?, ?)",
-                selected,
-            )
-            for row in candidate_database.execute(
-                """
-                SELECT
-                    c.seed_entity_id,
-                    c.role,
-                    c.seed_smiles,
-                    c.candidate_smiles,
-                    c.method,
-                    c.pubchem_cid,
-                    c.rule,
-                    c.method_rank
-                FROM candidates c
-                INNER JOIN selected s
-                    ON c.role = s.role
-                    AND c.candidate_smiles = s.candidate_smiles
-                ORDER BY
-                    c.role,
-                    c.candidate_smiles,
-                    c.seed_entity_id,
-                    c.method,
-                    c.rule
-                """
-            ):
-                (
-                    seed_entity_identifier,
-                    role,
-                    seed_smiles,
-                    candidate_smiles,
-                    method,
-                    pubchem_cid,
-                    rule,
-                    _method_rank,
-                ) = row
-                record = selected[(role, candidate_smiles)]
-                origins = record["origin_list"]
-                seeds = record["seed_smiles_list"]
-                pubchem_cids = record["pubchem_cid_list"]
-                rules = record["rule_list"]
-                if isinstance(origins, set):
-                    if method == "rule":
-                        origins.add("rule")
-                    elif method == "pubchem_similarity":
-                        origins.add("pubchem")
-                if isinstance(seeds, set):
-                    seeds.add(seed_smiles)
-                if (
-                    isinstance(pubchem_cids, set)
-                    and str(pubchem_cid).strip()
-                ):
-                    pubchem_cids.add(str(pubchem_cid).strip())
-                if isinstance(rules, set) and str(rule).strip():
-                    rules.add(str(rule).strip())
-            candidate_database.close()
-
-            all_rows: list[dict[str, object]] = []
-            for row in base.to_dict(orient="records"):
-                all_rows.append(
-                    {
-                        "role": str(row["role"]),
-                        "SMILES": canonicalize_smiles(str(row["SMILES"])),
-                        "formal_charge": int(row["formal_charge"]),
-                        "origin_list": _split_joined(row["origin_list"]),
-                        "seed_smiles_list": _split_joined(
-                            row["seed_smiles_list"]
-                        ),
-                        "rule_list": _split_joined(row["rule_list"]),
-                        "pubchem_cid_list": _split_joined(
-                            row["pubchem_cid_list"]
-                        ),
-                        "mol_id_list": _split_joined(row["mol_id_list"]),
-                    }
-                )
-            all_rows.extend(selected.values())
-            resonance_selected = sum(
-                "resonance_equivalent"
-                in record["rule_list"]
-                for record in selected.values()
-                if isinstance(record["rule_list"], set)
-            )
-            augmented = pd.DataFrame(
-                [
-                    {
-                        "role": row["role"],
-                        **_entity_output_frame([row]).iloc[0].to_dict(),
-                    }
-                    for row in sorted(
-                        all_rows,
-                        key=lambda item: (
-                            str(item["role"]),
-                            str(item["SMILES"]),
-                        ),
-                    )
-                ],
-                columns=["role", *PRETRAIN_ENTITY_COLUMNS],
-            )
-            _write_stage1_entity_files(stage1_root, augmented)
-            print(
-                "Resonance augmentation: "
-                f"generated={resonance_generated:,} "
-                f"selected={resonance_selected:,} "
-                f"not_selected={max(0, resonance_generated - resonance_selected):,}"
-            )
+        )
+        summary = {
+            "base_entities": len(base),
+            "completion_status": (
+                "partial_pubchem" if not failures.empty else "complete"
+            ),
+            "config": config,
+            "final_entities": len(augmented),
+            "local_rule_candidates": method_counts.get("rule", 0),
+            "pretrain_cap": pretrain_cap,
+            "pubchem_candidates": method_counts.get(
+                "pubchem_similarity",
+                0,
+            ),
+            "pubchem_failed_seeds": len(failures),
+            "pubchem_ok_seeds": pubchem_ok,
+            "resonance_generated": resonance_generated,
+            "resonance_selected": resonance_selected,
+            "resonance_skipped_seeds": int(
+                resonance_audit["resonance_status"]
+                .eq("skipped")
+                .sum()
+            ),
+            "resonance_truncated_seeds": int(
+                resonance_audit["resonance_status"]
+                .eq("truncated")
+                .sum()
+            ),
+            "selected_candidates": len(selected),
+        }
+        _write_stage1_entity_files(
+            stage1_root,
+            augmented,
+            summary=summary,
+            failures=failures,
+            resonance_audit=resonance_audit,
+        )
+        print(
+            "Stage1 augmentation complete: "
+            f"status={summary['completion_status']} "
+            f"entities={len(augmented):,} "
+            f"pubchem_failed={len(failures):,} "
+            f"resonance_skipped="
+            f"{summary['resonance_skipped_seeds']:,} "
+            f"resonance_truncated="
+            f"{summary['resonance_truncated_seeds']:,}",
+            flush=True,
+        )
     finally:
+        candidate_database.close()
         if owns_client:
             active_client.close()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
     (output_root / "manifest.json").unlink(missing_ok=True)
     return augmented
@@ -2861,6 +3508,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pubchem-threshold", type=int, default=90)
     parser.add_argument("--pubchem-max-records", type=int, default=100)
     parser.add_argument("--pubchem-rate", type=float, default=4.0)
+    parser.add_argument(
+        "--resonance-max-structs",
+        type=int,
+        default=DEFAULT_RESONANCE_MAX_STRUCTS,
+    )
+    parser.add_argument(
+        "--resonance-max-heavy-atoms",
+        type=int,
+        default=DEFAULT_RESONANCE_MAX_HEAVY_ATOMS,
+    )
+    parser.add_argument(
+        "--resonance-max-abs-charge",
+        type=int,
+        default=DEFAULT_RESONANCE_MAX_ABS_CHARGE,
+    )
     return parser.parse_args()
 
 
@@ -2873,6 +3535,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise TrainingSplitError("--pubchem-max-records must be positive")
     if args.pubchem_rate < 0:
         raise TrainingSplitError("--pubchem-rate cannot be negative")
+    if args.resonance_max_structs <= 0:
+        raise TrainingSplitError("--resonance-max-structs must be positive")
+    if args.resonance_max_heavy_atoms <= 0:
+        raise TrainingSplitError(
+            "--resonance-max-heavy-atoms must be positive"
+        )
+    if args.resonance_max_abs_charge < 0:
+        raise TrainingSplitError(
+            "--resonance-max-abs-charge cannot be negative"
+        )
 
 
 def main() -> None:
@@ -2893,6 +3565,9 @@ def main() -> None:
             max_records=args.pubchem_max_records,
             offline=args.offline,
             rate_limit=args.pubchem_rate,
+            resonance_max_structs=args.resonance_max_structs,
+            resonance_max_heavy_atoms=args.resonance_max_heavy_atoms,
+            resonance_max_abs_charge=args.resonance_max_abs_charge,
         )
         print(f"Prepared {len(augmented):,} pretraining entities")
     if args.command in {"build-splits", "all"}:
