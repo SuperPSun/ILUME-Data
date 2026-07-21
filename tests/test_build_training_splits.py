@@ -126,6 +126,7 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
                 "cation": "[Na+].[K+]",
                 "anion": "[Cl-].[Br-]",
                 "solute": "CCO",
+                "mol_id": "solute_id",
                 "temperature_K": 298.15,
                 "solvation_kcal/mol": -2.0,
                 "source_list": "test",
@@ -145,6 +146,7 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
         [
             {
                 "SMILES": "OCC",
+                "mol_id": "simulation_id",
                 "value": 1.0,
                 "source_list": "test",
             },
@@ -167,18 +169,15 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
     structure_path.write_text("not a molecule", encoding="utf-8")
 
     output_root = tmp_path / "training"
-    entities = extract_pretraining_entities(
-        final_root,
-        output_root,
-        pretrain_cap=100,
+    stale_augmentation = output_root / "stage1" / "augmentation"
+    stale_augmentation.mkdir(parents=True)
+    (stale_augmentation / "stale.txt").write_text(
+        "stale\n",
+        encoding="utf-8",
     )
+    entities = extract_pretraining_entities(final_root, output_root)
 
-    assert set(entities["role"]) == {
-        "cation",
-        "anion",
-        "solute",
-        "molecule",
-    }
+    assert set(entities["role"]) == {"cation", "anion", "molecule"}
     assert set(entities.loc[entities["role"].eq("cation"), "SMILES"]) == {
         "C[NH3+]",
         "[K+]",
@@ -190,7 +189,8 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
         "[Cl-]",
     }
     ethanol = entities[entities["SMILES"].eq("CCO")]
-    assert set(ethanol["role"]) == {"solute", "molecule"}
+    assert ethanol["role"].tolist() == ["molecule"]
+    assert ethanol.iloc[0]["mol_id_list"] == "simulation_id;solute_id"
     acetate = entities[entities["SMILES"].eq("CC(=O)[O-]")]
     assert set(acetate["role"]) == {"anion"}
     assert acetate.iloc[0]["mol_id_list"] == "negative_molecule"
@@ -209,6 +209,7 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
         "solute.csv",
         "solvent.csv",
         "molecule.csv",
+        "simulation_mol.csv",
     }
     il = pd.read_csv(output_root / "stage1" / "IL.csv")
     assert list(il.columns) == ["cation", "anion"]
@@ -220,9 +221,36 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
     ]
     molecule = pd.read_csv(output_root / "stage1" / "molecule.csv")
     assert list(molecule.columns) == PRETRAIN_ENTITY_COLUMNS
+    assert molecule["SMILES"].tolist() == ["CCO"]
+    assert molecule.loc[0, "mol_id_list"] == "simulation_id;solute_id"
     assert molecule.loc[0, "origin_list"] == "dataset"
+    simulation_mol = pd.read_csv(
+        output_root / "stage1" / "simulation_mol.csv"
+    )
+    assert simulation_mol["SMILES"].tolist() == ["CCO"]
+    assert simulation_mol.loc[0, "mol_id_list"] == "simulation_id"
+    solute = pd.read_csv(output_root / "stage1" / "solute.csv")
+    assert solute["SMILES"].tolist() == ["CCO"]
+    assert solute.loc[0, "mol_id_list"] == "solute_id"
+    for filename in (
+        "anion.csv",
+        "cation.csv",
+        "molecule.csv",
+        "simulation_mol.csv",
+        "solute.csv",
+        "solvent.csv",
+    ):
+        frame = pd.read_csv(
+            output_root / "stage1" / filename,
+            keep_default_na=False,
+        )
+        assert set(frame["origin_list"]) <= {"dataset"}
+        assert not frame[
+            ["seed_smiles_list", "rule_list", "pubchem_cid_list"]
+        ].astype(bool).any(axis=None)
     assert not (output_root / "stage1" / "entities.csv").exists()
     assert not (output_root / "stage1" / "entity_sources.csv").exists()
+    assert not (output_root / "stage1" / "augmentation").exists()
     assert structure_path.exists()
 
 
@@ -608,6 +636,33 @@ class FakePubChemClient:
         raise AssertionError("local rules must not call PubChem identity")
 
 
+class AllCandidatePubChemClient:
+    def similarity(
+        self,
+        smiles: str,
+        *,
+        threshold: int,
+        max_records: int,
+    ) -> list[dict[str, object]]:
+        assert threshold == 90
+        assert max_records == 100
+        canonical = canonicalize_smiles(smiles)
+        if canonical == "CCF":
+            return [
+                {"CID": 1, "SMILES": "CCF", "Charge": 0},
+                {"CID": 2, "SMILES": "CCO", "Charge": 0},
+                {"CID": 3, "SMILES": "CCBr", "Charge": 0},
+                {"CID": 4, "SMILES": "CCC", "Charge": 0},
+            ]
+        assert canonical == "CCO"
+        return [
+            {"CID": 5, "SMILES": "CCO", "Charge": 0},
+            {"CID": 6, "SMILES": "CCF", "Charge": 0},
+            {"CID": 7, "SMILES": "CO", "Charge": 0},
+            {"CID": 8, "SMILES": "CN", "Charge": 0},
+        ]
+
+
 class EmptyPubChemClient:
     def similarity(
         self,
@@ -654,7 +709,13 @@ def write_stage1_molecules(
         stage1 / "IL.csv",
         index=False,
     )
-    for role in ("anion", "cation", "solute", "solvent"):
+    for role in (
+        "anion",
+        "cation",
+        "simulation_mol",
+        "solute",
+        "solvent",
+    ):
         pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
             stage1 / f"{role}.csv",
             index=False,
@@ -675,6 +736,23 @@ def write_stage1_molecules(
         columns=PRETRAIN_ENTITY_COLUMNS,
     ).to_csv(stage1 / "molecule.csv", index=False)
     return (stage1 / "molecule.csv").read_bytes()
+
+
+def write_existing_augmentation(output_root: Path) -> dict[Path, bytes]:
+    augmentation = output_root / "stage1" / "augmentation"
+    augmentation.mkdir()
+    for role in ("anion", "cation", "molecule"):
+        pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
+            augmentation / f"{role}.csv",
+            index=False,
+        )
+    marker = augmentation / "marker.txt"
+    marker.write_text("previous augmentation\n", encoding="utf-8")
+    return {
+        path: path.read_bytes()
+        for path in augmentation.iterdir()
+        if path.is_file()
+    }
 
 
 def test_resonance_eligibility_has_conservative_boundaries():
@@ -781,12 +859,15 @@ def test_partial_pubchem_failure_writes_output_and_resumes_only_failure(
 
     first = augment_pretraining_entities(
         output_root,
-        pretrain_cap=100,
         client=first_client,
     )
 
-    assert set(first["SMILES"]) == {"CCF", "CCO", "CCCl"}
-    audit_root = output_root / "stage1" / "_audit"
+    assert first["augmentation_entities"] == 1
+    molecule_path = (
+        output_root / "stage1" / "augmentation" / "molecule.csv"
+    )
+    assert pd.read_csv(molecule_path)["SMILES"].tolist() == ["CCCl"]
+    audit_root = output_root / "stage1" / "augmentation" / "_audit"
     summary = json.loads(
         (audit_root / "augmentation_summary.json").read_text()
     )
@@ -805,12 +886,12 @@ def test_partial_pubchem_failure_writes_output_and_resumes_only_failure(
     second_client = RecoveringPubChemClient()
     second = augment_pretraining_entities(
         output_root,
-        pretrain_cap=100,
         client=second_client,
     )
 
     assert second_client.calls == ["CCO"]
-    assert set(second["SMILES"]) == {"CCF", "CCO", "CCCl", "CO"}
+    assert second["augmentation_entities"] == 2
+    assert set(pd.read_csv(molecule_path)["SMILES"]) == {"CCCl", "CO"}
     summary = json.loads(
         (audit_root / "augmentation_summary.json").read_text()
     )
@@ -821,16 +902,19 @@ def test_partial_pubchem_failure_writes_output_and_resumes_only_failure(
 def test_offline_missing_cache_fails_without_replacing_stage1(tmp_path: Path):
     output_root = tmp_path / "training"
     original = write_stage1_molecules(output_root, ["CCO"])
+    previous_augmentation = write_existing_augmentation(output_root)
 
     with pytest.raises(IncompletePubChemQuery, match="offline"):
         augment_pretraining_entities(
             output_root,
-            pretrain_cap=100,
             offline=True,
             client=PartiallyFailingPubChemClient(),
         )
 
     assert (output_root / "stage1" / "molecule.csv").read_bytes() == original
+    assert previous_augmentation == {
+        path: path.read_bytes() for path in previous_augmentation
+    }
 
 
 def test_interruption_preserves_stage1_and_local_checkpoint(
@@ -839,6 +923,7 @@ def test_interruption_preserves_stage1_and_local_checkpoint(
 ):
     output_root = tmp_path / "training"
     original = write_stage1_molecules(output_root, ["CCO"])
+    previous_augmentation = write_existing_augmentation(output_root)
 
     class InterruptingClient:
         def similarity(self, *_args, **_kwargs):
@@ -847,10 +932,12 @@ def test_interruption_preserves_stage1_and_local_checkpoint(
     with pytest.raises(KeyboardInterrupt):
         augment_pretraining_entities(
             output_root,
-            pretrain_cap=100,
             client=InterruptingClient(),
         )
     assert (output_root / "stage1" / "molecule.csv").read_bytes() == original
+    assert previous_augmentation == {
+        path: path.read_bytes() for path in previous_augmentation
+    }
 
     def forbidden_local_rules(*_args, **_kwargs):
         raise AssertionError("completed local rules must survive interruption")
@@ -862,7 +949,6 @@ def test_interruption_preserves_stage1_and_local_checkpoint(
     )
     augment_pretraining_entities(
         output_root,
-        pretrain_cap=100,
         client=EmptyPubChemClient(),
     )
 
@@ -875,7 +961,6 @@ def test_augmentation_parameter_change_invalidates_candidate_checkpoint(
     write_stage1_molecules(output_root, ["CCO"])
     augment_pretraining_entities(
         output_root,
-        pretrain_cap=100,
         resonance_max_structs=8,
         client=EmptyPubChemClient(),
     )
@@ -897,7 +982,6 @@ def test_augmentation_parameter_change_invalidates_candidate_checkpoint(
     )
     augment_pretraining_entities(
         output_root,
-        pretrain_cap=100,
         resonance_max_structs=9,
         client=EmptyPubChemClient(),
     )
@@ -905,84 +989,30 @@ def test_augmentation_parameter_change_invalidates_candidate_checkpoint(
     assert calls == 1
 
 
-def test_augmentation_migrates_old_stage1_roles_and_merges_identity_metadata(
+def test_augmentation_rejects_legacy_mixed_stage1_without_replacing_files(
     tmp_path: Path,
 ):
     output_root = tmp_path / "training"
+    original = write_stage1_molecules(output_root, ["CCO"])
     stage1 = output_root / "stage1"
-    stage1.mkdir(parents=True)
-    pd.DataFrame(
-        [{"cation": "C[NH3+]", "anion": "CC(=O)[O-]"}]
-    ).to_csv(stage1 / "IL.csv", index=False)
-    original_il = (stage1 / "IL.csv").read_bytes()
+    molecule = pd.read_csv(stage1 / "molecule.csv", keep_default_na=False)
+    molecule.loc[0, "origin_list"] = "dataset;pubchem"
+    molecule.loc[0, "seed_smiles_list"] = "CCF"
+    molecule.to_csv(stage1 / "molecule.csv", index=False)
+    legacy = (stage1 / "molecule.csv").read_bytes()
+    previous_augmentation = write_existing_augmentation(output_root)
 
-    rows_by_role = {
-        "anion": [
-            {
-                "SMILES": "CC(=O)[O-]",
-                "formal_charge": -1,
-                "origin_list": "dataset",
-                "seed_smiles_list": "",
-                "rule_list": "",
-                "pubchem_cid_list": "",
-                "mol_id_list": "anion_id",
-            }
-        ],
-        "cation": [],
-        "solute": [],
-        "solvent": [],
-        "molecule": [
-            {
-                "SMILES": "CC(=O)[O-]",
-                "formal_charge": -1,
-                "origin_list": "dataset",
-                "seed_smiles_list": "",
-                "rule_list": "",
-                "pubchem_cid_list": "",
-                "mol_id_list": "molecule_id",
-            },
-            {
-                "SMILES": "C[NH3+]",
-                "formal_charge": 1,
-                "origin_list": "dataset",
-                "seed_smiles_list": "",
-                "rule_list": "",
-                "pubchem_cid_list": "",
-                "mol_id_list": "positive_id",
-            },
-            {
-                "SMILES": "CCF",
-                "formal_charge": 0,
-                "origin_list": "dataset",
-                "seed_smiles_list": "",
-                "rule_list": "",
-                "pubchem_cid_list": "",
-                "mol_id_list": "neutral_id",
-            },
-        ],
-    }
-    for role, rows in rows_by_role.items():
-        pd.DataFrame(rows, columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
-            stage1 / f"{role}.csv",
-            index=False,
+    with pytest.raises(TrainingSplitError, match="extract-pretrain"):
+        augment_pretraining_entities(
+            output_root,
+            client=EmptyPubChemClient(),
         )
 
-    augmented = augment_pretraining_entities(
-        output_root,
-        pretrain_cap=3,
-        client=EmptyPubChemClient(),
-    )
-
-    assert len(augmented) == 3
-    anion = pd.read_csv(stage1 / "anion.csv", keep_default_na=False)
-    assert anion.to_dict(orient="records")[0]["mol_id_list"] == (
-        "anion_id;molecule_id"
-    )
-    cation = pd.read_csv(stage1 / "cation.csv", keep_default_na=False)
-    assert cation["SMILES"].tolist() == ["C[NH3+]"]
-    molecule = pd.read_csv(stage1 / "molecule.csv", keep_default_na=False)
-    assert molecule["SMILES"].tolist() == ["CCF"]
-    assert (stage1 / "IL.csv").read_bytes() == original_il
+    assert legacy != original
+    assert (stage1 / "molecule.csv").read_bytes() == legacy
+    assert previous_augmentation == {
+        path: path.read_bytes() for path in previous_augmentation
+    }
 
 
 def test_augmentation_keeps_resonance_forms_as_independent_rows(
@@ -994,7 +1024,7 @@ def test_augmentation_keeps_resonance_forms_as_independent_rows(
     pd.DataFrame(
         [{"cation": "CCCC[n+]1ccn(C)c1", "anion": "[Cl-]"}]
     ).to_csv(stage1 / "IL.csv", index=False)
-    for role in ("anion", "solute", "solvent", "molecule"):
+    for role in ("anion", "molecule"):
         pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
             stage1 / f"{role}.csv",
             index=False,
@@ -1015,17 +1045,21 @@ def test_augmentation_keeps_resonance_forms_as_independent_rows(
     ).to_csv(stage1 / "cation.csv", index=False)
     original_il = (stage1 / "IL.csv").read_bytes()
 
-    augmented = augment_pretraining_entities(
+    summary = augment_pretraining_entities(
         output_root,
-        pretrain_cap=100,
         client=EmptyPubChemClient(),
     )
 
+    augmented = pd.read_csv(
+        stage1 / "augmentation" / "cation.csv",
+        keep_default_na=False,
+    )
     resonance = augmented[
         augmented["rule_list"].map(
             lambda value: "resonance_equivalent" in str(value)
         )
     ]
+    assert summary["resonance_exported"] == 1
     assert len(resonance) == 1
     assert resonance.iloc[0]["origin_list"] == "rule"
     assert resonance.iloc[0]["seed_smiles_list"] == "CCCC[n+]1ccn(C)c1"
@@ -1045,7 +1079,7 @@ def test_neutral_augmentation_uses_pubchem_without_structural_rules(
         stage1 / "IL.csv",
         index=False,
     )
-    for role in ("anion", "cation", "solute", "solvent"):
+    for role in ("anion", "cation"):
         pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
             stage1 / f"{role}.csv",
             index=False,
@@ -1065,26 +1099,89 @@ def test_neutral_augmentation_uses_pubchem_without_structural_rules(
         columns=PRETRAIN_ENTITY_COLUMNS,
     ).to_csv(stage1 / "molecule.csv", index=False)
 
-    augmented = augment_pretraining_entities(
+    summary = augment_pretraining_entities(
         output_root,
-        pretrain_cap=4,
         client=FakePubChemClient(),
     )
 
-    assert len(augmented) == 3
-    assert set(augmented["SMILES"]) == {"CCF", "CCBr", "CCO"}
+    assert summary["augmentation_entities"] == 2
     molecule = pd.read_csv(stage1 / "molecule.csv", keep_default_na=False)
     assert list(molecule.columns) == PRETRAIN_ENTITY_COLUMNS
     assert molecule.set_index("SMILES").loc["CCF", "origin_list"] == "dataset"
-    pubchem_halogen = molecule.set_index("SMILES").loc["CCBr"]
+    augmented = pd.read_csv(
+        stage1 / "augmentation" / "molecule.csv",
+        keep_default_na=False,
+    ).set_index("SMILES")
+    assert set(augmented.index) == {"CCBr", "CCO"}
+    pubchem_halogen = augmented.loc["CCBr"]
     assert pubchem_halogen["origin_list"] == "pubchem"
     assert pubchem_halogen["seed_smiles_list"] == "CCF"
     assert pubchem_halogen["rule_list"] == ""
     assert str(pubchem_halogen["pubchem_cid_list"]) == "2"
-    pubchem_only = molecule.set_index("SMILES").loc["CCO"]
+    pubchem_only = augmented.loc["CCO"]
     assert pubchem_only["origin_list"] == "pubchem"
     assert str(pubchem_only["pubchem_cid_list"]) == "3"
     assert not (stage1 / "augmentation_provenance.csv").exists()
+
+
+def test_augmentation_exports_all_novel_candidates_and_consistent_audit(
+    tmp_path: Path,
+):
+    output_root = tmp_path / "training"
+    write_stage1_molecules(output_root, ["CCF", "CCO"])
+    stage1 = output_root / "stage1"
+    root_snapshot = {
+        stage1 / f"{role}.csv": (stage1 / f"{role}.csv").read_bytes()
+        for role in ("anion", "cation", "molecule")
+    }
+
+    summary = augment_pretraining_entities(
+        output_root,
+        client=AllCandidatePubChemClient(),
+    )
+
+    augmentation = stage1 / "augmentation"
+    assert {
+        path.name for path in augmentation.glob("*.csv")
+    } == {"anion.csv", "cation.csv", "molecule.csv"}
+    assert pd.read_csv(augmentation / "anion.csv").empty
+    assert pd.read_csv(augmentation / "cation.csv").empty
+    molecule = pd.read_csv(
+        augmentation / "molecule.csv",
+        keep_default_na=False,
+    )
+    assert set(molecule["SMILES"]) == {"CCBr", "CCC", "CN", "CO"}
+    assert set(molecule["origin_list"]) == {"pubchem"}
+    assert summary == json.loads(
+        (
+            augmentation / "_audit" / "augmentation_summary.json"
+        ).read_text()
+    )
+    assert summary["base_entities"] == 2
+    assert summary["base_entities_by_role"] == {
+        "anion": 0,
+        "cation": 0,
+        "molecule": 2,
+    }
+    assert summary["candidate_relation_rows"] == {
+        "pubchem_similarity": 6,
+        "rule": 0,
+    }
+    assert summary["augmentation_entities"] == 4
+    assert summary["augmentation_entities_by_role"] == {
+        "anion": 0,
+        "cation": 0,
+        "molecule": 4,
+    }
+    assert summary["augmentation_entities_by_origin"] == {
+        "rule_only": 0,
+        "pubchem_only": 4,
+        "both": 0,
+    }
+    assert summary["excluded_base_overlaps"] == 2
+    assert root_snapshot == {
+        path: path.read_bytes() for path in root_snapshot
+    }
 
 
 def test_neutral_resonance_overlap_merges_rule_and_pubchem_provenance(
@@ -1098,7 +1195,7 @@ def test_neutral_resonance_overlap_merges_rule_and_pubchem_provenance(
         index=False,
     )
     original_il = (stage1 / "IL.csv").read_bytes()
-    for role in ("anion", "cation", "solute", "solvent"):
+    for role in ("anion", "cation"):
         pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS).to_csv(
             stage1 / f"{role}.csv",
             index=False,
@@ -1118,18 +1215,31 @@ def test_neutral_resonance_overlap_merges_rule_and_pubchem_provenance(
         columns=PRETRAIN_ENTITY_COLUMNS,
     ).to_csv(stage1 / "molecule.csv", index=False)
 
-    augment_pretraining_entities(
+    summary = augment_pretraining_entities(
         output_root,
-        pretrain_cap=10,
         client=NeutralResonancePubChemClient(),
     )
 
-    molecule = pd.read_csv(stage1 / "molecule.csv", keep_default_na=False)
+    molecule = pd.read_csv(
+        stage1 / "augmentation" / "molecule.csv",
+        keep_default_na=False,
+    )
     resonance = molecule.set_index("SMILES").loc["[N-]=[N+]=O"]
     assert resonance["origin_list"] == "pubchem;rule"
     assert resonance["rule_list"] == "resonance_equivalent"
     assert resonance["seed_smiles_list"] == "N#[N+][O-]"
     assert str(resonance["pubchem_cid_list"]) == "2"
+    assert summary["candidate_relation_rows"] == {
+        "pubchem_similarity": 1,
+        "rule": 1,
+    }
+    assert summary["augmentation_entities_by_origin"] == {
+        "rule_only": 0,
+        "pubchem_only": 0,
+        "both": 1,
+    }
+    assert summary["resonance_generated"] == 1
+    assert summary["resonance_exported"] == 1
     assert (stage1 / "IL.csv").read_bytes() == original_il
 
 
@@ -1446,11 +1556,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     ignored_structure.write_text("invalid structure", encoding="utf-8")
 
     output_root = tmp_path / "training"
-    extract_pretraining_entities(
-        final_root,
-        output_root,
-        pretrain_cap=10_000,
-    )
+    extract_pretraining_entities(final_root, output_root)
     catalog = build_training_splits(final_root, output_root, seed=42)
 
     assert int(catalog["stage"].eq(2).sum()) == 5
