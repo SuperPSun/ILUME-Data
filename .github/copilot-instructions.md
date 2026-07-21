@@ -15,14 +15,15 @@
 ## Execution Paths
 
 - Prefer repository entrypoints under `scripts/` over ad-hoc inline Python.
-- Use `python scripts/run_raw_processing.py` for the full local raw-data processing flow.
-- Use the dedicated scripts when a task is scoped to one data source, such as `python scripts/structuring_for_reference.py`, `python scripts/structuring_for_simulation.py`, `python scripts/structuring_ilthermo_data.py`, or a single script under `scripts/ilthermo/`.
+- Use `python scripts/structure_raw_data.py` for the full local raw-data structuring flow.
+- Use `python scripts/structure_raw_data.py --sources ...` when processing only selected raw sources.
+- Use `python scripts/build_training_splits.py extract-pretrain` to rebuild the dataset-only Stage1 entity files. Do not start `augment-pretrain`, which may query PubChem, unless the user explicitly requests network augmentation.
 - Do not add or rely on notebook-based processing paths when an equivalent script exists under `scripts/`.
 
 ## Data Layout
 
-- Read raw inputs from `data/raw/1.0/`, `data/raw/ILThermo/`, and `data/raw/simulation_data/`.
-- Write cleaned outputs under `data/structured/reference/`, `data/structured/simulation/`, or `data/structured/ILThermo/` according to the source.
+- Read raw inputs from `data/raw/AIonopedia/`, `data/raw/ILBERT/`, `data/raw/ILThermo/`, `data/raw/after_AIonopedia/`, and `data/raw/simulation_data/`.
+- Write structured outputs under the matching source directory in `data/structured/`; simulation outputs use `data/structured/simulation/`.
 - Use `data/manual/` for manual review results that are not yet part of the automated structured outputs.
 - Preserve the existing separation between raw inputs and structured outputs.
 
