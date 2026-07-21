@@ -8,6 +8,7 @@ files such as ``.mol`` or ``.mol2``.
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
@@ -43,6 +44,16 @@ ROLE_BY_COLUMN = {
     "SMILES": "molecule",
 }
 IDENTITY_COLUMNS = tuple(ROLE_BY_COLUMN)
+PRETRAIN_ROLES = ("anion", "cation", "molecule")
+STAGE1_SOURCE_ROLE_BY_COLUMN = {
+    "cation": "cation",
+    "anion": "anion",
+    "solute": "solute",
+    "solvent": "solvent",
+    "SMILES": "simulation_mol",
+}
+STAGE1_NEUTRAL_SOURCE_ROLES = ("simulation_mol", "solute", "solvent")
+STAGE1_SOURCE_ROLES = ("anion", "cation", *STAGE1_NEUTRAL_SOURCE_ROLES)
 CONDITION_COLUMNS = {
     "temperature_K",
     "pressure_kPa",
@@ -527,34 +538,35 @@ def _split_joined(value: object) -> set[str]:
 def _entity_output_frame(
     records: Iterable[Mapping[str, object]],
 ) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    for record in records:
-        rows.append(
-            {
-                "SMILES": str(record["SMILES"]),
-                "formal_charge": int(record["formal_charge"]),
-                "origin_list": _joined(
-                    record.get("origin_list", set()),
-                    origin=True,
-                ),
-                "seed_smiles_list": _joined(
-                    record.get("seed_smiles_list", set())
-                ),
-                "rule_list": _joined(record.get("rule_list", set())),
-                "pubchem_cid_list": _joined(
-                    record.get("pubchem_cid_list", set())
-                ),
-                "mol_id_list": _joined(record.get("mol_id_list", set())),
-            }
-        )
+    rows = [_entity_output_record(record) for record in records]
     return pd.DataFrame(rows, columns=PRETRAIN_ENTITY_COLUMNS).sort_values(
         "SMILES",
         kind="stable",
     ).reset_index(drop=True)
 
 
+def _entity_output_record(
+    record: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "SMILES": str(record["SMILES"]),
+        "formal_charge": int(record["formal_charge"]),
+        "origin_list": _joined(
+            record.get("origin_list", set()),
+            origin=True,
+        ),
+        "seed_smiles_list": _joined(record.get("seed_smiles_list", set())),
+        "rule_list": _joined(record.get("rule_list", set())),
+        "pubchem_cid_list": _joined(
+            record.get("pubchem_cid_list", set())
+        ),
+        "mol_id_list": _joined(record.get("mol_id_list", set())),
+    }
+
+
 def _normalized_pretrain_role(role: str, charge: int) -> str:
-    if role not in set(ROLE_BY_COLUMN.values()):
+    allowed_roles = set(STAGE1_SOURCE_ROLES) | set(PRETRAIN_ROLES)
+    if role not in allowed_roles:
         raise TrainingSplitError(f"Unknown Stage-1 entity role: {role}")
     if charge > 0:
         return "cation"
@@ -622,7 +634,7 @@ def _normalize_base_entity_roles(frame: pd.DataFrame) -> pd.DataFrame:
         [
             {
                 "role": record["role"],
-                **_entity_output_frame([record]).iloc[0].to_dict(),
+                **_entity_output_record(record),
             }
             for record in sorted(
                 records.values(),
@@ -638,7 +650,7 @@ def _normalize_base_entity_roles(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _combined_entity_frame(stage1_root: Path) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
-    for role in ROLE_BY_COLUMN.values():
+    for role in PRETRAIN_ROLES:
         path = stage1_root / f"{role}.csv"
         if not path.exists():
             raise TrainingSplitError(
@@ -651,16 +663,50 @@ def _combined_entity_frame(stage1_root: Path) -> pd.DataFrame:
                 f"Missing Stage-1 columns in {path}: {sorted(missing)}"
             )
         frame = frame.loc[:, PRETRAIN_ENTITY_COLUMNS].copy()
+        origins = frame["origin_list"].map(_split_joined)
+        has_augmentation_provenance = (
+            origins.map(lambda values: values != {"dataset"}).any()
+            or frame[
+                ["seed_smiles_list", "rule_list", "pubchem_cid_list"]
+            ]
+            .astype(str)
+            .apply(lambda column: column.str.strip().ne(""))
+            .any(axis=None)
+        )
+        if has_augmentation_provenance:
+            raise TrainingSplitError(
+                "Stage-1 root entity files contain augmentation rows or "
+                "provenance; run extract-pretrain before augment-pretrain"
+            )
         frame.insert(0, "role", role)
         frames.append(frame)
-    return pd.concat(frames, ignore_index=True)
+    combined = pd.concat(frames, ignore_index=True)
+    normalized = _normalize_base_entity_roles(combined)
+    if len(normalized) != len(combined):
+        raise TrainingSplitError(
+            "Stage-1 root entity files contain duplicate chemical identities; "
+            "run extract-pretrain before augment-pretrain"
+        )
+    normalized_keys = list(
+        normalized[["role", "SMILES"]].itertuples(index=False, name=None)
+    )
+    input_keys = list(
+        combined[["role", "SMILES"]]
+        .sort_values(["role", "SMILES"], kind="stable")
+        .itertuples(index=False, name=None)
+    )
+    if normalized_keys != input_keys:
+        raise TrainingSplitError(
+            "Stage-1 root entity roles or SMILES are not normalized; "
+            "run extract-pretrain before augment-pretrain"
+        )
+    return normalized
 
 
 def extract_pretraining_entities(
     final_root: Path,
     output_root: Path,
     *,
-    pretrain_cap: int = 500_000,
     chunk_size: int = 100_000,
 ) -> pd.DataFrame:
     """Extract readable role-specific entities and observed ionic-liquid pairs."""
@@ -713,7 +759,7 @@ def extract_pretraining_entities(
                             ) from exc
 
                 for column in columns:
-                    role = ROLE_BY_COLUMN[column]
+                    role = STAGE1_SOURCE_ROLE_BY_COLUMN[column]
                     for local_row, value in enumerate(chunk[column].tolist()):
                         if pd.isna(value) or not str(value).strip():
                             raise TrainingSplitError(
@@ -762,26 +808,46 @@ def extract_pretraining_entities(
                                     mol_ids.add(str(mol_id).strip())
                 row_offset += len(chunk)
 
-        if len(entities) > pretrain_cap:
-            raise TrainingSplitError(
-                f"Base pretraining corpus has {len(entities)} entities, "
-                f"exceeding cap {pretrain_cap}"
-            )
-        combined_rows: list[pd.DataFrame] = []
-        for role in ROLE_BY_COLUMN.values():
+        source_frames: dict[str, pd.DataFrame] = {}
+        for role in STAGE1_SOURCE_ROLES:
             role_frame = _entity_output_frame(
                 record
                 for (record_role, _), record in entities.items()
                 if record_role == role
             )
+            source_frames[role] = role_frame
             role_frame.to_csv(
                 staged_stage1 / f"{role}.csv",
                 index=False,
                 lineterminator="\n",
             )
-            with_role = role_frame.copy()
+
+        neutral_records = _normalize_base_entity_roles(
+            pd.DataFrame(
+                [
+                    {
+                        "role": "molecule",
+                        **_entity_output_record(record),
+                    }
+                    for (record_role, _), record in entities.items()
+                    if record_role in STAGE1_NEUTRAL_SOURCE_ROLES
+                ],
+                columns=["role", *PRETRAIN_ENTITY_COLUMNS],
+            )
+        )
+        molecule_frame = neutral_records.loc[:, PRETRAIN_ENTITY_COLUMNS]
+        molecule_frame.to_csv(
+            staged_stage1 / "molecule.csv",
+            index=False,
+            lineterminator="\n",
+        )
+
+        combined_rows: list[pd.DataFrame] = []
+        for role in ("anion", "cation"):
+            with_role = source_frames[role].copy()
             with_role.insert(0, "role", role)
             combined_rows.append(with_role)
+        combined_rows.append(neutral_records)
         pd.DataFrame(
             sorted(ionic_liquids),
             columns=["cation", "anion"],
@@ -1940,71 +2006,288 @@ def _augmentation_audit_frames(
     return failures, resonance
 
 
-def _write_stage1_entity_files(
+def _write_augmentation_files(
     stage1_root: Path,
-    combined: pd.DataFrame,
+    connection: sqlite3.Connection,
     *,
-    summary: Mapping[str, object] | None = None,
-    failures: pd.DataFrame | None = None,
-    resonance_audit: pd.DataFrame | None = None,
-) -> None:
-    il_path = stage1_root / "IL.csv"
-    if not il_path.exists():
-        raise TrainingSplitError(
-            "Run extract-pretrain before augment-pretrain; missing "
-            f"{il_path}"
+    base: pd.DataFrame,
+    config: Mapping[str, int],
+    failures: pd.DataFrame,
+    resonance_audit: pd.DataFrame,
+) -> dict[str, object]:
+    connection.execute("DROP TABLE IF EXISTS temp.base_entities")
+    connection.execute(
+        """
+        CREATE TEMP TABLE base_entities (
+            role TEXT NOT NULL,
+            smiles TEXT NOT NULL,
+            PRIMARY KEY(role, smiles)
         )
-    with tempfile.TemporaryDirectory(
-        dir=stage1_root.parent.parent
-    ) as temporary_dir:
-        staged_stage1 = Path(temporary_dir) / "stage1"
-        staged_stage1.mkdir()
-        shutil.copy2(il_path, staged_stage1 / "IL.csv")
-        for role in ROLE_BY_COLUMN.values():
-            role_frame = (
-                combined.loc[combined["role"].eq(role), PRETRAIN_ENTITY_COLUMNS]
-                .sort_values("SMILES", kind="stable")
-                .reset_index(drop=True)
+        """
+    )
+    connection.executemany(
+        "INSERT INTO base_entities(role, smiles) VALUES (?, ?)",
+        (
+            (str(row.role), canonicalize_smiles(str(row.SMILES)))
+            for row in base.itertuples(index=False)
+        ),
+    )
+
+    base_counts = {
+        role: int(base["role"].eq(role).sum())
+        for role in PRETRAIN_ROLES
+    }
+    method_counts = dict(
+        connection.execute(
+            """
+            SELECT method, COUNT(*)
+            FROM candidates
+            GROUP BY method
+            """
+        )
+    )
+    pubchem_status_counts = dict(
+        connection.execute(
+            """
+            SELECT pubchem_status, COUNT(*)
+            FROM seed_status
+            GROUP BY pubchem_status
+            """
+        )
+    )
+    resonance_generated = int(
+        connection.execute(
+            """
+            SELECT COALESCE(SUM(resonance_generated), 0)
+            FROM seed_status
+            """
+        ).fetchone()[0]
+    )
+    excluded_base_overlaps = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT c.role, c.candidate_smiles
+                FROM candidates c
+                INNER JOIN base_entities b
+                    ON b.role = c.role
+                    AND b.smiles = c.candidate_smiles
+                GROUP BY c.role, c.candidate_smiles
             )
-            role_frame.to_csv(
-                staged_stage1 / f"{role}.csv",
-                index=False,
-                lineterminator="\n",
-            )
-        if summary is not None:
-            audit_root = staged_stage1 / "_audit"
-            audit_root.mkdir()
-            (audit_root / "augmentation_summary.json").write_text(
-                json.dumps(
-                    dict(summary),
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
+            """
+        ).fetchone()[0]
+    )
+
+    role_counts = {role: 0 for role in PRETRAIN_ROLES}
+    origin_counts = {"rule_only": 0, "pubchem_only": 0, "both": 0}
+    resonance_exported = 0
+
+    with tempfile.TemporaryDirectory(dir=stage1_root) as temporary_dir:
+        staged_augmentation = Path(temporary_dir) / "augmentation"
+        staged_augmentation.mkdir()
+        handles = {
+            role: (staged_augmentation / f"{role}.csv").open(
+                "w",
                 encoding="utf-8",
+                newline="",
             )
-            (failures if failures is not None else pd.DataFrame()).to_csv(
-                audit_root / "pubchem_failures.csv",
-                index=False,
+            for role in PRETRAIN_ROLES
+        }
+        writers = {
+            role: csv.DictWriter(
+                handle,
+                fieldnames=PRETRAIN_ENTITY_COLUMNS,
                 lineterminator="\n",
             )
-            (
-                resonance_audit
-                if resonance_audit is not None
-                else pd.DataFrame()
-            ).to_csv(
-                audit_root / "resonance_skips.csv",
-                index=False,
-                lineterminator="\n",
+            for role, handle in handles.items()
+        }
+        for writer in writers.values():
+            writer.writeheader()
+
+        current_key: tuple[str, str] | None = None
+        current_record: dict[str, object] | None = None
+
+        def write_current_record() -> None:
+            nonlocal resonance_exported
+            if current_key is None or current_record is None:
+                return
+            role = current_key[0]
+            origins = current_record["origin_list"]
+            rules = current_record["rule_list"]
+            if not isinstance(origins, set) or not isinstance(rules, set):
+                raise TrainingSplitError(
+                    f"Invalid augmentation provenance for {current_key}"
+                )
+            if origins == {"rule"}:
+                origin_class = "rule_only"
+            elif origins == {"pubchem"}:
+                origin_class = "pubchem_only"
+            elif origins == {"rule", "pubchem"}:
+                origin_class = "both"
+            else:
+                raise TrainingSplitError(
+                    f"Unknown augmentation origins for {current_key}: "
+                    f"{sorted(origins)}"
+                )
+            writers[role].writerow(_entity_output_record(current_record))
+            role_counts[role] += 1
+            origin_counts[origin_class] += 1
+            if "resonance_equivalent" in rules:
+                resonance_exported += 1
+
+        try:
+            cursor = connection.execute(
+                """
+                SELECT
+                    c.role,
+                    c.candidate_smiles,
+                    c.seed_smiles,
+                    c.method,
+                    c.pubchem_cid,
+                    c.rule,
+                    s.formal_charge
+                FROM candidates c
+                INNER JOIN seed_status s
+                    ON s.seed_entity_id = c.seed_entity_id
+                LEFT JOIN base_entities b
+                    ON b.role = c.role
+                    AND b.smiles = c.candidate_smiles
+                WHERE b.smiles IS NULL
+                ORDER BY
+                    c.role,
+                    c.candidate_smiles,
+                    c.seed_smiles,
+                    c.method,
+                    c.rule,
+                    c.pubchem_cid
+                """
             )
-        replace_directory(staged_stage1, stage1_root)
+            for (
+                role,
+                candidate_smiles,
+                seed_smiles,
+                method,
+                pubchem_cid,
+                rule,
+                candidate_charge,
+            ) in cursor:
+                key = (str(role), str(candidate_smiles))
+                if key[0] not in PRETRAIN_ROLES:
+                    raise TrainingSplitError(
+                        f"Unknown augmentation role in candidate cache: {key[0]}"
+                    )
+                if current_key != key:
+                    write_current_record()
+                    current_key = key
+                    current_record = {
+                        "SMILES": key[1],
+                        "formal_charge": int(candidate_charge),
+                        "origin_list": set(),
+                        "seed_smiles_list": set(),
+                        "rule_list": set(),
+                        "pubchem_cid_list": set(),
+                        "mol_id_list": set(),
+                    }
+                elif int(current_record["formal_charge"]) != int(
+                    candidate_charge
+                ):
+                    raise TrainingSplitError(
+                        f"Conflicting formal charges for augmentation {key}"
+                    )
+
+                origins = current_record["origin_list"]
+                seeds = current_record["seed_smiles_list"]
+                rules = current_record["rule_list"]
+                pubchem_cids = current_record["pubchem_cid_list"]
+                if not all(
+                    isinstance(values, set)
+                    for values in (origins, seeds, rules, pubchem_cids)
+                ):
+                    raise TrainingSplitError(
+                        f"Invalid augmentation accumulator for {key}"
+                    )
+                if method == "rule":
+                    origins.add("rule")
+                elif method == "pubchem_similarity":
+                    origins.add("pubchem")
+                else:
+                    raise TrainingSplitError(
+                        f"Unknown augmentation method: {method}"
+                    )
+                seeds.add(str(seed_smiles))
+                if str(rule).strip():
+                    rules.add(str(rule).strip())
+                if str(pubchem_cid).strip():
+                    pubchem_cids.add(str(pubchem_cid).strip())
+            write_current_record()
+        finally:
+            for handle in handles.values():
+                handle.close()
+
+        summary: dict[str, object] = {
+            "augmentation_entities": sum(role_counts.values()),
+            "augmentation_entities_by_origin": origin_counts,
+            "augmentation_entities_by_role": role_counts,
+            "base_entities": len(base),
+            "base_entities_by_role": base_counts,
+            "candidate_relation_rows": {
+                "pubchem_similarity": int(
+                    method_counts.get("pubchem_similarity", 0)
+                ),
+                "rule": int(method_counts.get("rule", 0)),
+            },
+            "completion_status": (
+                "partial_pubchem" if not failures.empty else "complete"
+            ),
+            "config": dict(config),
+            "excluded_base_overlaps": excluded_base_overlaps,
+            "pubchem_failed_seeds": len(failures),
+            "pubchem_ok_seeds": int(pubchem_status_counts.get("ok", 0)),
+            "pubchem_skipped_seeds": int(
+                pubchem_status_counts.get("skipped", 0)
+            ),
+            "resonance_exported": resonance_exported,
+            "resonance_generated": resonance_generated,
+            "resonance_skipped_seeds": int(
+                resonance_audit["resonance_status"].eq("skipped").sum()
+            ),
+            "resonance_truncated_seeds": int(
+                resonance_audit["resonance_status"].eq("truncated").sum()
+            ),
+        }
+        audit_root = staged_augmentation / "_audit"
+        audit_root.mkdir()
+        (audit_root / "augmentation_summary.json").write_text(
+            json.dumps(
+                summary,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        failures.to_csv(
+            audit_root / "pubchem_failures.csv",
+            index=False,
+            lineterminator="\n",
+        )
+        resonance_audit.to_csv(
+            audit_root / "resonance_skips.csv",
+            index=False,
+            lineterminator="\n",
+        )
+        replace_directory(
+            staged_augmentation,
+            stage1_root / "augmentation",
+        )
+    return summary
 
 
 def augment_pretraining_entities(
     output_root: Path,
     *,
-    pretrain_cap: int = 500_000,
     threshold: int = 90,
     max_records: int = 100,
     offline: bool = False,
@@ -2013,7 +2296,7 @@ def augment_pretraining_entities(
     resonance_max_heavy_atoms: int = DEFAULT_RESONANCE_MAX_HEAVY_ATOMS,
     resonance_max_abs_charge: int = DEFAULT_RESONANCE_MAX_ABS_CHARGE,
     client: PubChemClient | None = None,
-) -> pd.DataFrame:
+) -> dict[str, object]:
     """Augment entities using PubChem similarity and local chemistry rules."""
     if resonance_max_structs <= 0:
         raise TrainingSplitError("resonance_max_structs must be positive")
@@ -2028,20 +2311,7 @@ def augment_pretraining_entities(
 
     output_root = Path(output_root)
     stage1_root = output_root / "stage1"
-    existing = _combined_entity_frame(stage1_root)
-    original_mask = existing["origin_list"].map(
-        lambda value: "dataset" in _split_joined(value)
-    )
-    base = _normalize_base_entity_roles(existing.loc[original_mask].copy())
-    if len(base) > pretrain_cap:
-        raise TrainingSplitError(
-            f"Base pretraining corpus has {len(base)} entities, exceeding cap "
-            f"{pretrain_cap}"
-        )
-    remaining = pretrain_cap - len(base)
-    if remaining == 0:
-        _write_stage1_entity_files(stage1_root, base)
-        return base
+    base = _combined_entity_frame(stage1_root)
 
     fingerprint, config = _augmentation_fingerprint(
         base,
@@ -2344,204 +2614,21 @@ def augment_pretraining_entities(
                     flush=True,
                 )
 
-        base_keys = {
-            (str(row.role), canonicalize_smiles(str(row.SMILES)))
-            for row in base.itertuples(index=False)
-        }
-        selected: dict[tuple[str, str], dict[str, object]] = {}
-        cursor = candidate_database.execute(
-            """
-            SELECT role, candidate_smiles
-            FROM candidates
-            ORDER BY seed_rank, seed_entity_id, method, candidate_smiles
-            """
-        )
-        for role, candidate_smiles in cursor:
-            key = (role, candidate_smiles)
-            if key in base_keys or key in selected:
-                continue
-            selected[key] = {
-                "role": role,
-                "SMILES": candidate_smiles,
-                "formal_charge": formal_charge(candidate_smiles),
-                "origin_list": set(),
-                "seed_smiles_list": set(),
-                "rule_list": set(),
-                "pubchem_cid_list": set(),
-                "mol_id_list": set(),
-            }
-            if len(selected) >= remaining:
-                break
-
-        candidate_database.execute("DROP TABLE IF EXISTS temp.selected")
-        candidate_database.execute(
-            """
-            CREATE TEMP TABLE selected (
-                role TEXT NOT NULL,
-                candidate_smiles TEXT NOT NULL,
-                PRIMARY KEY(role, candidate_smiles)
-            )
-            """
-        )
-        candidate_database.executemany(
-            "INSERT INTO selected(role, candidate_smiles) VALUES (?, ?)",
-            selected,
-        )
-        for row in candidate_database.execute(
-            """
-            SELECT
-                c.seed_entity_id,
-                c.role,
-                c.seed_smiles,
-                c.candidate_smiles,
-                c.method,
-                c.pubchem_cid,
-                c.rule,
-                c.method_rank
-            FROM candidates c
-            INNER JOIN selected s
-                ON c.role = s.role
-                AND c.candidate_smiles = s.candidate_smiles
-            ORDER BY
-                c.role,
-                c.candidate_smiles,
-                c.seed_entity_id,
-                c.method,
-                c.rule
-            """
-        ):
-            (
-                _seed_entity_identifier,
-                role,
-                seed_smiles,
-                candidate_smiles,
-                method,
-                pubchem_cid,
-                rule,
-                _method_rank,
-            ) = row
-            record = selected[(role, candidate_smiles)]
-            origins = record["origin_list"]
-            seeds = record["seed_smiles_list"]
-            pubchem_cids = record["pubchem_cid_list"]
-            rules = record["rule_list"]
-            if isinstance(origins, set):
-                if method == "rule":
-                    origins.add("rule")
-                elif method == "pubchem_similarity":
-                    origins.add("pubchem")
-            if isinstance(seeds, set):
-                seeds.add(seed_smiles)
-            if isinstance(pubchem_cids, set) and str(pubchem_cid).strip():
-                pubchem_cids.add(str(pubchem_cid).strip())
-            if isinstance(rules, set) and str(rule).strip():
-                rules.add(str(rule).strip())
-
-        all_rows: list[dict[str, object]] = []
-        for row in base.to_dict(orient="records"):
-            all_rows.append(
-                {
-                    "role": str(row["role"]),
-                    "SMILES": canonicalize_smiles(str(row["SMILES"])),
-                    "formal_charge": int(row["formal_charge"]),
-                    "origin_list": _split_joined(row["origin_list"]),
-                    "seed_smiles_list": _split_joined(
-                        row["seed_smiles_list"]
-                    ),
-                    "rule_list": _split_joined(row["rule_list"]),
-                    "pubchem_cid_list": _split_joined(
-                        row["pubchem_cid_list"]
-                    ),
-                    "mol_id_list": _split_joined(row["mol_id_list"]),
-                }
-            )
-        all_rows.extend(selected.values())
-        augmented = pd.DataFrame(
-            [
-                {
-                    "role": row["role"],
-                    **_entity_output_frame([row]).iloc[0].to_dict(),
-                }
-                for row in sorted(
-                    all_rows,
-                    key=lambda item: (
-                        str(item["role"]),
-                        str(item["SMILES"]),
-                    ),
-                )
-            ],
-            columns=["role", *PRETRAIN_ENTITY_COLUMNS],
-        )
-
         failures, resonance_audit = _augmentation_audit_frames(
             candidate_database
         )
-        pubchem_ok = candidate_database.execute(
-            """
-            SELECT COUNT(*) FROM seed_status
-            WHERE pubchem_status = 'ok'
-            """
-        ).fetchone()[0]
-        resonance_generated = candidate_database.execute(
-            """
-            SELECT COALESCE(SUM(resonance_generated), 0)
-            FROM seed_status
-            """
-        ).fetchone()[0]
-        resonance_selected = sum(
-            "resonance_equivalent" in record["rule_list"]
-            for record in selected.values()
-            if isinstance(record["rule_list"], set)
-        )
-        method_counts = dict(
-            candidate_database.execute(
-                """
-                SELECT method, COUNT(*)
-                FROM candidates
-                GROUP BY method
-                """
-            )
-        )
-        summary = {
-            "base_entities": len(base),
-            "completion_status": (
-                "partial_pubchem" if not failures.empty else "complete"
-            ),
-            "config": config,
-            "final_entities": len(augmented),
-            "local_rule_candidates": method_counts.get("rule", 0),
-            "pretrain_cap": pretrain_cap,
-            "pubchem_candidates": method_counts.get(
-                "pubchem_similarity",
-                0,
-            ),
-            "pubchem_failed_seeds": len(failures),
-            "pubchem_ok_seeds": pubchem_ok,
-            "resonance_generated": resonance_generated,
-            "resonance_selected": resonance_selected,
-            "resonance_skipped_seeds": int(
-                resonance_audit["resonance_status"]
-                .eq("skipped")
-                .sum()
-            ),
-            "resonance_truncated_seeds": int(
-                resonance_audit["resonance_status"]
-                .eq("truncated")
-                .sum()
-            ),
-            "selected_candidates": len(selected),
-        }
-        _write_stage1_entity_files(
+        summary = _write_augmentation_files(
             stage1_root,
-            augmented,
-            summary=summary,
+            candidate_database,
+            base=base,
+            config=config,
             failures=failures,
             resonance_audit=resonance_audit,
         )
         print(
             "Stage1 augmentation complete: "
             f"status={summary['completion_status']} "
-            f"entities={len(augmented):,} "
+            f"entities={summary['augmentation_entities']:,} "
             f"pubchem_failed={len(failures):,} "
             f"resonance_skipped="
             f"{summary['resonance_skipped_seeds']:,} "
@@ -2557,7 +2644,7 @@ def augment_pretraining_entities(
             signal.signal(signal.SIGTERM, previous_sigterm)
 
     (output_root / "manifest.json").unlink(missing_ok=True)
-    return augmented
+    return summary
 
 
 def system_type_for_columns(identity_columns: Sequence[str]) -> str:
@@ -3156,10 +3243,8 @@ def build_training_splits(
     output_root: Path,
     *,
     seed: int = 42,
-    pretrain_cap: int = 500_000,
 ) -> pd.DataFrame:
     """Build readable Stage-2 and Stage-3 task datasets."""
-    _ = pretrain_cap  # Kept for CLI compatibility.
     final_root = Path(final_root)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -3503,7 +3588,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_ROOT,
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--pretrain-cap", type=int, default=500_000)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--pubchem-threshold", type=int, default=90)
     parser.add_argument("--pubchem-max-records", type=int, default=100)
@@ -3527,8 +3611,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.pretrain_cap <= 0:
-        raise TrainingSplitError("--pretrain-cap must be positive")
     if not 1 <= args.pubchem_threshold <= 100:
         raise TrainingSplitError("--pubchem-threshold must be between 1 and 100")
     if args.pubchem_max_records <= 0:
@@ -3554,13 +3636,11 @@ def main() -> None:
         extracted = extract_pretraining_entities(
             args.final_root,
             args.output_root,
-            pretrain_cap=args.pretrain_cap,
         )
         print(f"Extracted {len(extracted):,} base pretraining entities")
     if args.command in {"augment-pretrain", "all"}:
         augmented = augment_pretraining_entities(
             args.output_root,
-            pretrain_cap=args.pretrain_cap,
             threshold=args.pubchem_threshold,
             max_records=args.pubchem_max_records,
             offline=args.offline,
@@ -3569,13 +3649,18 @@ def main() -> None:
             resonance_max_heavy_atoms=args.resonance_max_heavy_atoms,
             resonance_max_abs_charge=args.resonance_max_abs_charge,
         )
-        print(f"Prepared {len(augmented):,} pretraining entities")
+        counts = augmented["augmentation_entities_by_role"]
+        print(
+            "Prepared "
+            f"{augmented['augmentation_entities']:,} augmentation entities "
+            f"(anion={counts['anion']:,}, cation={counts['cation']:,}, "
+            f"molecule={counts['molecule']:,})"
+        )
     if args.command in {"build-splits", "all"}:
         catalog = build_training_splits(
             args.final_root,
             args.output_root,
             seed=args.seed,
-            pretrain_cap=args.pretrain_cap,
         )
         stage2_count = int(catalog["stage"].eq(2).sum())
         stage3_count = int(catalog["stage"].eq(3).sum())
