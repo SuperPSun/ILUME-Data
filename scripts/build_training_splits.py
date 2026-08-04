@@ -3280,7 +3280,6 @@ def build_training_splits(
 
     task_catalog_rows: list[dict[str, object]] = []
     fold_balance_rows: list[dict[str, object]] = []
-    stage2_groups: dict[tuple[str, str], str] = {}
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
         staged_root = Path(temporary_dir) / "training_splits"
         stage2_root = staged_root / "stage2"
@@ -3303,6 +3302,7 @@ def build_training_splits(
                     if stable_fraction(
                         seed,
                         "stage2_validation",
+                        task.task_id,
                         task.system_type,
                         system_id_value,
                     )
@@ -3321,17 +3321,14 @@ def build_training_splits(
                     "partition": partitions,
                 }
             ).drop_duplicates()
-            for system_id_value, partition in assignments.itertuples(
-                index=False,
-                name=None,
-            ):
-                key = (task.system_type, str(system_id_value))
-                value = str(partition)
-                previous = stage2_groups.setdefault(key, value)
-                if previous != value:
-                    raise TrainingSplitError(
-                        f"Inconsistent shared Stage-2 assignment for {key}"
-                    )
+            partition_counts = assignments.groupby(
+                "system_id",
+                sort=False,
+            )["partition"].nunique()
+            if partition_counts.gt(1).any():
+                raise TrainingSplitError(
+                    f"Stage-2 system crosses partitions for {task.task_id}"
+                )
 
             task_root = stage2_root / Path(task.source_file).stem
             materialized = _materialized_task_frame(frame, task)

@@ -77,41 +77,55 @@ def write_stage2_files(final_root: Path, count: int = 100) -> None:
         ("heat_capacity.csv", "heat_capacity_J/mol/K"),
         ("thermal_expansion.csv", "thermal_expansion_K^-1"),
     ):
+        rows = [
+            {
+                "cation": cation,
+                "anion": anion,
+                "temperature_K": 298.0,
+                target: float(index),
+                "source_list": "simulation",
+            }
+            for index, (cation, anion) in enumerate(pairs)
+        ]
+        rows.append(
+            {
+                "cation": pairs[0][0],
+                "anion": pairs[0][1],
+                "temperature_K": 320.0,
+                target: -1.0,
+                "source_list": "simulation",
+            }
+        )
         write_csv(
             final_root / "simulation" / filename,
-            [
-                {
-                    "cation": cation,
-                    "anion": anion,
-                    "temperature_K": 298.15,
-                    target: float(index),
-                    "source_list": "simulation",
-                }
-                for index, (cation, anion) in enumerate(pairs)
-            ],
+            rows,
         )
+    qm_rows = [
+        {
+            "SMILES": neutral_carbon(index),
+            **{column: float(index) for column in QM_COLUMNS},
+            "source_list": "simulation",
+        }
+        for index in range(1, count + 1)
+    ]
+    qm_rows.append(qm_rows[0].copy())
     write_csv(
         final_root / "simulation" / "simulated_qm_elec_hf.csv",
-        [
-            {
-                "SMILES": neutral_carbon(index),
-                **{column: float(index) for column in QM_COLUMNS},
-                "source_list": "simulation",
-            }
-            for index in range(1, count + 1)
-        ],
+        qm_rows,
     )
+    transfer_rows = [
+        {
+            "solute": neutral_carbon(index),
+            "solvent": neutral_oxygen(index),
+            "transfer_organic_kcal/mol": float(index),
+            "source_list": "simulation",
+        }
+        for index in range(1, count + 1)
+    ]
+    transfer_rows.append(transfer_rows[0].copy())
     write_csv(
         final_root / "simulation" / "transfer_organic.csv",
-        [
-            {
-                "solute": neutral_carbon(index),
-                "solvent": neutral_oxygen(index),
-                "transfer_organic_kcal/mol": float(index),
-                "source_list": "simulation",
-            }
-            for index in range(1, count + 1)
-        ],
+        transfer_rows,
     )
 
 
@@ -1705,12 +1719,47 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     train = pd.read_csv(stage2_density / "train.csv")
     valid = pd.read_csv(stage2_density / "valid.csv")
     assert set(train.columns) == set(valid.columns)
-    assert len(train) + len(valid) == 100
-    assert set(
-        train[["cation", "anion"]].itertuples(index=False, name=None)
-    ).isdisjoint(
-        set(valid[["cation", "anion"]].itertuples(index=False, name=None))
+    assert len(train) + len(valid) == 101
+
+    def stage2_assignments(
+        task_name: str,
+        columns: list[str],
+    ) -> dict[tuple[str, ...], str]:
+        assignments: dict[tuple[str, ...], str] = {}
+        task_root = output_root / "stage2" / task_name
+        for partition, filename in (
+            ("train", "train.csv"),
+            ("valid", "valid.csv"),
+        ):
+            frame = pd.read_csv(task_root / filename)
+            for system in frame[columns].itertuples(index=False, name=None):
+                previous = assignments.setdefault(system, partition)
+                assert previous == partition
+        return assignments
+
+    density_assignments = stage2_assignments(
+        "density",
+        ["cation", "anion"],
     )
+    heat_capacity_assignments = stage2_assignments(
+        "heat_capacity",
+        ["cation", "anion"],
+    )
+    stage2_assignments("simulated_qm_elec_hf", ["SMILES"])
+    stage2_assignments("transfer_organic", ["solute", "solvent"])
+    assert density_assignments != heat_capacity_assignments
+
+    repeated_rows = pd.concat([train, valid], ignore_index=True)
+    repeated_pair = repeated_rows.loc[
+        repeated_rows["temperature_K"].eq(320.0),
+        ["cation", "anion"],
+    ].iloc[0]
+    repeated_rows = repeated_rows.loc[
+        repeated_rows["cation"].eq(repeated_pair["cation"])
+        & repeated_rows["anion"].eq(repeated_pair["anion"])
+    ]
+    assert set(repeated_rows["temperature_K"]) == {298.0, 320.0}
+    assert len(repeated_rows) == 2
 
     legacy_paths = [
         output_root / "task_catalog.csv",
@@ -1739,3 +1788,9 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     first_run = {path: path.read_bytes() for path in checksummed_paths}
     build_training_splits(final_root, output_root, seed=42)
     assert first_run == {path: path.read_bytes() for path in checksummed_paths}
+
+    build_training_splits(final_root, output_root, seed=43)
+    assert density_assignments != stage2_assignments(
+        "density",
+        ["cation", "anion"],
+    )

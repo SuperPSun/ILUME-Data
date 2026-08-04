@@ -72,6 +72,12 @@ data/training_splits/stage1/augmentation/
 
 There is no Stage1 entity cap in this builder. Selecting or sampling augmented entities for a particular pretraining run is a separate downstream step. Use the two explicit commands above when rebuilding only Stage1; the `all` command also rebuilds Stage2 and Stage3.
 
+## Stage2 Property Splits
+
+`python scripts/build_training_splits.py build-splits` builds the Stage2 property datasets under `data/training_splits/stage2/`. Each task is split independently by its complete chemical system: `(cation, anion)` for IL properties, `(solute, solvent)` for organic transfer, and `SMILES` for molecular QM properties. Conditions such as temperature and pressure are not part of the system identity, so every condition row for one system stays entirely in either `train.csv` or `valid.csv` within that task.
+
+The default seed `42` deterministically assigns approximately 10% of systems, rather than rows, to validation. Changing the seed changes the assignment, while rerunning with the same inputs and seed reproduces the same files. A system shared by different property tasks is assigned independently in each task. The command also rebuilds Stage3; use a temporary `--output-root` when validating split changes without replacing the current generated datasets.
+
 ## 3D Box Fingerprints
 
 Build one-row-per-snapshot structural fingerprints from `box_20260514` with:

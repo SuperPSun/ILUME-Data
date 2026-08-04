@@ -18,6 +18,7 @@
 - Use `python scripts/structure_raw_data.py` for the full local raw-data structuring flow.
 - Use `python scripts/structure_raw_data.py --sources ...` when processing only selected raw sources.
 - Use `python scripts/build_training_splits.py extract-pretrain` to rebuild the dataset-only Stage1 entity files. Do not start `augment-pretrain`, which may query PubChem, unless the user explicitly requests network augmentation.
+- Use `python scripts/build_training_splits.py build-splits --seed 42` only when the user explicitly requests generated split replacement; it atomically rebuilds Stage2, Stage3, and `_audit` outputs.
 - Do not add or rely on notebook-based processing paths when an equivalent script exists under `scripts/`.
 
 ## Data Layout
@@ -26,6 +27,7 @@
 - Write structured outputs under the matching source directory in `data/structured/`; simulation outputs use `data/structured/simulation/`.
 - Use `data/manual/` for manual review results that are not yet part of the automated structured outputs.
 - Preserve the existing separation between raw inputs and structured outputs.
+- Keep every Stage2 chemical system within one task-local partition: IL properties group by `(cation, anion)`, organic transfer by `(solute, solvent)`, and molecular QM by `SMILES`. Conditions such as temperature and pressure never define a new system, and different property tasks assign shared systems independently.
 
 ## Dependencies
 
