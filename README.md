@@ -76,6 +76,8 @@ There is no Stage1 entity cap in this builder. Selecting or sampling augmented e
 
 `python scripts/build_training_splits.py build-splits` builds the Stage2 property datasets under `data/training_splits/stage2/`. Each task is split independently by its complete chemical system: `(cation, anion)` for IL properties, `(solute, solvent)` for organic transfer, and `SMILES` for molecular QM properties. Conditions such as temperature and pressure are not part of the system identity, so every condition row for one system stays entirely in either `train.csv` or `valid.csv` within that task.
 
+Before the Stage2 train/validation split, three simulated IL-property tasks exclude every complete IL system found in the corresponding experimental task: simulation density against experiment density, simulation heat capacity against experiment heat capacity, and simulation thermal expansion against experiment isobaric volume expansion. These exclusions are property-local rather than a union across properties. Missing reference datasets abort the build, and the excluded systems and row counts are recorded in `data/training_splits/_audit/stage2_overlap_exclusions.csv`.
+
 The default seed `42` deterministically assigns approximately 10% of systems, rather than rows, to validation. Changing the seed changes the assignment, while rerunning with the same inputs and seed reproduces the same files. A system shared by different property tasks is assigned independently in each task. The command also rebuilds Stage3; use a temporary `--output-root` when validating split changes without replacing the current generated datasets.
 
 ## 3D Box Fingerprints
