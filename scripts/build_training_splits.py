@@ -98,6 +98,21 @@ STAGE2_FILES = {
     "simulation/thermal_expansion.csv",
     "simulation/transfer_organic.csv",
 }
+STAGE2_EXPERIMENT_REFERENCES = {
+    "simulation/density.csv": "experiment/density.csv",
+    "simulation/heat_capacity.csv": "experiment/heat_capacity.csv",
+    "simulation/thermal_expansion.csv": (
+        "experiment/isobaric_coefficient_of_volume_expansion.csv"
+    ),
+}
+STAGE2_OVERLAP_AUDIT_COLUMNS = [
+    "stage2_task_id",
+    "stage3_task_id",
+    "cation",
+    "anion",
+    "excluded_stage2_rows",
+    "matching_stage3_rows",
+]
 QM_TARGET_COLUMNS = (
     "ESP_max",
     "ESP_min",
@@ -2671,6 +2686,14 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
             "Missing required stage-2 datasets: "
             + ", ".join(sorted(missing_stage2))
         )
+    missing_references = (
+        set(STAGE2_EXPERIMENT_REFERENCES.values()) - relative_paths
+    )
+    if missing_references:
+        raise TrainingSplitError(
+            "Missing required stage-3 overlap references: "
+            + ", ".join(sorted(missing_references))
+        )
 
     tasks: list[TaskSpec] = []
     for path in paths:
@@ -2952,6 +2975,48 @@ def _system_table(frame: pd.DataFrame) -> pd.DataFrame:
         .rename("row_count")
         .reset_index()
     )
+
+
+def exclude_stage2_experiment_overlap(
+    frame: pd.DataFrame,
+    task: TaskSpec,
+    reference_task: TaskSpec,
+    reference_systems: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Remove Stage-2 IL systems present in the paired experiment task."""
+    if task.system_type != "il" or reference_task.system_type != "il":
+        raise TrainingSplitError(
+            "Stage-2 overlap exclusion requires paired IL tasks: "
+            f"{task.task_id}, {reference_task.task_id}"
+        )
+
+    reference_counts = reference_systems.set_index("_system_id")[
+        "row_count"
+    ]
+    excluded_mask = frame["_system_id"].isin(reference_counts.index)
+    excluded = frame.loc[excluded_mask]
+    if excluded.empty:
+        audit = pd.DataFrame(columns=STAGE2_OVERLAP_AUDIT_COLUMNS)
+    else:
+        audit = (
+            excluded.groupby(
+                ["_system_id", "cation", "anion"],
+                sort=True,
+                dropna=False,
+            )
+            .size()
+            .rename("excluded_stage2_rows")
+            .reset_index()
+        )
+        audit["matching_stage3_rows"] = audit["_system_id"].map(
+            reference_counts
+        )
+        audit.insert(0, "stage3_task_id", reference_task.task_id)
+        audit.insert(0, "stage2_task_id", task.task_id)
+        audit = audit.loc[:, STAGE2_OVERLAP_AUDIT_COLUMNS]
+
+    filtered = frame.loc[~excluded_mask].reset_index(drop=True)
+    return filtered, audit
 
 
 def plan_joint_test_registry(
@@ -3259,6 +3324,7 @@ def build_training_splits(
     }
     stage2_tasks = [task for task in tasks if task.stage == 2]
     stage3_tasks = [task for task in tasks if task.stage == 3]
+    tasks_by_source = {task.source_file: task for task in tasks}
 
     stage3_profiles: dict[str, TaskProfile] = {}
     systems_by_task: dict[str, pd.DataFrame] = {}
@@ -3280,6 +3346,7 @@ def build_training_splits(
 
     task_catalog_rows: list[dict[str, object]] = []
     fold_balance_rows: list[dict[str, object]] = []
+    stage2_overlap_audits: list[pd.DataFrame] = []
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
         staged_root = Path(temporary_dir) / "training_splits"
         stage2_root = staged_root / "stage2"
@@ -3295,6 +3362,18 @@ def build_training_splits(
                 task,
                 checksums[task.source_file],
             )
+            reference_source = STAGE2_EXPERIMENT_REFERENCES.get(
+                task.source_file
+            )
+            if reference_source is not None:
+                reference_task = tasks_by_source[reference_source]
+                frame, overlap_audit = exclude_stage2_experiment_overlap(
+                    frame,
+                    task,
+                    reference_task,
+                    systems_by_task[reference_task.task_id],
+                )
+                stage2_overlap_audits.append(overlap_audit)
             profile = _profile_task(frame, raw_rows)
             partitions = frame["_system_id"].map(
                 lambda system_id_value: (
@@ -3546,6 +3625,17 @@ def build_training_splits(
                 fold_balance_rows,
                 columns=FOLD_BALANCE_COLUMNS,
             ),
+        )
+        overlap_audit = pd.concat(
+            stage2_overlap_audits,
+            ignore_index=True,
+        ).sort_values(
+            ["stage2_task_id", "cation", "anion"],
+            kind="stable",
+        )
+        write_dataframe(
+            audit_root / "stage2_overlap_exclusions.csv",
+            overlap_audit.reset_index(drop=True),
         )
         replace_directory(stage2_root, output_root / "stage2")
         replace_directory(stage3_root, output_root / "stage3")

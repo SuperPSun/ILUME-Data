@@ -19,6 +19,7 @@ from scripts.build_training_splits import (
     build_training_splits,
     candidate_allowed,
     canonicalize_smiles,
+    discover_tasks,
     extract_pretraining_entities,
     fixed_h_identity_key,
     formal_charge,
@@ -60,6 +61,11 @@ def ion_pair(index: int) -> tuple[str, str]:
         f"{'C' * cation_chain}[N+](C)(C)C",
         f"{'C' * anion_chain}(=O)[O-]",
     )
+
+
+def canonical_ion_pair(index: int) -> tuple[str, str]:
+    """Return the canonicalized ion pair generated for an index."""
+    return tuple(canonicalize_smiles(value) for value in ion_pair(index))
 
 
 def neutral_carbon(index: int) -> str:
@@ -1500,7 +1506,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     final_root = tmp_path / "final"
     write_stage2_files(final_root)
 
-    large_pairs = [ion_pair(index) for index in range(1, 502)]
+    large_pairs = [ion_pair(index) for index in range(51, 552)]
     for filename, target in (
         ("density.csv", "density_g/cm^3"),
         ("electrical_conductivity.csv", "electrical_conductivity_S/m_log10"),
@@ -1519,6 +1525,37 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
                 for index, (cation, anion) in enumerate(large_pairs)
             ],
         )
+
+    write_csv(
+        final_root / "experiment" / "heat_capacity.csv",
+        [
+            {
+                "cation": ion_pair(index)[0],
+                "anion": ion_pair(index)[1],
+                "temperature_K": 298.15,
+                "pressure_kPa": 101.325,
+                "heat_capacity_J/mol/K": float(index),
+                "source_list": "experiment",
+            }
+            for index in [2, *range(200, 209)]
+        ],
+    )
+    write_csv(
+        final_root
+        / "experiment"
+        / "isobaric_coefficient_of_volume_expansion.csv",
+        [
+            {
+                "cation": ion_pair(index)[0],
+                "anion": ion_pair(index)[1],
+                "temperature_K": 298.15,
+                "pressure_kPa": 101.325,
+                "isobaric_coefficient_of_volume_expansion_K^-1": float(index),
+                "source_list": "experiment",
+            }
+            for index in [3, *range(300, 309)]
+        ],
+    )
 
     small_indices = list(range(1, 50))
     write_csv(
@@ -1582,6 +1619,31 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         "simulation/simulated_qm_elec_hf",
         "simulation/thermal_expansion",
         "simulation/transfer_organic",
+    }
+    stage2 = catalog[catalog["stage"].eq(2)].set_index("task_id")
+    assert stage2.loc[
+        [
+            "simulation/density",
+            "simulation/heat_capacity",
+            "simulation/thermal_expansion",
+        ],
+        ["raw_rows", "rows", "unique_systems"],
+    ].to_dict("index") == {
+        "simulation/density": {
+            "raw_rows": 101,
+            "rows": 51,
+            "unique_systems": 50,
+        },
+        "simulation/heat_capacity": {
+            "raw_rows": 101,
+            "rows": 100,
+            "unique_systems": 99,
+        },
+        "simulation/thermal_expansion": {
+            "raw_rows": 101,
+            "rows": 100,
+            "unique_systems": 99,
+        },
     }
     stage3 = catalog[catalog["stage"].eq(3)].set_index("task_id")
     assert stage3.loc["experiment/density", "tier"] == "large"
@@ -1719,7 +1781,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     train = pd.read_csv(stage2_density / "train.csv")
     valid = pd.read_csv(stage2_density / "valid.csv")
     assert set(train.columns) == set(valid.columns)
-    assert len(train) + len(valid) == 101
+    assert len(train) + len(valid) == 51
 
     def stage2_assignments(
         task_name: str,
@@ -1745,9 +1807,69 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         "heat_capacity",
         ["cation", "anion"],
     )
+    thermal_expansion_assignments = stage2_assignments(
+        "thermal_expansion",
+        ["cation", "anion"],
+    )
     stage2_assignments("simulated_qm_elec_hf", ["SMILES"])
     stage2_assignments("transfer_organic", ["solute", "solvent"])
     assert density_assignments != heat_capacity_assignments
+
+    assert set(density_assignments) == {
+        canonical_ion_pair(index) for index in range(1, 51)
+    }
+    assert canonical_ion_pair(2) not in heat_capacity_assignments
+    assert canonical_ion_pair(51) in heat_capacity_assignments
+    assert canonical_ion_pair(3) not in thermal_expansion_assignments
+    assert canonical_ion_pair(2) in thermal_expansion_assignments
+    assert canonical_ion_pair(51) in thermal_expansion_assignments
+
+    overlap_audit = pd.read_csv(
+        output_root / "_audit" / "stage2_overlap_exclusions.csv"
+    )
+    assert list(overlap_audit.columns) == [
+        "stage2_task_id",
+        "stage3_task_id",
+        "cation",
+        "anion",
+        "excluded_stage2_rows",
+        "matching_stage3_rows",
+    ]
+    assert overlap_audit.groupby("stage2_task_id").size().to_dict() == {
+        "simulation/density": 50,
+        "simulation/heat_capacity": 1,
+        "simulation/thermal_expansion": 1,
+    }
+    assert overlap_audit.groupby("stage2_task_id")[
+        "excluded_stage2_rows"
+    ].sum().to_dict() == {
+        "simulation/density": 50,
+        "simulation/heat_capacity": 1,
+        "simulation/thermal_expansion": 1,
+    }
+    assert overlap_audit["matching_stage3_rows"].eq(1).all()
+    density_overlap = overlap_audit.loc[
+        overlap_audit["stage2_task_id"].eq("simulation/density")
+    ]
+    assert set(
+        density_overlap[["cation", "anion"]].itertuples(
+            index=False,
+            name=None,
+        )
+    ) == {canonical_ion_pair(index) for index in range(51, 101)}
+    assert density_overlap["excluded_stage2_rows"].eq(1).all()
+    assert overlap_audit.loc[
+        overlap_audit["stage2_task_id"].eq("simulation/heat_capacity"),
+        "stage3_task_id",
+    ].tolist() == ["experiment/heat_capacity"]
+    assert overlap_audit.loc[
+        overlap_audit["stage2_task_id"].eq(
+            "simulation/thermal_expansion"
+        ),
+        "stage3_task_id",
+    ].tolist() == [
+        "experiment/isobaric_coefficient_of_volume_expansion"
+    ]
 
     repeated_rows = pd.concat([train, valid], ignore_index=True)
     repeated_pair = repeated_rows.loc[
@@ -1794,3 +1916,28 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         "density",
         ["cation", "anion"],
     )
+
+
+def test_discover_tasks_requires_stage2_overlap_references(tmp_path: Path):
+    """Require every experiment file used for Stage-2 overlap filtering."""
+    final_root = tmp_path / "final"
+    write_stage2_files(final_root)
+    cation, anion = ion_pair(1)
+    write_csv(
+        final_root / "experiment" / "density.csv",
+        [
+            {
+                "cation": cation,
+                "anion": anion,
+                "temperature_K": 298.15,
+                "density_g/cm^3": 1.0,
+                "source_list": "experiment",
+            }
+        ],
+    )
+
+    with pytest.raises(
+        training_splits.TrainingSplitError,
+        match="Missing required stage-3 overlap references",
+    ):
+        discover_tasks(final_root)
