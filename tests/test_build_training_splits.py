@@ -1,6 +1,9 @@
+import gzip
 import json
 from http.client import IncompleteRead
 from pathlib import Path
+import subprocess
+import sys
 
 import pandas as pd
 import pytest
@@ -23,7 +26,10 @@ from scripts.build_training_splits import (
     extract_pretraining_entities,
     fixed_h_identity_key,
     formal_charge,
+    fragment_count,
     generate_rule_candidates,
+    import_zinc_diversity,
+    ionize_zinc_parent,
     plan_joint_test_registry,
     prepare_task_frame,
     resonance_eligibility,
@@ -274,9 +280,16 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
     assert structure_path.exists()
 
 
-def test_rule_candidates_keep_only_resonance_for_neutral_entities():
-    assert generate_rule_candidates("CCCC", "molecule") == []
-    assert generate_rule_candidates("CCF", "molecule") == []
+def test_rule_candidates_apply_shared_rules_to_neutral_entities():
+    alkyl = generate_rule_candidates("CCCC", "molecule")
+    assert any(row["rule"] == "terminal_alkyl_extend_1" for row in alkyl)
+    assert any(
+        row["rule"] == "terminal_alkyl_linear_to_branch"
+        for row in alkyl
+    )
+
+    halogen = generate_rule_candidates("CCF", "molecule")
+    assert any(row["rule"] == "halogen_F_to_Cl" for row in halogen)
 
     neutral_resonance = generate_rule_candidates(
         "N#[N+][O-]",
@@ -409,7 +422,12 @@ def test_ion_rules_extend_and_branch_terminal_alkyl_chains():
         canonicalize_smiles("CCC[N+](C)(C)C"),
     ) in branched
 
-    assert generate_rule_candidates("CCCC", "molecule") == []
+    neutral = {
+        row["rule"]
+        for row in generate_rule_candidates("CCCC", "molecule")
+    }
+    assert "terminal_alkyl_extend_4" in neutral
+    assert "terminal_alkyl_linear_to_branch" in neutral
 
 
 def test_rule_candidates_drop_disconnected_explicit_hydrogen_fragments(capfd):
@@ -507,8 +525,8 @@ def test_ion_rules_cover_chalcogen_aromatic_and_iodine_analogs():
         for row in generate_rule_candidates("[Cl-]", "anion")
     }
     assert ("halogen_Cl_to_I", "[I-]") in chloride
-    assert not any(
-        "_to_I" in row["rule"] or "I_to_" in row["rule"]
+    assert any(
+        row["rule"] == "halogen_Cl_to_I"
         for row in generate_rule_candidates("CCCl", "molecule")
     )
 
@@ -775,6 +793,716 @@ def write_existing_augmentation(output_root: Path) -> dict[Path, bytes]:
     }
 
 
+def write_zinc_shard(
+    path: Path,
+    rows: list[tuple[str, str]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8", newline="") as handle:
+        for smiles, zinc_id in rows:
+            handle.write(f"{smiles}\t{zinc_id}\n")
+
+
+def write_zinc_manifest(root: Path, relative_paths: list[str]) -> Path:
+    manifest = root.parent / "zinc22_smi_urls.txt"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        "".join(
+            f"https://cache.docking.org/zinc22/{relative_path}\n"
+            for relative_path in relative_paths
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def write_zinc_failed_log(
+    root: Path,
+    relative_paths: list[str],
+    *,
+    extra_urls: list[str] | None = None,
+) -> Path:
+    failed_log = root.parent / "zinc22_smi_failed.log"
+    failed_log.write_text(
+        "".join(
+            [
+                *(
+                    f"https://cache.docking.org/zinc22/{relative_path}\n"
+                    for relative_path in relative_paths
+                ),
+                *(f"{url}\n" for url in (extra_urls or [])),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return failed_log
+
+
+def write_empty_stage1(output_root: Path) -> None:
+    write_stage1_molecules(output_root, [])
+    write_existing_augmentation(output_root)
+
+
+def test_zinc_ionization_rules_are_conservative_and_deterministic():
+    carboxylate = ionize_zinc_parent("CC(=O)O", "anion")
+    ammonium = ionize_zinc_parent("CCCCN", "cation")
+    pyridinium = ionize_zinc_parent("c1ccncc1", "cation")
+
+    assert carboxylate is not None
+    assert carboxylate["rule"] == "zinc_deprotonate_carboxylic_acid"
+    assert formal_charge(str(carboxylate["SMILES"])) == -1
+    assert ammonium is not None
+    assert ammonium["rule"] == "zinc_protonate_amine"
+    assert formal_charge(str(ammonium["SMILES"])) == 1
+    assert pyridinium is not None
+    assert "[nH+]" in str(pyridinium["SMILES"])
+
+    assert ionize_zinc_parent("CCCC(=O)N", "cation") is None
+    first = ionize_zinc_parent("OC(=O)CCC(=O)O", "anion")
+    second = ionize_zinc_parent("O=C(O)CCC(O)=O", "anion")
+    assert first is not None and second is not None
+    assert first["SMILES"] == second["SMILES"]
+    for result in (carboxylate, ammonium, pyridinium, first):
+        smiles = str(result["SMILES"])
+        assert fragment_count(smiles) == 1
+        assert formal_charge(smiles) in {-1, 1}
+
+
+def test_zinc_scan_only_freezes_startup_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    first_path = zinc_root / "zinc-22a/H06/H06M000/H06M000-M-a.smi.gz"
+    second_path = zinc_root / "zinc-22a/H07/H07O000/H07O000-O-a.smi.gz"
+    write_zinc_shard(first_path, [("CC(=O)O", "ZINC0001")])
+    manifest = write_zinc_manifest(
+        zinc_root,
+        [
+            first_path.relative_to(zinc_root).as_posix(),
+            second_path.relative_to(zinc_root).as_posix(),
+        ],
+    )
+    write_empty_stage1(output_root)
+
+    original_hash = training_splits.file_sha256
+
+    def add_file_after_snapshot(path: Path) -> str:
+        digest = original_hash(path)
+        if path == first_path and not second_path.exists():
+            write_zinc_shard(second_path, [("CCCCN", "ZINC0002")])
+        return digest
+
+    monkeypatch.setattr(training_splits, "file_sha256", add_file_after_snapshot)
+    summary = import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        target_per_ion_role=1,
+        scan_only=True,
+    )
+
+    assert summary["snapshot_files"] == 1
+    assert summary["manifest_files"] == 2
+    assert summary["processed_files"] == 1
+    assert (output_root / "stage1" / "augmentation" / "marker.txt").exists()
+
+    resumed = import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        target_per_ion_role=1,
+        scan_only=True,
+    )
+    assert resumed["snapshot_files"] == 2
+    assert resumed["processed_files"] == 1
+
+
+def test_zinc_formal_incomplete_input_preserves_augmentation(tmp_path: Path):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    path = zinc_root / "zinc-22a/H06/H06M000/H06M000-M-a.smi.gz"
+    manifest = write_zinc_manifest(
+        zinc_root,
+        [path.relative_to(zinc_root).as_posix()],
+    )
+    write_empty_stage1(output_root)
+    before = {
+        item.relative_to(output_root): item.read_bytes()
+        for item in (output_root / "stage1" / "augmentation").rglob("*")
+        if item.is_file()
+    }
+
+    with pytest.raises(TrainingSplitError, match="incomplete"):
+        import_zinc_diversity(
+            output_root,
+            zinc_root=zinc_root,
+            zinc_manifest=manifest,
+            target_per_ion_role=1,
+        )
+
+    assert before == {
+        item.relative_to(output_root): item.read_bytes()
+        for item in (output_root / "stage1" / "augmentation").rglob("*")
+        if item.is_file()
+    }
+
+
+def test_zinc_formal_skips_logged_missing_and_empty_sources(tmp_path: Path):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    available_paths = [
+        zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz",
+        zinc_root / "zinc-22a/H06/H06O000/H06O000-O.a.smi.gz",
+    ]
+    missing_path = zinc_root / "zinc-22a/H07/H07M000/H07M000-M.a.smi.gz"
+    empty_path = zinc_root / "zinc-22a/H07/H07O000/H07O000-O.a.smi.gz"
+    write_zinc_shard(available_paths[0], [("CC(=O)O", "ZINC0001")])
+    write_zinc_shard(available_paths[1], [("CCCCN", "ZINC0002")])
+    empty_path.parent.mkdir(parents=True)
+    empty_path.touch()
+    relative_paths = [
+        path.relative_to(zinc_root).as_posix()
+        for path in [*available_paths, missing_path, empty_path]
+    ]
+    manifest = write_zinc_manifest(zinc_root, relative_paths)
+    failed_log = write_zinc_failed_log(
+        zinc_root,
+        [relative_paths[2], relative_paths[3], relative_paths[2]],
+        extra_urls=["https://cache.docking.org/zinc22/not-in-manifest.smi.gz"],
+    )
+    # A historical failure must not override a subsequently valid local file.
+    with failed_log.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "https://cache.docking.org/zinc22/"
+            f"{relative_paths[0]}\n"
+        )
+    write_empty_stage1(output_root)
+
+    summary = import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        zinc_failed_log=failed_log,
+        minimum_per_ion_role=1,
+    )
+
+    assert summary["manifest_files"] == 4
+    assert summary["available_source_files"] == 2
+    assert summary["logged_unavailable_source_files"] == 2
+    assert summary["failed_log_nonmanifest_urls"] == 1
+    unavailable = pd.read_csv(
+        output_root
+        / "stage1/augmentation/_audit/zinc_unavailable_sources.csv"
+    )
+    assert dict(zip(unavailable["relative_path"], unavailable["reason"])) == {
+        relative_paths[2]: "missing_logged_failure",
+        relative_paths[3]: "empty_logged_failure",
+    }
+
+
+def test_zinc_logged_part_file_still_blocks_formal_import(tmp_path: Path):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    path = zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz"
+    part = path.with_name(f"{path.name}.part")
+    part.parent.mkdir(parents=True)
+    part.write_bytes(b"partial")
+    relative_path = path.relative_to(zinc_root).as_posix()
+    manifest = write_zinc_manifest(zinc_root, [relative_path])
+    failed_log = write_zinc_failed_log(zinc_root, [relative_path])
+    write_empty_stage1(output_root)
+
+    with pytest.raises(TrainingSplitError, match=r"\.part"):
+        import_zinc_diversity(
+            output_root,
+            zinc_root=zinc_root,
+            zinc_manifest=manifest,
+            zinc_failed_log=failed_log,
+            minimum_per_ion_role=1,
+        )
+
+
+def test_zinc_minimum_allows_existing_excess_without_truncation(
+    tmp_path: Path,
+):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    missing_paths = [
+        zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz",
+        zinc_root / "zinc-22a/H06/H06O000/H06O000-O.a.smi.gz",
+    ]
+    relative_paths = [
+        path.relative_to(zinc_root).as_posix() for path in missing_paths
+    ]
+    manifest = write_zinc_manifest(zinc_root, relative_paths)
+    failed_log = write_zinc_failed_log(zinc_root, relative_paths)
+    write_empty_stage1(output_root)
+    augmentation = output_root / "stage1" / "augmentation"
+    ions = {
+        "anion": ["CC(=O)[O-]", "CCC(=O)[O-]"],
+        "cation": ["CCC[NH3+]", "CCCC[NH3+]"],
+    }
+    for role, smiles_values in ions.items():
+        pd.DataFrame(
+            [
+                {
+                    "SMILES": canonicalize_smiles(smiles),
+                    "formal_charge": formal_charge(smiles),
+                    "origin_list": "rule",
+                    "seed_smiles_list": "seed",
+                    "rule_list": "existing_rule",
+                    "pubchem_cid_list": "",
+                    "mol_id_list": "",
+                }
+                for smiles in smiles_values
+            ],
+            columns=PRETRAIN_ENTITY_COLUMNS,
+        ).to_csv(augmentation / f"{role}.csv", index=False)
+
+    summary = import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        zinc_failed_log=failed_log,
+        minimum_per_ion_role=1,
+    )
+
+    assert summary["final_unique_by_role"] == {"anion": 2, "cation": 2}
+    assert summary["minimum_met_by_role"] == {"anion": True, "cation": True}
+    assert summary["excess_by_role"] == {"anion": 1, "cation": 1}
+    for role in ions:
+        assert len(pd.read_csv(augmentation / f"{role}.csv")) == 2
+
+
+def test_zinc_minimum_publishes_all_eligible_candidates(
+    tmp_path: Path,
+):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    paths = [
+        zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz",
+        zinc_root / "zinc-22a/H06/H06O000/H06O000-O.a.smi.gz",
+    ]
+    write_zinc_shard(
+        paths[0],
+        [
+            ("CC(=O)O", "ZINC0001"),
+            ("CCC(=O)O", "ZINC0002"),
+        ],
+    )
+    write_zinc_shard(
+        paths[1],
+        [
+            ("CCCN", "ZINC0003"),
+            ("CCCCN", "ZINC0004"),
+        ],
+    )
+    manifest = write_zinc_manifest(
+        zinc_root,
+        [path.relative_to(zinc_root).as_posix() for path in paths],
+    )
+    write_empty_stage1(output_root)
+
+    summary = import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        minimum_per_ion_role=1,
+    )
+
+    assert summary["selection_mode"] == "all_eligible"
+    assert summary["eligible_unique_by_role"] == {
+        "anion": 2,
+        "cation": 2,
+    }
+    assert summary["selected_new_by_role"] == {
+        "anion": 2,
+        "cation": 2,
+    }
+    assert summary["eligible_not_selected"] == 0
+    assert summary["final_unique_by_role"] == {
+        "anion": 2,
+        "cation": 2,
+    }
+    assert summary["excess_by_role"] == {"anion": 1, "cation": 1}
+    balance = pd.read_csv(
+        output_root
+        / "stage1/augmentation/_audit/zinc_selection_balance.csv"
+    )
+    assert balance["available"].equals(balance["quota"])
+    assert balance["available"].equals(balance["selected"])
+
+
+def test_zinc_import_is_order_independent_and_merges_overlap_provenance(
+    tmp_path: Path,
+):
+    outputs: list[dict[str, list[str]]] = []
+    rows_by_charge = {
+        "M": [
+            ("CC(=O)O", "ZINC0001"),
+            ("CCC(=O)O", "ZINC0002"),
+        ],
+        "O": [
+            ("CCCCN", "ZINC0003"),
+            ("CCCN", "ZINC0004"),
+        ],
+    }
+    for run, reverse in enumerate((False, True)):
+        output_root = tmp_path / f"training-{run}"
+        zinc_root = tmp_path / f"ZINC-{run}" / "zinc22_smi_data"
+        relative_paths: list[str] = []
+        for charge in ("M", "O"):
+            path = (
+                zinc_root
+                / "zinc-22a/H06"
+                / f"H06{charge}000"
+                / f"H06{charge}000-{charge}-a.smi.gz"
+            )
+            rows = (
+                list(reversed(rows_by_charge[charge]))
+                if reverse
+                else rows_by_charge[charge]
+            )
+            write_zinc_shard(path, rows)
+            relative_paths.append(path.relative_to(zinc_root).as_posix())
+        manifest = write_zinc_manifest(
+            zinc_root,
+            list(reversed(relative_paths)) if reverse else relative_paths,
+        )
+        write_empty_stage1(output_root)
+
+        overlapping = ionize_zinc_parent("CC(=O)O", "anion")
+        assert overlapping is not None
+        augmentation = output_root / "stage1" / "augmentation"
+        pd.DataFrame(
+            [
+                {
+                    "SMILES": overlapping["SMILES"],
+                    "formal_charge": -1,
+                    "origin_list": "rule",
+                    "seed_smiles_list": "seed",
+                    "rule_list": "existing_rule",
+                    "pubchem_cid_list": "",
+                    "mol_id_list": "",
+                }
+            ],
+            columns=PRETRAIN_ENTITY_COLUMNS,
+        ).to_csv(augmentation / "anion.csv", index=False)
+
+        summary = import_zinc_diversity(
+            output_root,
+            zinc_root=zinc_root,
+            zinc_manifest=manifest,
+            target_per_ion_role=2,
+            diversity_seed=42,
+        )
+        assert summary["completion_status"] == "complete"
+        anion = pd.read_csv(augmentation / "anion.csv", keep_default_na=False)
+        overlap_row = anion.loc[anion["SMILES"].eq(overlapping["SMILES"])].iloc[0]
+        assert overlap_row["origin_list"] == "rule;zinc"
+        outputs.append(
+            {
+                role: pd.read_csv(
+                    augmentation / f"{role}.csv",
+                    keep_default_na=False,
+                )["SMILES"].tolist()
+                for role in ("anion", "cation")
+            }
+        )
+
+    assert outputs[0] == outputs[1]
+
+
+def test_zinc_bad_gzip_and_unknown_charge_code_are_rejected(tmp_path: Path):
+    output_root = tmp_path / "training"
+    write_empty_stage1(output_root)
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    bad = zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"not a gzip stream")
+    manifest = write_zinc_manifest(
+        zinc_root,
+        [bad.relative_to(zinc_root).as_posix()],
+    )
+    before = (output_root / "stage1" / "augmentation" / "marker.txt").read_bytes()
+
+    with pytest.raises(TrainingSplitError, match="gzip"):
+        import_zinc_diversity(
+            output_root,
+            zinc_root=zinc_root,
+            zinc_manifest=manifest,
+            target_per_ion_role=1,
+        )
+    assert (
+        output_root / "stage1" / "augmentation" / "marker.txt"
+    ).read_bytes() == before
+
+    unknown = zinc_root / "zinc-22a/H06/H06M000/H06M000-X.a.smi.gz"
+    write_zinc_shard(unknown, [("CC(=O)O", "ZINC0001")])
+    unknown_manifest = write_zinc_manifest(
+        zinc_root,
+        [unknown.relative_to(zinc_root).as_posix()],
+    )
+    with pytest.raises(TrainingSplitError, match="charge code"):
+        import_zinc_diversity(
+            output_root,
+            zinc_root=zinc_root,
+            zinc_manifest=unknown_manifest,
+            target_per_ion_role=1,
+            scan_only=True,
+        )
+
+
+def test_zinc_bad_rows_and_duplicate_ids_have_bounded_audit(tmp_path: Path):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    anion_path = zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz"
+    cation_path = zinc_root / "zinc-22a/H06/H06O000/H06O000-O.a.smi.gz"
+    write_zinc_shard(
+        anion_path,
+        [
+            ("CC(=O)O", "ZINC0001"),
+            ("CCC(=O)O", "ZINC0001"),
+            ("bad", "row\textra"),
+        ],
+    )
+    write_zinc_shard(cation_path, [("CCCCN", "ZINC0002")])
+    manifest = write_zinc_manifest(
+        zinc_root,
+        [
+            anion_path.relative_to(zinc_root).as_posix(),
+            cation_path.relative_to(zinc_root).as_posix(),
+        ],
+    )
+    write_empty_stage1(output_root)
+
+    import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        target_per_ion_role=1,
+    )
+
+    audit = pd.read_csv(
+        output_root
+        / "stage1/augmentation/_audit/zinc_rejection_counts.csv"
+    )
+    counts = dict(zip(audit["reason"], audit["count"], strict=True))
+    assert counts["duplicate_zinc_row"] == 1
+    assert counts["malformed_row"] == 1
+    samples = pd.read_csv(
+        output_root
+        / "stage1/augmentation/_audit/zinc_rejection_samples.csv"
+    )
+    assert len(samples) <= 2 * training_splits.ZINC_REJECTION_SAMPLE_LIMIT
+
+
+def test_zinc_rerun_invalidates_only_changed_shard_and_is_idempotent(
+    tmp_path: Path,
+):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    anion_path = zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz"
+    cation_path = zinc_root / "zinc-22a/H06/H06O000/H06O000-O.a.smi.gz"
+    write_zinc_shard(anion_path, [("CC(=O)O", "ZINC0001")])
+    write_zinc_shard(cation_path, [("CCCCN", "ZINC0002")])
+    manifest = write_zinc_manifest(
+        zinc_root,
+        [
+            anion_path.relative_to(zinc_root).as_posix(),
+            cation_path.relative_to(zinc_root).as_posix(),
+        ],
+    )
+    write_empty_stage1(output_root)
+    first = import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        target_per_ion_role=1,
+    )
+    first_anion = pd.read_csv(
+        output_root / "stage1/augmentation/anion.csv"
+    )["SMILES"].tolist()
+    assert first["processed_files"] == 2
+
+    write_zinc_shard(anion_path, [("CCC(=O)O", "ZINC0003")])
+    second = import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        target_per_ion_role=1,
+    )
+    second_anion = pd.read_csv(
+        output_root / "stage1/augmentation/anion.csv"
+    )["SMILES"].tolist()
+
+    assert second["processed_files"] == 1
+    assert first_anion != second_anion
+    third = import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        target_per_ion_role=1,
+    )
+    third_anion = pd.read_csv(
+        output_root / "stage1/augmentation/anion.csv"
+    )["SMILES"].tolist()
+    assert third["processed_files"] == 0
+    assert third_anion == second_anion
+    with pytest.raises(TrainingSplitError, match="already published"):
+        augment_pretraining_entities(
+            output_root,
+            client=EmptyPubChemClient(),
+        )
+
+
+@pytest.mark.parametrize(
+    "minimum_option",
+    ["--minimum-per-ion-role", "--target-per-ion-role"],
+)
+def test_zinc_cli_smoke_uses_synthetic_gzip_and_temporary_output(
+    tmp_path: Path,
+    minimum_option: str,
+):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    paths = [
+        zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz",
+        zinc_root / "zinc-22a/H06/H06O000/H06O000-O.a.smi.gz",
+    ]
+    write_zinc_shard(paths[0], [("CC(=O)O", "ZINC0001")])
+    write_zinc_shard(paths[1], [("CCCCN", "ZINC0002")])
+    manifest = write_zinc_manifest(
+        zinc_root,
+        [path.relative_to(zinc_root).as_posix() for path in paths],
+    )
+    write_empty_stage1(output_root)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(training_splits.__file__).resolve()),
+            "import-zinc-diversity",
+            "--output-root",
+            str(output_root),
+            "--zinc-root",
+            str(zinc_root),
+            "--zinc-manifest",
+            str(manifest),
+            minimum_option,
+            "1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "anion=1, cation=1" in completed.stdout
+    for role, expected_charge in (("anion", -1), ("cation", 1)):
+        frame = pd.read_csv(
+            output_root / "stage1" / "augmentation" / f"{role}.csv"
+        )
+        assert len(frame) == 1
+        assert formal_charge(frame.loc[0, "SMILES"]) == expected_charge
+
+
+def test_zinc_scan_resumes_after_file_boundary_interruption(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    paths = [
+        zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz",
+        zinc_root / "zinc-22a/H06/H06O000/H06O000-O.a.smi.gz",
+    ]
+    write_zinc_shard(paths[0], [("CC(=O)O", "ZINC0001")])
+    write_zinc_shard(paths[1], [("CCCCN", "ZINC0002")])
+    manifest = write_zinc_manifest(
+        zinc_root,
+        [path.relative_to(zinc_root).as_posix() for path in paths],
+    )
+    write_empty_stage1(output_root)
+    original_process = training_splits._process_zinc_source
+    calls = 0
+
+    def interrupt_second_file(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return original_process(*args, **kwargs)
+
+    monkeypatch.setattr(
+        training_splits,
+        "_process_zinc_source",
+        interrupt_second_file,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        import_zinc_diversity(
+            output_root,
+            zinc_root=zinc_root,
+            zinc_manifest=manifest,
+            target_per_ion_role=1,
+            scan_only=True,
+        )
+    monkeypatch.setattr(
+        training_splits,
+        "_process_zinc_source",
+        original_process,
+    )
+
+    resumed = import_zinc_diversity(
+        output_root,
+        zinc_root=zinc_root,
+        zinc_manifest=manifest,
+        target_per_ion_role=1,
+        scan_only=True,
+    )
+
+    assert resumed["processed_files"] == 1
+    assert (output_root / "stage1/augmentation/marker.txt").exists()
+
+
+def test_zinc_chemical_shortage_preserves_previous_augmentation(
+    tmp_path: Path,
+):
+    output_root = tmp_path / "training"
+    zinc_root = tmp_path / "ZINC" / "zinc22_smi_data"
+    paths = [
+        zinc_root / "zinc-22a/H06/H06M000/H06M000-M.a.smi.gz",
+        zinc_root / "zinc-22a/H06/H06O000/H06O000-O.a.smi.gz",
+    ]
+    write_zinc_shard(paths[0], [("CCCC", "ZINC0001")])
+    write_zinc_shard(paths[1], [("CCCCN", "ZINC0002")])
+    manifest = write_zinc_manifest(
+        zinc_root,
+        [path.relative_to(zinc_root).as_posix() for path in paths],
+    )
+    write_empty_stage1(output_root)
+    before = {
+        path.relative_to(output_root): path.read_bytes()
+        for path in (output_root / "stage1/augmentation").rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(TrainingSplitError, match="insufficient"):
+        import_zinc_diversity(
+            output_root,
+            zinc_root=zinc_root,
+            zinc_manifest=manifest,
+            target_per_ion_role=1,
+        )
+
+    assert before == {
+        path.relative_to(output_root): path.read_bytes()
+        for path in (output_root / "stage1/augmentation").rglob("*")
+        if path.is_file()
+    }
+
+
 def test_resonance_eligibility_has_conservative_boundaries():
     assert resonance_eligibility("C" * 50, 50, 2).eligible
     heavy = resonance_eligibility("C" * 51, 50, 2)
@@ -882,11 +1610,14 @@ def test_partial_pubchem_failure_writes_output_and_resumes_only_failure(
         client=first_client,
     )
 
-    assert first["augmentation_entities"] == 1
     molecule_path = (
         output_root / "stage1" / "augmentation" / "molecule.csv"
     )
-    assert pd.read_csv(molecule_path)["SMILES"].tolist() == ["CCCl"]
+    first_molecule = pd.read_csv(molecule_path, keep_default_na=False)
+    assert first["augmentation_entities"] == len(first_molecule)
+    first_chloride = first_molecule.set_index("SMILES").loc["CCCl"]
+    assert "pubchem" in first_chloride["origin_list"].split(";")
+    assert str(first_chloride["pubchem_cid_list"]) == "7"
     audit_root = output_root / "stage1" / "augmentation" / "_audit"
     summary = json.loads(
         (audit_root / "augmentation_summary.json").read_text()
@@ -910,8 +1641,12 @@ def test_partial_pubchem_failure_writes_output_and_resumes_only_failure(
     )
 
     assert second_client.calls == ["CCO"]
-    assert second["augmentation_entities"] == 2
-    assert set(pd.read_csv(molecule_path)["SMILES"]) == {"CCCl", "CO"}
+    second_molecule = pd.read_csv(molecule_path, keep_default_na=False)
+    assert second["augmentation_entities"] == len(second_molecule)
+    assert set(first_molecule["SMILES"]) <= set(second_molecule["SMILES"])
+    recovered = second_molecule.set_index("SMILES").loc["CO"]
+    assert "pubchem" in recovered["origin_list"].split(";")
+    assert str(recovered["pubchem_cid_list"]) == "8"
     summary = json.loads(
         (audit_root / "augmentation_summary.json").read_text()
     )
@@ -1089,7 +1824,41 @@ def test_augmentation_keeps_resonance_forms_as_independent_rows(
     assert (stage1 / "IL.csv").read_bytes() == original_il
 
 
-def test_neutral_augmentation_uses_pubchem_without_structural_rules(
+def test_neutral_rule_generation_shares_generic_ion_transformations():
+    cases = {
+        "CCCC": {"terminal_alkyl", "alkyl_branching"},
+        "CCCl": {"halogen"},
+        "CCO": {"hydroxyl_thiol"},
+        "c1ccccc1": {"aromatic_CH_N"},
+    }
+    for seed, expected_families in cases.items():
+        generated = generate_rule_candidates(seed, "molecule")
+        families = {row["family"] for row in generated}
+        assert expected_families <= families
+        for row in generated:
+            candidate = row["SMILES"]
+            assert formal_charge(candidate) == 0
+            assert fragment_count(candidate) == 1
+
+    halogen_rules = {
+        row["rule"] for row in generate_rule_candidates("CCCl", "molecule")
+    }
+    assert "halogen_Cl_to_I" in halogen_rules
+    neutral_perfluoro = generate_rule_candidates(
+        "FC(F)(F)C(F)(F)F",
+        "molecule",
+    )
+    assert all(
+        not row["rule"].startswith("perfluoroalkyl_")
+        for row in neutral_perfluoro
+    )
+    assert all(
+        not row["rule"].startswith("cation_headgroup_")
+        for row in neutral_perfluoro
+    )
+
+
+def test_neutral_augmentation_combines_shared_rules_and_pubchem(
     tmp_path: Path,
 ):
     output_root = tmp_path / "training"
@@ -1124,7 +1893,7 @@ def test_neutral_augmentation_uses_pubchem_without_structural_rules(
         client=FakePubChemClient(),
     )
 
-    assert summary["augmentation_entities"] == 2
+    assert summary["augmentation_entities"] > 2
     molecule = pd.read_csv(stage1 / "molecule.csv", keep_default_na=False)
     assert list(molecule.columns) == PRETRAIN_ENTITY_COLUMNS
     assert molecule.set_index("SMILES").loc["CCF", "origin_list"] == "dataset"
@@ -1132,16 +1901,57 @@ def test_neutral_augmentation_uses_pubchem_without_structural_rules(
         stage1 / "augmentation" / "molecule.csv",
         keep_default_na=False,
     ).set_index("SMILES")
-    assert set(augmented.index) == {"CCBr", "CCO"}
+    assert {"CCBr", "CCO", "CCCl", "CCI"} <= set(augmented.index)
     pubchem_halogen = augmented.loc["CCBr"]
-    assert pubchem_halogen["origin_list"] == "pubchem"
+    assert pubchem_halogen["origin_list"] == "pubchem;rule"
     assert pubchem_halogen["seed_smiles_list"] == "CCF"
-    assert pubchem_halogen["rule_list"] == ""
+    assert pubchem_halogen["rule_list"] == "halogen_F_to_Br"
     assert str(pubchem_halogen["pubchem_cid_list"]) == "2"
     pubchem_only = augmented.loc["CCO"]
     assert pubchem_only["origin_list"] == "pubchem"
     assert str(pubchem_only["pubchem_cid_list"]) == "3"
     assert not (stage1 / "augmentation_provenance.csv").exists()
+
+
+def test_neutral_ruleset_migration_preserves_completed_pubchem_state(
+    tmp_path: Path,
+    monkeypatch,
+):
+    output_root = tmp_path / "training"
+    write_stage1_molecules(output_root, ["CCF"])
+    augment_pretraining_entities(
+        output_root,
+        client=EmptyPubChemClient(),
+    )
+    cache = output_root / ".cache" / "stage1_augmentation.sqlite"
+    with training_splits.sqlite3.connect(cache) as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+            ("neutral_ruleset_version", "0"),
+        )
+
+    original_generator = training_splits._generate_rule_candidates_with_audit
+    generated_roles: list[str] = []
+
+    def counting_generator(smiles, role, **kwargs):
+        generated_roles.append(role)
+        return original_generator(smiles, role, **kwargs)
+
+    class ForbiddenPubChemClient:
+        def similarity(self, *_args, **_kwargs):
+            raise AssertionError("completed PubChem state must be preserved")
+
+    monkeypatch.setattr(
+        training_splits,
+        "_generate_rule_candidates_with_audit",
+        counting_generator,
+    )
+    augment_pretraining_entities(
+        output_root,
+        client=ForbiddenPubChemClient(),
+    )
+
+    assert generated_roles == ["molecule"]
 
 
 def test_augmentation_exports_all_novel_candidates_and_consistent_audit(
@@ -1170,8 +1980,11 @@ def test_augmentation_exports_all_novel_candidates_and_consistent_audit(
         augmentation / "molecule.csv",
         keep_default_na=False,
     )
-    assert set(molecule["SMILES"]) == {"CCBr", "CCC", "CN", "CO"}
-    assert set(molecule["origin_list"]) == {"pubchem"}
+    assert {"CCBr", "CCC", "CN", "CO"} <= set(molecule["SMILES"])
+    pubchem_rows = molecule[
+        molecule["origin_list"].str.split(";").map(lambda origins: "pubchem" in origins)
+    ]
+    assert {"CCBr", "CCC", "CN", "CO"} <= set(pubchem_rows["SMILES"])
     assert summary == json.loads(
         (
             augmentation / "_audit" / "augmentation_summary.json"
@@ -1183,22 +1996,21 @@ def test_augmentation_exports_all_novel_candidates_and_consistent_audit(
         "cation": 0,
         "molecule": 2,
     }
-    assert summary["candidate_relation_rows"] == {
-        "pubchem_similarity": 6,
-        "rule": 0,
-    }
-    assert summary["augmentation_entities"] == 4
+    assert summary["candidate_relation_rows"]["pubchem_similarity"] == 6
+    assert summary["candidate_relation_rows"]["rule"] > 0
+    assert summary["augmentation_entities"] == len(molecule)
     assert summary["augmentation_entities_by_role"] == {
         "anion": 0,
         "cation": 0,
-        "molecule": 4,
+        "molecule": len(molecule),
     }
-    assert summary["augmentation_entities_by_origin"] == {
-        "rule_only": 0,
-        "pubchem_only": 4,
-        "both": 0,
+    expected_origin_counts = {
+        "rule_only": int((molecule["origin_list"] == "rule").sum()),
+        "pubchem_only": int((molecule["origin_list"] == "pubchem").sum()),
+        "both": int((molecule["origin_list"] == "pubchem;rule").sum()),
     }
-    assert summary["excluded_base_overlaps"] == 2
+    assert summary["augmentation_entities_by_origin"] == expected_origin_counts
+    assert summary["excluded_base_overlaps"] >= 2
     assert root_snapshot == {
         path: path.read_bytes() for path in root_snapshot
     }
@@ -1249,15 +2061,9 @@ def test_neutral_resonance_overlap_merges_rule_and_pubchem_provenance(
     assert resonance["rule_list"] == "resonance_equivalent"
     assert resonance["seed_smiles_list"] == "N#[N+][O-]"
     assert str(resonance["pubchem_cid_list"]) == "2"
-    assert summary["candidate_relation_rows"] == {
-        "pubchem_similarity": 1,
-        "rule": 1,
-    }
-    assert summary["augmentation_entities_by_origin"] == {
-        "rule_only": 0,
-        "pubchem_only": 0,
-        "both": 1,
-    }
+    assert summary["candidate_relation_rows"]["pubchem_similarity"] == 1
+    assert summary["candidate_relation_rows"]["rule"] >= 1
+    assert summary["augmentation_entities_by_origin"]["both"] == 1
     assert summary["resonance_generated"] == 1
     assert summary["resonance_exported"] == 1
     assert (stage1 / "IL.csv").read_bytes() == original_il

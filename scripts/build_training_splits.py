@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
+import gzip
 import hashlib
+import heapq
 from http import client as http_client
 import json
+import math
 import os
 from pathlib import Path
+import re
 import signal
 import shutil
 import sqlite3
@@ -28,12 +33,20 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem, rdBase
 from rdkit.Chem import inchi
+from rdkit.Chem.Scaffolds import MurckoScaffold
 from sklearn.model_selection import GroupKFold
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FINAL_ROOT = PROJECT_ROOT / "data" / "final"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data" / "training_splits"
+DEFAULT_ZINC_ROOT = PROJECT_ROOT / "data" / "raw" / "ZINC" / "zinc22_smi_data"
+DEFAULT_ZINC_MANIFEST = (
+    PROJECT_ROOT / "data" / "raw" / "ZINC" / "zinc22_smi_urls.txt"
+)
+DEFAULT_ZINC_FAILED_LOG = (
+    PROJECT_ROOT / "data" / "raw" / "ZINC" / "zinc22_smi_failed.log"
+)
 
 BUCKETS = ("experiment", "simulation")
 ROLE_BY_COLUMN = {
@@ -85,11 +98,30 @@ FOLD_BALANCE_COLUMNS = [
     "theoretical_lower_bound",
     "unavoidable_group_dominance",
 ]
-ORIGIN_ORDER = {"dataset": 0, "pubchem": 1, "rule": 2}
+ORIGIN_ORDER = {"dataset": 0, "pubchem": 1, "rule": 2, "zinc": 3}
 DEFAULT_RESONANCE_MAX_STRUCTS = 256
 DEFAULT_RESONANCE_MAX_HEAVY_ATOMS = 50
 DEFAULT_RESONANCE_MAX_ABS_CHARGE = 2
 AUGMENTATION_CACHE_VERSION = 1
+NEUTRAL_RULESET_VERSION = 1
+ZINC_DIVERSITY_CACHE_VERSION = 2
+ZINC_PRESAMPLE_MULTIPLIER = 4
+ZINC_REJECTION_SAMPLE_LIMIT = 20
+ZINC_ALLOWED_ELEMENTS = {
+    "H",
+    "B",
+    "C",
+    "N",
+    "O",
+    "F",
+    "Si",
+    "P",
+    "S",
+    "Cl",
+    "Se",
+    "Br",
+    "I",
+}
 
 STAGE2_FILES = {
     "simulation/density.csv",
@@ -205,6 +237,25 @@ class TaskProfile:
     rows: int
     system_count: int
     tier: str
+
+
+@dataclass(frozen=True)
+class ZincSource:
+    url: str
+    relative_path: str
+    path: Path
+    role: str
+    layer: str
+    hac: int
+    logp_tranche: str
+
+
+@dataclass(frozen=True)
+class ZincUnavailableSource:
+    url: str
+    relative_path: str
+    role: str
+    reason: str
 
 
 def stable_id(namespace: str, *parts: object) -> str:
@@ -663,9 +714,12 @@ def _normalize_base_entity_roles(frame: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _combined_entity_frame(stage1_root: Path) -> pd.DataFrame:
+def _combined_entity_frame(
+    stage1_root: Path,
+    roles: Sequence[str] = PRETRAIN_ROLES,
+) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
-    for role in PRETRAIN_ROLES:
+    for role in roles:
         path = stage1_root / f"{role}.csv"
         if not path.exists():
             raise TrainingSplitError(
@@ -1303,7 +1357,7 @@ def _generate_rule_candidates_with_audit(
         target_charge,
     )
     candidates: dict[tuple[str, str], dict[str, str]] = {}
-    ion_role = target_charge != 0
+    shared_generic_rules = effective_role in PRETRAIN_ROLES
     eligibility = resonance_eligibility(
         canonical,
         resonance_max_heavy_atoms,
@@ -1364,12 +1418,12 @@ def _generate_rule_candidates_with_audit(
             "resonance_truncated": truncated,
         }
 
-    if target_charge == 0:
+    if not shared_generic_rules:
         return result()
 
     for chain in _terminal_alkyl_chains(molecule):
         terminal_index = chain[0]
-        carbon_counts = (1, 2, 3, 4) if ion_role else (1, 2)
+        carbon_counts = (1, 2, 3, 4)
         for carbon_count in carbon_counts:
             if molecule.GetAtomWithIdx(terminal_index).GetTotalNumHs() < 1:
                 continue
@@ -1405,7 +1459,7 @@ def _generate_rule_candidates_with_audit(
                 family="terminal_alkyl",
             )
 
-        if ion_role and len(chain) >= 3:
+        if shared_generic_rules and len(chain) >= 3:
             editable = Chem.RWMol(molecule)
             editable.RemoveBond(chain[0], chain[1])
             editable.AddBond(chain[0], chain[2], Chem.BondType.SINGLE)
@@ -1418,7 +1472,7 @@ def _generate_rule_candidates_with_audit(
                 family="alkyl_branching",
             )
 
-    if ion_role:
+    if shared_generic_rules:
         for branch_atom in molecule.GetAtoms():
             if not _is_alkyl_carbon(branch_atom):
                 continue
@@ -1460,7 +1514,7 @@ def _generate_rule_candidates_with_audit(
             )
 
     halogen_symbols = {9: "F", 17: "Cl", 35: "Br"}
-    if ion_role:
+    if shared_generic_rules:
         halogen_symbols[53] = "I"
 
     for atom in molecule.GetAtoms():
@@ -1626,7 +1680,7 @@ def _generate_rule_candidates_with_audit(
                     family="perfluoroalkyl",
                 )
 
-    if ion_role:
+    if shared_generic_rules:
         chalcogen_symbols = {8: "O", 16: "S"}
         for atom in molecule.GetAtoms():
             if atom.GetAtomicNum() not in chalcogen_symbols:
@@ -1634,7 +1688,8 @@ def _generate_rule_candidates_with_audit(
             bonds = list(atom.GetBonds())
             family: str | None = None
             if (
-                atom.GetFormalCharge() == -1
+                effective_role == "anion"
+                and atom.GetFormalCharge() == -1
                 and atom.GetDegree() == 1
                 and len(bonds) == 1
                 and bonds[0].GetBondType() == Chem.BondType.SINGLE
@@ -1921,6 +1976,36 @@ def _open_augmentation_database(
     if stored_fingerprint is not None and stored_fingerprint[0] != fingerprint:
         connection.execute("DELETE FROM candidates")
         connection.execute("DELETE FROM seed_status")
+    stored_neutral_ruleset = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'neutral_ruleset_version'"
+    ).fetchone()
+    if stored_neutral_ruleset != (str(NEUTRAL_RULESET_VERSION),):
+        connection.execute(
+            """
+            DELETE FROM candidates
+            WHERE method = 'rule'
+              AND seed_entity_id IN (
+                  SELECT seed_entity_id
+                  FROM seed_status
+                  WHERE role = 'molecule'
+              )
+            """
+        )
+        connection.execute(
+            """
+            UPDATE seed_status
+            SET
+                local_status = 'pending',
+                heavy_atom_count = NULL,
+                formal_charge = NULL,
+                resonance_status = 'pending',
+                resonance_skip_reason = '',
+                resonance_examined = 0,
+                resonance_generated = 0,
+                resonance_truncated = 0
+            WHERE role = 'molecule'
+            """
+        )
     connection.executemany(
         """
         INSERT INTO metadata(key, value) VALUES (?, ?)
@@ -1928,6 +2013,7 @@ def _open_augmentation_database(
         """,
         (
             ("cache_version", str(AUGMENTATION_CACHE_VERSION)),
+            ("neutral_ruleset_version", str(NEUTRAL_RULESET_VERSION)),
             ("fingerprint", fingerprint),
             (
                 "config",
@@ -2256,6 +2342,7 @@ def _write_augmentation_files(
                 "partial_pubchem" if not failures.empty else "complete"
             ),
             "config": dict(config),
+            "neutral_ruleset_version": NEUTRAL_RULESET_VERSION,
             "excluded_base_overlaps": excluded_base_overlaps,
             "pubchem_failed_seeds": len(failures),
             "pubchem_ok_seeds": int(pubchem_status_counts.get("ok", 0)),
@@ -2326,6 +2413,43 @@ def augment_pretraining_entities(
 
     output_root = Path(output_root)
     stage1_root = output_root / "stage1"
+    zinc_cache = output_root / ".cache" / "stage1_zinc_diversity.sqlite"
+    if zinc_cache.exists():
+        zinc_connection: sqlite3.Connection | None = None
+        try:
+            zinc_connection = sqlite3.connect(
+                f"file:{zinc_cache}?mode=ro",
+                uri=True,
+            )
+            published = zinc_connection.execute(
+                "SELECT value FROM metadata WHERE key = 'publication_complete'"
+            ).fetchone()
+        except sqlite3.Error:
+            published = None
+        finally:
+            if zinc_connection is not None:
+                zinc_connection.close()
+        zinc_rows_present = False
+        augmentation_root = stage1_root / "augmentation"
+        if published == ("1",) and augmentation_root.is_dir():
+            for role in ("anion", "cation"):
+                role_path = augmentation_root / f"{role}.csv"
+                if not role_path.exists():
+                    continue
+                with role_path.open(encoding="utf-8", newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        if "zinc" in _split_joined(row.get("origin_list", "")):
+                            zinc_rows_present = True
+                            break
+                if zinc_rows_present:
+                    break
+        if published == ("1",) and zinc_rows_present:
+            raise TrainingSplitError(
+                "ZINC diversity augmentation is already published. Run "
+                "extract-pretrain, augment-pretrain, then "
+                "import-zinc-diversity to rebuild all Stage1 layers without "
+                "silently discarding ZINC provenance."
+            )
     base = _combined_entity_frame(stage1_root)
 
     fingerprint, config = _augmentation_fingerprint(
@@ -2660,6 +2784,1729 @@ def augment_pretraining_entities(
 
     (output_root / "manifest.json").unlink(missing_ok=True)
     return summary
+
+
+def _bonded_to_double_hetero(atom: Chem.Atom) -> bool:
+    for neighbor in atom.GetNeighbors():
+        if neighbor.GetAtomicNum() != 6:
+            continue
+        for bond in neighbor.GetBonds():
+            other = bond.GetOtherAtom(neighbor)
+            if (
+                other.GetIdx() != atom.GetIdx()
+                and bond.GetBondType() == Chem.BondType.DOUBLE
+                and other.GetSymbol() in {"N", "O", "S"}
+            ):
+                return True
+    return False
+
+
+def _sulfonyl_neighbor(atom: Chem.Atom) -> bool:
+    for neighbor in atom.GetNeighbors():
+        if neighbor.GetSymbol() != "S":
+            continue
+        double_oxygen_count = sum(
+            bond.GetBondType() == Chem.BondType.DOUBLE
+            and bond.GetOtherAtom(neighbor).GetSymbol() == "O"
+            for bond in neighbor.GetBonds()
+        )
+        if double_oxygen_count:
+            return True
+    return False
+
+
+def _change_atom_protonation(
+    molecule: Chem.Mol,
+    atom_index: int,
+    delta: int,
+) -> str | None:
+    editable = Chem.RWMol(molecule)
+    atom = editable.GetAtomWithIdx(atom_index)
+    total_hydrogens = int(atom.GetTotalNumHs())
+    if delta < 0 and total_hydrogens < 1:
+        return None
+    atom.SetFormalCharge(atom.GetFormalCharge() + delta)
+    atom.SetNumExplicitHs(
+        total_hydrogens + 1 if delta > 0 else total_hydrogens - 1
+    )
+    atom.SetNoImplicit(True)
+    try:
+        with rdBase.BlockLogs():
+            Chem.SanitizeMol(editable)
+        return canonicalize_smiles(
+            Chem.MolToSmiles(
+                editable,
+                canonical=True,
+                isomericSmiles=True,
+            )
+        )
+    except (ValueError, RuntimeError, TrainingSplitError):
+        return None
+
+
+def _zinc_parent_rejection(molecule: Chem.Mol) -> str | None:
+    if len(Chem.GetMolFrags(molecule)) != 1:
+        return "multiple_fragments"
+    heavy_atom_count = molecule.GetNumHeavyAtoms()
+    if not 4 <= heavy_atom_count <= 50:
+        return "heavy_atom_count"
+    if any(
+        atom.GetSymbol() not in ZINC_ALLOWED_ELEMENTS
+        for atom in molecule.GetAtoms()
+    ):
+        return "unsupported_element"
+    if any(atom.GetNumRadicalElectrons() for atom in molecule.GetAtoms()):
+        return "radical"
+    return None
+
+
+def _cation_sites(molecule: Chem.Mol) -> list[tuple[int, str, int]]:
+    sites: list[tuple[int, str, int]] = []
+    for atom in molecule.GetAtoms():
+        if atom.GetFormalCharge() != 0:
+            continue
+        symbol = atom.GetSymbol()
+        if symbol == "N":
+            if _bonded_to_double_hetero(atom) or _sulfonyl_neighbor(atom):
+                continue
+            if any(
+                neighbor.GetSymbol() == "N"
+                and molecule.GetBondBetweenAtoms(
+                    atom.GetIdx(), neighbor.GetIdx()
+                ).GetBondType()
+                == Chem.BondType.DOUBLE
+                for neighbor in atom.GetNeighbors()
+            ):
+                continue
+            if atom.GetIsAromatic():
+                if atom.GetTotalNumHs() == 0:
+                    sites.append(
+                        (30, "zinc_protonate_aromatic_n", atom.GetIdx())
+                    )
+                continue
+            amidine = any(
+                neighbor.GetSymbol() == "C"
+                and any(
+                    bond.GetBondType() == Chem.BondType.DOUBLE
+                    and bond.GetOtherAtom(neighbor).GetSymbol() == "N"
+                    for bond in neighbor.GetBonds()
+                )
+                for neighbor in atom.GetNeighbors()
+            )
+            if amidine:
+                sites.append(
+                    (10, "zinc_protonate_amidine_guanidine", atom.GetIdx())
+                )
+            elif any(
+                bond.GetBondType() == Chem.BondType.DOUBLE
+                for bond in atom.GetBonds()
+            ):
+                sites.append((20, "zinc_protonate_imine", atom.GetIdx()))
+            elif all(
+                bond.GetBondType() == Chem.BondType.SINGLE
+                for bond in atom.GetBonds()
+            ) and atom.GetTotalValence() <= 3:
+                sites.append((25, "zinc_protonate_amine", atom.GetIdx()))
+        elif symbol == "P":
+            has_phosphoryl = any(
+                bond.GetBondType() == Chem.BondType.DOUBLE
+                and bond.GetOtherAtom(atom).GetSymbol() == "O"
+                for bond in atom.GetBonds()
+            )
+            if not has_phosphoryl and atom.GetTotalValence() <= 3:
+                sites.append((40, "zinc_protonate_phosphine", atom.GetIdx()))
+        elif symbol == "S":
+            has_multiple_bond = any(
+                bond.GetBondType() != Chem.BondType.SINGLE
+                for bond in atom.GetBonds()
+            )
+            if not has_multiple_bond and atom.GetDegree() == 2:
+                sites.append((50, "zinc_protonate_sulfide", atom.GetIdx()))
+    return sites
+
+
+def _is_tetrazole_n(atom: Chem.Atom) -> bool:
+    if not atom.GetIsAromatic() or atom.GetSymbol() != "N":
+        return False
+    for ring in atom.GetOwningMol().GetRingInfo().AtomRings():
+        if atom.GetIdx() in ring and len(ring) == 5:
+            if sum(
+                atom.GetOwningMol().GetAtomWithIdx(index).GetSymbol() == "N"
+                for index in ring
+            ) >= 3:
+                return True
+    return False
+
+
+def _anion_sites(molecule: Chem.Mol) -> list[tuple[int, str, int]]:
+    sites: list[tuple[int, str, int]] = []
+    for atom in molecule.GetAtoms():
+        if atom.GetFormalCharge() != 0 or atom.GetTotalNumHs() < 1:
+            continue
+        symbol = atom.GetSymbol()
+        if symbol == "O":
+            neighbors = list(atom.GetNeighbors())
+            if len(neighbors) != 1:
+                continue
+            neighbor = neighbors[0]
+            if neighbor.GetSymbol() == "S":
+                sites.append(
+                    (10, "zinc_deprotonate_sulfonic_sulfinic_acid", atom.GetIdx())
+                )
+            elif neighbor.GetSymbol() == "P":
+                sites.append(
+                    (20, "zinc_deprotonate_phosphoric_phosphonic_acid", atom.GetIdx())
+                )
+            elif neighbor.GetSymbol() == "C" and any(
+                bond.GetBondType() == Chem.BondType.DOUBLE
+                and bond.GetOtherAtom(neighbor).GetSymbol() == "O"
+                for bond in neighbor.GetBonds()
+            ):
+                sites.append(
+                    (30, "zinc_deprotonate_carboxylic_acid", atom.GetIdx())
+                )
+            elif neighbor.GetSymbol() == "B":
+                sites.append(
+                    (90, "zinc_deprotonate_boronic_acid", atom.GetIdx())
+                )
+            elif neighbor.GetIsAromatic():
+                sites.append((80, "zinc_deprotonate_phenol", atom.GetIdx()))
+        elif symbol == "S":
+            sites.append((70, "zinc_deprotonate_thiol", atom.GetIdx()))
+        elif symbol == "N":
+            if _is_tetrazole_n(atom):
+                sites.append((40, "zinc_deprotonate_tetrazole", atom.GetIdx()))
+                continue
+            acidic_neighbors = sum(
+                neighbor.GetSymbol() == "C"
+                and any(
+                    bond.GetBondType() == Chem.BondType.DOUBLE
+                    and bond.GetOtherAtom(neighbor).GetSymbol() in {"O", "S"}
+                    for bond in neighbor.GetBonds()
+                )
+                for neighbor in atom.GetNeighbors()
+            )
+            if acidic_neighbors >= 2:
+                sites.append((50, "zinc_deprotonate_imide", atom.GetIdx()))
+            elif _sulfonyl_neighbor(atom):
+                sites.append((60, "zinc_deprotonate_sulfonamide", atom.GetIdx()))
+    return sites
+
+
+def _ionize_zinc_parent_with_reason(
+    parent_smiles: str,
+    role: str,
+) -> tuple[dict[str, object] | None, str]:
+    if role not in {"anion", "cation"}:
+        raise TrainingSplitError(f"Unknown ZINC ion role: {role}")
+    try:
+        parent = canonicalize_smiles(parent_smiles)
+    except TrainingSplitError:
+        return None, "invalid_smiles"
+    molecule = Chem.MolFromSmiles(parent)
+    if molecule is None:  # pragma: no cover - canonicalization protects this
+        return None, "invalid_smiles"
+    rejection = _zinc_parent_rejection(molecule)
+    if rejection is not None:
+        return None, rejection
+    charge = int(sum(atom.GetFormalCharge() for atom in molecule.GetAtoms()))
+    target_charge = -1 if role == "anion" else 1
+    if charge == target_charge:
+        return (
+            {
+                "SMILES": parent,
+                "parent_smiles": parent,
+                "rule": "zinc_preserve_explicit_target_charge",
+                "family": "existing_charge",
+            },
+            "",
+        )
+    if charge != 0:
+        return None, "nonneutral_parent"
+
+    sites = _anion_sites(molecule) if role == "anion" else _cation_sites(molecule)
+    candidates: list[tuple[int, str, str]] = []
+    for priority, rule, atom_index in sites:
+        candidate = _change_atom_protonation(
+            molecule,
+            atom_index,
+            -1 if role == "anion" else 1,
+        )
+        if candidate is None:
+            continue
+        if formal_charge(candidate) != target_charge or fragment_count(candidate) != 1:
+            continue
+        candidates.append((priority, candidate, rule))
+    if not candidates:
+        return None, "no_supported_ionization_site"
+    priority, candidate, rule = min(candidates, key=lambda item: (item[0], item[1]))
+    del priority
+    return (
+        {
+            "SMILES": candidate,
+            "parent_smiles": parent,
+            "rule": rule,
+            "family": rule.removeprefix("zinc_protonate_").removeprefix(
+                "zinc_deprotonate_"
+            ),
+        },
+        "",
+    )
+
+
+def ionize_zinc_parent(
+    parent_smiles: str,
+    role: str,
+) -> dict[str, object] | None:
+    """Create one deterministic, explainable +/-1 ion from a ZINC parent."""
+    result, _reason = _ionize_zinc_parent_with_reason(parent_smiles, role)
+    return result
+
+
+def _zinc_scaffold(smiles: str) -> str:
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:  # pragma: no cover - cached candidates are validated
+        raise TrainingSplitError(f"Invalid cached ZINC candidate: {smiles}")
+    scaffold = MurckoScaffold.MurckoScaffoldSmiles(
+        mol=molecule,
+        includeChirality=True,
+    )
+    return scaffold or f"acyclic:{canonicalize_smiles(smiles)}"
+
+
+def _parse_zinc_source(url: str, zinc_root: Path) -> ZincSource:
+    prefix = "https://cache.docking.org/zinc22/"
+    if not url.startswith(prefix):
+        raise TrainingSplitError(f"Unsupported ZINC manifest URL: {url}")
+    relative_path = parse.unquote(url[len(prefix) :]).lstrip("/")
+    parts = Path(relative_path).parts
+    if len(parts) < 4:
+        raise TrainingSplitError(f"Malformed ZINC path: {relative_path}")
+    match = re.search(r"-([MO])(?:[-.])[A-Za-z]\.smi\.gz$", parts[-1])
+    if match is None:
+        raise TrainingSplitError(
+            f"Unknown ZINC charge code in manifest path: {relative_path}"
+        )
+    charge_code = match.group(1)
+    role = "anion" if charge_code == "M" else "cation"
+    hac_match = re.fullmatch(r"H(\d{2})", parts[-3])
+    if hac_match is None:
+        raise TrainingSplitError(f"Malformed ZINC HAC tranche: {relative_path}")
+    tranche = parts[-2]
+    if not tranche.startswith(parts[-3]) or len(tranche) <= len(parts[-3]):
+        raise TrainingSplitError(f"Malformed ZINC logP tranche: {relative_path}")
+    return ZincSource(
+        url=url,
+        relative_path=relative_path,
+        path=zinc_root / relative_path,
+        role=role,
+        layer=parts[-4],
+        hac=int(hac_match.group(1)),
+        logp_tranche=tranche[len(parts[-3]) :],
+    )
+
+
+def _read_zinc_manifest(path: Path, zinc_root: Path) -> list[ZincSource]:
+    if not path.is_file():
+        raise TrainingSplitError(f"Missing ZINC manifest: {path}")
+    urls = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not urls:
+        raise TrainingSplitError(f"Empty ZINC manifest: {path}")
+    if len(urls) != len(set(urls)):
+        raise TrainingSplitError(f"Duplicate URLs in ZINC manifest: {path}")
+    sources = [_parse_zinc_source(url, zinc_root) for url in urls]
+    relative_paths = [source.relative_path for source in sources]
+    if len(relative_paths) != len(set(relative_paths)):
+        raise TrainingSplitError(
+            f"Multiple ZINC URLs map to the same local file: {path}"
+        )
+    return sorted(sources, key=lambda source: source.relative_path)
+
+
+def _read_zinc_failed_log(path: Path) -> tuple[set[str], int]:
+    if not path.exists():
+        return set(), 0
+    if not path.is_file():
+        raise TrainingSplitError(f"Invalid ZINC failed log: {path}")
+    urls = [
+        line.strip()
+        for line in path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).splitlines()
+        if line.strip()
+    ]
+    return set(urls), len(urls) - len(set(urls))
+
+
+def _freeze_zinc_snapshot(
+    sources: Sequence[ZincSource],
+    *,
+    scan_only: bool,
+    failed_urls: set[str] | None = None,
+) -> tuple[list[ZincSource], list[ZincUnavailableSource], dict[str, int]]:
+    failed_urls = failed_urls or set()
+    snapshot: list[ZincSource] = []
+    unavailable: list[ZincUnavailableSource] = []
+    part_files: list[str] = []
+    unaccounted: list[str] = []
+    for source in sources:
+        part_path = source.path.with_name(f"{source.path.name}.part")
+        if part_path.exists():
+            part_files.append(source.relative_path)
+            continue
+        if source.path.is_file() and source.path.stat().st_size > 0:
+            snapshot.append(source)
+            continue
+        reason = (
+            "empty_logged_failure"
+            if source.path.exists()
+            else "missing_logged_failure"
+        )
+        if source.url in failed_urls:
+            unavailable.append(
+                ZincUnavailableSource(
+                    url=source.url,
+                    relative_path=source.relative_path,
+                    role=source.role,
+                    reason=reason,
+                )
+            )
+        else:
+            unaccounted.append(source.relative_path)
+    if not scan_only and (part_files or unaccounted):
+        examples = [
+            *(f"part:{path}" for path in part_files[:5]),
+            *(f"unaccounted:{path}" for path in unaccounted[:5]),
+        ][:5]
+        raise TrainingSplitError(
+            "ZINC input is incomplete: "
+            f"{len(part_files):,} manifest entries have .part files and "
+            f"{len(unaccounted):,} missing or empty entries are not listed "
+            "in the failed log; examples: "
+            + ", ".join(examples)
+        )
+    return snapshot, unavailable, {
+        "part_files": len(part_files),
+        "unaccounted_files": len(unaccounted),
+    }
+
+
+def _open_zinc_database(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS source_files (
+            relative_path TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            role TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            sample_quota INTEGER NOT NULL,
+            diversity_seed INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            sampled_rows INTEGER NOT NULL,
+            candidate_rows INTEGER NOT NULL,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS unavailable_sources (
+            relative_path TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            role TEXT NOT NULL,
+            reason TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS candidates (
+            relative_path TEXT NOT NULL,
+            role TEXT NOT NULL,
+            parent_smiles TEXT NOT NULL,
+            candidate_smiles TEXT NOT NULL,
+            zinc_id TEXT NOT NULL,
+            rule TEXT NOT NULL,
+            family TEXT NOT NULL,
+            layer TEXT NOT NULL,
+            hac INTEGER NOT NULL,
+            logp_tranche TEXT NOT NULL,
+            scaffold TEXT NOT NULL,
+            selection_hash TEXT NOT NULL,
+            scaffold_hash TEXT NOT NULL,
+            PRIMARY KEY(relative_path, role, parent_smiles, candidate_smiles, zinc_id),
+            FOREIGN KEY(relative_path) REFERENCES source_files(relative_path)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS zinc_candidates_role_smiles
+            ON candidates(role, candidate_smiles);
+        CREATE INDEX IF NOT EXISTS zinc_candidates_stratum
+            ON candidates(role, hac, logp_tranche, family);
+        CREATE TABLE IF NOT EXISTS rejection_counts (
+            relative_path TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY(relative_path, reason),
+            FOREIGN KEY(relative_path) REFERENCES source_files(relative_path)
+                ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS rejection_samples (
+            relative_path TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            line_number INTEGER NOT NULL,
+            raw_text TEXT NOT NULL,
+            PRIMARY KEY(relative_path, reason, line_number),
+            FOREIGN KEY(relative_path) REFERENCES source_files(relative_path)
+                ON DELETE CASCADE
+        );
+        """
+    )
+    version = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'cache_version'"
+    ).fetchone()
+    if version is not None and int(version[0]) != ZINC_DIVERSITY_CACHE_VERSION:
+        connection.close()
+        path.unlink()
+        return _open_zinc_database(path)
+    connection.execute(
+        "INSERT OR REPLACE INTO metadata(key, value) VALUES ('cache_version', ?)",
+        (str(ZINC_DIVERSITY_CACHE_VERSION),),
+    )
+    connection.commit()
+    return connection
+
+
+def _allocate_zinc_presample_quotas(
+    sources: Sequence[ZincSource],
+    budgets: Mapping[str, int],
+    manifest_source_counts: Mapping[str, int],
+) -> dict[str, int]:
+    quotas: dict[str, int] = {}
+    for role in ("anion", "cation"):
+        role_sources = [source for source in sources if source.role == role]
+        if not role_sources:
+            continue
+        manifest_count = int(manifest_source_counts.get(role, 0))
+        if manifest_count < len(role_sources):
+            raise TrainingSplitError(
+                f"Invalid ZINC manifest source count for {role}: "
+                f"{manifest_count} < {len(role_sources)}"
+            )
+        quota = max(
+            1,
+            math.ceil(int(budgets.get(role, 0)) / manifest_count),
+        )
+        for source in role_sources:
+            quotas[source.relative_path] = quota
+    return quotas
+
+
+def _record_zinc_rejection(
+    counts: Counter[str],
+    samples: dict[str, list[tuple[int, str]]],
+    reason: str,
+    line_number: int,
+    raw_text: str,
+) -> None:
+    counts[reason] += 1
+    if len(samples[reason]) < ZINC_REJECTION_SAMPLE_LIMIT:
+        samples[reason].append((line_number, raw_text[:500]))
+
+
+def _process_zinc_source(
+    connection: sqlite3.Connection,
+    source: ZincSource,
+    *,
+    sha256: str,
+    quota: int,
+    diversity_seed: int,
+) -> tuple[int, int, int]:
+    heap: list[tuple[int, int, str, str, str]] = []
+    row_count = 0
+    rejection_counts: Counter[str] = Counter()
+    rejection_samples: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    try:
+        with gzip.open(source.path, "rt", encoding="utf-8", newline="") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                raw_text = line.rstrip("\r\n")
+                if not raw_text:
+                    continue
+                row_count += 1
+                fields = raw_text.split("\t")
+                if len(fields) != 2 or not fields[0].strip() or not fields[1].strip():
+                    _record_zinc_rejection(
+                        rejection_counts,
+                        rejection_samples,
+                        "malformed_row",
+                        line_number,
+                        raw_text,
+                    )
+                    continue
+                raw_smiles, zinc_id = (field.strip() for field in fields)
+                rank = int(
+                    stable_id(
+                        f"zinc-presample:{diversity_seed}",
+                        source.role,
+                        source.layer,
+                        source.hac,
+                        source.logp_tranche,
+                        zinc_id,
+                        raw_smiles,
+                    ),
+                    16,
+                )
+                item = (-rank, -line_number, raw_smiles, zinc_id, raw_text)
+                if len(heap) < quota:
+                    heapq.heappush(heap, item)
+                elif rank < -heap[0][0]:
+                    heapq.heapreplace(heap, item)
+    except (EOFError, OSError, UnicodeError) as exc:
+        raise TrainingSplitError(
+            f"Invalid or incomplete ZINC gzip {source.path}: {exc}"
+        ) from exc
+
+    sampled = sorted(heap, key=lambda item: (-item[0], -item[1]))
+    candidate_rows: list[tuple[object, ...]] = []
+    seen_zinc_ids: set[str] = set()
+    for negative_rank, negative_line, raw_smiles, zinc_id, raw_text in sampled:
+        del negative_rank
+        line_number = -negative_line
+        if zinc_id in seen_zinc_ids:
+            _record_zinc_rejection(
+                rejection_counts,
+                rejection_samples,
+                "duplicate_zinc_row",
+                line_number,
+                raw_text,
+            )
+            continue
+        seen_zinc_ids.add(zinc_id)
+        result, reason = _ionize_zinc_parent_with_reason(raw_smiles, source.role)
+        if result is None:
+            _record_zinc_rejection(
+                rejection_counts,
+                rejection_samples,
+                reason,
+                line_number,
+                raw_text,
+            )
+            continue
+        candidate = str(result["SMILES"])
+        parent = str(result["parent_smiles"])
+        scaffold = _zinc_scaffold(parent)
+        candidate_rows.append(
+            (
+                source.relative_path,
+                source.role,
+                parent,
+                candidate,
+                zinc_id,
+                str(result["rule"]),
+                str(result["family"]),
+                source.layer,
+                source.hac,
+                source.logp_tranche,
+                scaffold,
+                stable_id(
+                    f"zinc-selection:{diversity_seed}",
+                    source.role,
+                    candidate,
+                ),
+                stable_id(
+                    f"zinc-scaffold:{diversity_seed}",
+                    source.role,
+                    scaffold,
+                ),
+            )
+        )
+
+    with connection:
+        connection.execute(
+            "DELETE FROM source_files WHERE relative_path = ?",
+            (source.relative_path,),
+        )
+        connection.execute(
+            """
+            INSERT INTO source_files(
+                relative_path, url, role, sha256, size_bytes, sample_quota,
+                diversity_seed, row_count, sampled_rows, candidate_rows, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'complete')
+            """,
+            (
+                source.relative_path,
+                source.url,
+                source.role,
+                sha256,
+                source.path.stat().st_size,
+                quota,
+                diversity_seed,
+                row_count,
+                len(sampled),
+                len(candidate_rows),
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO candidates(
+                relative_path, role, parent_smiles, candidate_smiles, zinc_id,
+                rule, family, layer, hac, logp_tranche, scaffold,
+                selection_hash, scaffold_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            candidate_rows,
+        )
+        connection.executemany(
+            """
+            INSERT INTO rejection_counts(relative_path, reason, count)
+            VALUES (?, ?, ?)
+            """,
+            (
+                (source.relative_path, reason, count)
+                for reason, count in sorted(rejection_counts.items())
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO rejection_samples(relative_path, reason, line_number, raw_text)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                (source.relative_path, reason, line_number, raw_text)
+                for reason, rows in sorted(rejection_samples.items())
+                for line_number, raw_text in rows
+            ),
+        )
+    return row_count, len(sampled), len(candidate_rows)
+
+
+def _cache_zinc_snapshot(
+    connection: sqlite3.Connection,
+    sources: Sequence[ZincSource],
+    *,
+    unavailable_sources: Sequence[ZincUnavailableSource],
+    budgets: Mapping[str, int],
+    manifest_source_counts: Mapping[str, int],
+    diversity_seed: int,
+) -> tuple[int, dict[str, bool]]:
+    quotas = _allocate_zinc_presample_quotas(
+        sources,
+        budgets,
+        manifest_source_counts,
+    )
+    snapshot_paths = {source.relative_path for source in sources}
+    with connection:
+        connection.execute("DELETE FROM unavailable_sources")
+        connection.executemany(
+            """
+            INSERT INTO unavailable_sources(relative_path, url, role, reason)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                (
+                    source.relative_path,
+                    source.url,
+                    source.role,
+                    source.reason,
+                )
+                for source in unavailable_sources
+            ),
+        )
+        if snapshot_paths:
+            placeholders = ",".join("?" for _ in snapshot_paths)
+            connection.execute(
+                f"DELETE FROM source_files WHERE relative_path NOT IN ({placeholders})",
+                tuple(sorted(snapshot_paths)),
+            )
+        else:
+            connection.execute("DELETE FROM source_files")
+    processed_files = 0
+    for source_index, source in enumerate(sources, start=1):
+        digest = file_sha256(source.path)
+        quota = quotas[source.relative_path]
+        cached = connection.execute(
+            """
+            SELECT sha256, sample_quota, diversity_seed, status
+            FROM source_files WHERE relative_path = ?
+            """,
+            (source.relative_path,),
+        ).fetchone()
+        if cached == (digest, quota, diversity_seed, "complete"):
+            continue
+        row_count, sampled_rows, candidate_rows = _process_zinc_source(
+            connection,
+            source,
+            sha256=digest,
+            quota=quota,
+            diversity_seed=diversity_seed,
+        )
+        processed_files += 1
+        if processed_files % 25 == 0 or source_index == len(sources):
+            print(
+                "ZINC diversity cache: "
+                f"snapshot={source_index:,}/{len(sources):,} "
+                f"processed={processed_files:,} role={source.role} "
+                f"rows={row_count:,} sampled={sampled_rows:,} "
+                f"candidates={candidate_rows:,}",
+                flush=True,
+            )
+    unexhausted = dict(
+        connection.execute(
+            """
+            SELECT role, COUNT(*)
+            FROM source_files
+            WHERE sampled_rows < row_count
+            GROUP BY role
+            """
+        )
+    )
+    exhausted = {
+        role: int(unexhausted.get(role, 0)) == 0
+        for role in ("anion", "cation")
+    }
+    return processed_files, exhausted
+
+
+def _read_augmentation_records(
+    stage1_root: Path,
+    *,
+    strip_zinc: bool = False,
+    roles: Sequence[str] = PRETRAIN_ROLES,
+) -> dict[str, dict[str, dict[str, object]]]:
+    records: dict[str, dict[str, dict[str, object]]] = {
+        role: {} for role in roles
+    }
+    augmentation_root = stage1_root / "augmentation"
+    zinc_provenance: dict[tuple[str, str], tuple[set[str], set[str]]] = {}
+    provenance_path = augmentation_root / "_audit" / "zinc_provenance.csv"
+    if strip_zinc and provenance_path.exists():
+        mixed_keys: set[tuple[str, str]] = set()
+        for role in roles:
+            role_path = augmentation_root / f"{role}.csv"
+            if not role_path.exists():
+                continue
+            with role_path.open(encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    origins = _split_joined(row.get("origin_list", ""))
+                    if "zinc" in origins and origins != {"zinc"}:
+                        mixed_keys.add(
+                            (
+                                role,
+                                canonicalize_smiles(row.get("SMILES", "")),
+                            )
+                        )
+        if mixed_keys:
+            with provenance_path.open(
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                reader = csv.DictReader(handle)
+                required = {
+                    "role",
+                    "SMILES",
+                    "parent_smiles_list",
+                    "rule_list",
+                }
+                if not required.issubset(reader.fieldnames or []):
+                    raise TrainingSplitError(
+                        f"Missing ZINC provenance columns in {provenance_path}"
+                    )
+                for row in reader:
+                    key = (str(row["role"]), str(row["SMILES"]))
+                    if key in mixed_keys:
+                        zinc_provenance[key] = (
+                            _split_joined(row["parent_smiles_list"]),
+                            _split_joined(row["rule_list"]),
+                        )
+    for role in roles:
+        path = augmentation_root / f"{role}.csv"
+        if not path.exists():
+            continue
+        with path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            missing = set(PRETRAIN_ENTITY_COLUMNS) - set(
+                reader.fieldnames or []
+            )
+            if missing:
+                raise TrainingSplitError(
+                    f"Missing Stage-1 augmentation columns in {path}: "
+                    f"{sorted(missing)}"
+                )
+            for row in reader:
+                canonical = canonicalize_smiles(str(row["SMILES"]))
+                charge = formal_charge(canonical)
+                if (role == "anion" and charge >= 0) or (
+                    role == "cation" and charge <= 0
+                ):
+                    raise TrainingSplitError(
+                        f"Invalid {role} charge in existing augmentation: "
+                        f"{canonical}"
+                    )
+                row_origins = _split_joined(row["origin_list"])
+                if strip_zinc and "zinc" in row_origins:
+                    if row_origins == {"zinc"}:
+                        continue
+                    row_origins.discard("zinc")
+                record = records[role].setdefault(
+                    canonical,
+                    {
+                        "SMILES": canonical,
+                        "formal_charge": charge,
+                        "origin_list": set(),
+                        "seed_smiles_list": set(),
+                        "rule_list": set(),
+                        "pubchem_cid_list": set(),
+                        "mol_id_list": set(),
+                    },
+                )
+                for column in (
+                    "origin_list",
+                    "seed_smiles_list",
+                    "rule_list",
+                    "pubchem_cid_list",
+                    "mol_id_list",
+                ):
+                    values = record[column]
+                    if isinstance(values, set):
+                        row_values = (
+                            row_origins
+                            if column == "origin_list"
+                            else _split_joined(row[column])
+                        )
+                        if strip_zinc:
+                            parents, rules = zinc_provenance.get(
+                                (role, canonical),
+                                (set(), set()),
+                            )
+                            if column == "seed_smiles_list":
+                                row_values -= parents
+                            elif column == "rule_list":
+                                row_values -= rules
+                                row_values = {
+                                    value
+                                    for value in row_values
+                                    if not value.startswith("zinc_")
+                                }
+                        values.update(row_values)
+    return records
+
+
+def _prepare_unique_zinc_candidates(
+    connection: sqlite3.Connection,
+    *,
+    base: pd.DataFrame,
+    existing: Mapping[str, Mapping[str, Mapping[str, object]]],
+) -> None:
+    connection.execute("DROP TABLE IF EXISTS temp.zinc_base_entities")
+    connection.execute(
+        """
+        CREATE TEMP TABLE zinc_base_entities(
+            role TEXT,
+            smiles TEXT,
+            PRIMARY KEY(role, smiles)
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO zinc_base_entities(role, smiles) VALUES (?, ?)",
+        sorted(
+            {
+                (str(row.role), canonicalize_smiles(str(row.SMILES)))
+                for row in base.itertuples(index=False)
+            }
+        ),
+    )
+    connection.execute("DROP TABLE IF EXISTS temp.zinc_existing_augmentation")
+    connection.execute(
+        """
+        CREATE TEMP TABLE zinc_existing_augmentation(
+            role TEXT,
+            smiles TEXT,
+            PRIMARY KEY(role, smiles)
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO zinc_existing_augmentation(role, smiles) VALUES (?, ?)",
+        sorted(
+            (role, smiles)
+            for role, role_records in existing.items()
+            for smiles in role_records
+        ),
+    )
+    connection.execute("DROP TABLE IF EXISTS temp.zinc_exclusions")
+    connection.execute(
+        """
+        CREATE TEMP TABLE zinc_exclusions(
+            role TEXT,
+            smiles TEXT,
+            PRIMARY KEY(role, smiles)
+        )
+        """
+    )
+    exclusions = {
+        (str(row.role), canonicalize_smiles(str(row.SMILES)))
+        for row in base.itertuples(index=False)
+    }
+    exclusions.update(
+        (role, smiles)
+        for role, role_records in existing.items()
+        for smiles in role_records
+    )
+    connection.executemany(
+        "INSERT INTO zinc_exclusions(role, smiles) VALUES (?, ?)",
+        sorted(exclusions),
+    )
+    connection.execute("DROP TABLE IF EXISTS temp.unique_zinc_candidates")
+    connection.execute(
+        """
+        CREATE TEMP TABLE unique_zinc_candidates AS
+        SELECT
+            role,
+            candidate_smiles,
+            MIN(parent_smiles) AS parent_smiles,
+            MIN(rule) AS rule,
+            MIN(family) AS family,
+            MIN(layer) AS layer,
+            MIN(hac) AS hac,
+            MIN(logp_tranche) AS logp_tranche,
+            MIN(scaffold) AS scaffold,
+            MIN(selection_hash) AS selection_hash,
+            MIN(scaffold_hash) AS scaffold_hash,
+            GROUP_CONCAT(DISTINCT zinc_id) AS zinc_ids,
+            GROUP_CONCAT(DISTINCT relative_path) AS source_paths,
+            GROUP_CONCAT(DISTINCT parent_smiles) AS parent_smiles_all,
+            GROUP_CONCAT(DISTINCT rule) AS rules_all
+        FROM candidates
+        GROUP BY role, candidate_smiles
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX temp.unique_zinc_role_smiles
+        ON unique_zinc_candidates(role, candidate_smiles)
+        """
+    )
+
+
+def _eligible_zinc_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    counts = {"anion": 0, "cation": 0}
+    counts.update(
+        dict(
+            connection.execute(
+                """
+                SELECT u.role, COUNT(*)
+                FROM unique_zinc_candidates u
+                LEFT JOIN zinc_exclusions e
+                    ON e.role = u.role AND e.smiles = u.candidate_smiles
+                WHERE e.smiles IS NULL
+                GROUP BY u.role
+                """
+            )
+        )
+    )
+    return {role: int(value) for role, value in counts.items()}
+
+
+def _select_all_eligible_zinc_candidates(
+    connection: sqlite3.Connection,
+) -> tuple[dict[str, int], pd.DataFrame]:
+    connection.execute("DROP TABLE IF EXISTS temp.selected_zinc")
+    connection.execute(
+        """
+        CREATE TEMP TABLE selected_zinc (
+            role TEXT NOT NULL,
+            candidate_smiles TEXT NOT NULL,
+            PRIMARY KEY(role, candidate_smiles)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO selected_zinc(role, candidate_smiles)
+        SELECT u.role, u.candidate_smiles
+        FROM unique_zinc_candidates u
+        LEFT JOIN zinc_exclusions e
+            ON e.role = u.role AND e.smiles = u.candidate_smiles
+        WHERE e.smiles IS NULL
+        """
+    )
+    balance_rows = [
+        {
+            "role": str(role),
+            "hac": int(hac),
+            "logp_tranche": str(logp),
+            "family": str(family),
+            "available": int(count),
+            "quota": int(count),
+            "selected": int(count),
+        }
+        for role, hac, logp, family, count in connection.execute(
+            """
+            SELECT u.role, u.hac, u.logp_tranche, u.family, COUNT(*)
+            FROM unique_zinc_candidates u
+            LEFT JOIN zinc_exclusions e
+                ON e.role = u.role AND e.smiles = u.candidate_smiles
+            WHERE e.smiles IS NULL
+            GROUP BY u.role, u.hac, u.logp_tranche, u.family
+            ORDER BY u.role, u.hac, u.logp_tranche, u.family
+            """
+        )
+    ]
+    selected_counts = {"anion": 0, "cation": 0}
+    selected_counts.update(
+        {
+            str(role): int(count)
+            for role, count in connection.execute(
+                "SELECT role, COUNT(*) FROM selected_zinc GROUP BY role"
+            )
+        }
+    )
+    return selected_counts, pd.DataFrame(
+        balance_rows,
+        columns=[
+            "role",
+            "hac",
+            "logp_tranche",
+            "family",
+            "available",
+            "quota",
+            "selected",
+        ],
+    )
+
+
+def _merge_zinc_overlaps(
+    connection: sqlite3.Connection,
+    existing: dict[str, dict[str, dict[str, object]]],
+) -> list[dict[str, object]]:
+    provenance: list[dict[str, object]] = []
+    for role in ("anion", "cation"):
+        if not existing[role]:
+            continue
+        rows = connection.execute(
+            """
+            SELECT
+                u.role, u.candidate_smiles, u.parent_smiles_all, u.rules_all,
+                u.family, u.layer, u.hac, u.logp_tranche, u.scaffold,
+                u.zinc_ids, u.source_paths
+            FROM unique_zinc_candidates u
+            INNER JOIN zinc_existing_augmentation e
+                ON e.role = u.role AND e.smiles = u.candidate_smiles
+            WHERE u.role = ?
+            ORDER BY u.candidate_smiles
+            """,
+            (role,),
+        )
+        for row in rows:
+            smiles = str(row[1])
+            record = existing[role].get(smiles)
+            if record is None:
+                continue
+            for column, values in (
+                ("origin_list", {"zinc"}),
+                ("seed_smiles_list", set(str(row[2]).split(","))),
+                ("rule_list", set(str(row[3]).split(","))),
+            ):
+                target = record[column]
+                if isinstance(target, set):
+                    target.update(values)
+            provenance.append(
+                {
+                    "role": role,
+                    "SMILES": smiles,
+                    "parent_smiles_list": str(row[2]).replace(",", ";"),
+                    "rule_list": str(row[3]).replace(",", ";"),
+                    "family": str(row[4]),
+                    "layer": str(row[5]),
+                    "hac": int(row[6]),
+                    "logp_tranche": str(row[7]),
+                    "scaffold": str(row[8]),
+                    "zinc_id_list": str(row[9]).replace(",", ";"),
+                    "source_shard_list": str(row[10]).replace(",", ";"),
+                    "overlap": True,
+                }
+            )
+    return provenance
+
+
+def _publish_zinc_augmentation(
+    stage1_root: Path,
+    connection: sqlite3.Connection,
+    *,
+    base: pd.DataFrame,
+    existing: dict[str, dict[str, dict[str, object]]],
+    selected_counts: Mapping[str, int],
+    balance: pd.DataFrame,
+    sources: Sequence[ZincSource],
+    minimum_per_ion_role: int,
+    failed_log_duplicate_rows: int,
+    failed_log_nonmanifest_urls: int,
+    failed_log_recovered_sources: int,
+    inventory_counts: Mapping[str, int],
+    diversity_seed: int,
+) -> dict[str, object]:
+    overlap_provenance = _merge_zinc_overlaps(connection, existing)
+    base_counts = {
+        role: int(base["role"].eq(role).sum())
+        for role in ("anion", "cation")
+    }
+    final_counts = {
+        role: (
+            base_counts[role]
+            + len(existing[role])
+            + int(selected_counts[role])
+        )
+        for role in ("anion", "cation")
+    }
+    minimum_met = {
+        role: value >= minimum_per_ion_role
+        for role, value in final_counts.items()
+    }
+    if not all(minimum_met.values()):
+        raise TrainingSplitError(
+            "ZINC minimum closure failed: "
+            f"{final_counts}, minimum={minimum_per_ion_role}"
+        )
+
+    available_source_frame = pd.read_sql_query(
+        """
+        SELECT
+            relative_path, url, role, sha256, size_bytes, sample_quota,
+            row_count, sampled_rows, candidate_rows, status,
+            '' AS reason
+        FROM source_files ORDER BY relative_path
+        """,
+        connection,
+    )
+    unavailable_frame = pd.read_sql_query(
+        """
+        SELECT
+            relative_path, url, role, NULL AS sha256, NULL AS size_bytes,
+            NULL AS sample_quota, NULL AS row_count, NULL AS sampled_rows,
+            NULL AS candidate_rows, 'logged_unavailable' AS status, reason
+        FROM unavailable_sources ORDER BY relative_path
+        """,
+        connection,
+    )
+    source_frame = pd.concat(
+        [available_source_frame, unavailable_frame],
+        ignore_index=True,
+    ).sort_values("relative_path", kind="stable").reset_index(drop=True)
+    if len(source_frame) != len(sources):
+        raise TrainingSplitError(
+            "ZINC source inventory closure failed: "
+            f"manifest={len(sources):,}, accounted={len(source_frame):,}"
+        )
+    rejection_counts = pd.read_sql_query(
+        """
+        SELECT relative_path, reason, count
+        FROM rejection_counts ORDER BY relative_path, reason
+        """,
+        connection,
+    )
+    rejection_samples = pd.read_sql_query(
+        """
+        SELECT relative_path, reason, line_number, raw_text
+        FROM rejection_samples ORDER BY relative_path, reason, line_number
+        """,
+        connection,
+    )
+    rule_counts = pd.read_sql_query(
+        """
+        SELECT role, rule, COUNT(*) AS candidate_relations
+        FROM candidates GROUP BY role, rule ORDER BY role, rule
+        """,
+        connection,
+    )
+    rejection_by_reason = {
+        str(reason): int(count)
+        for reason, count in connection.execute(
+            """
+            SELECT reason, SUM(count)
+            FROM rejection_counts
+            GROUP BY reason
+            ORDER BY reason
+            """
+        )
+    }
+    source_rows = int(available_source_frame["row_count"].sum())
+    sampled_rows = int(available_source_frame["sampled_rows"].sum())
+    candidate_relations = int(
+        available_source_frame["candidate_rows"].sum()
+    )
+    malformed_rows = int(rejection_by_reason.get("malformed_row", 0))
+    chemistry_rejections = sum(rejection_by_reason.values()) - malformed_rows
+    if sampled_rows != candidate_relations + chemistry_rejections:
+        raise TrainingSplitError(
+            "ZINC cache count closure failed: sampled rows do not equal "
+            "candidate relations plus chemistry rejections"
+        )
+    unique_charged_candidates = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM unique_zinc_candidates"
+        ).fetchone()[0]
+    )
+    base_overlaps = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM unique_zinc_candidates u
+            INNER JOIN zinc_base_entities b
+                ON b.role = u.role AND b.smiles = u.candidate_smiles
+            """
+        ).fetchone()[0]
+    )
+    eligible_counts = _eligible_zinc_counts(connection)
+    if dict(selected_counts) != eligible_counts:
+        raise TrainingSplitError(
+            "ZINC all-eligible selection closure failed: "
+            f"selected={dict(selected_counts)}, eligible={eligible_counts}"
+        )
+    selected_total = sum(int(value) for value in selected_counts.values())
+    molecule_path = stage1_root / "augmentation" / "molecule.csv"
+    if molecule_path.exists():
+        with molecule_path.open(encoding="utf-8", newline="") as handle:
+            molecule_count = sum(1 for _row in csv.DictReader(handle))
+    else:
+        molecule_count = 0
+    augmentation_counts = {
+        role: len(existing[role]) + int(selected_counts[role])
+        for role in ("anion", "cation")
+    }
+    augmentation_counts["molecule"] = molecule_count
+    summary: dict[str, object] = {
+        "completion_status": "complete",
+        "selection_mode": "all_eligible",
+        "manifest_files": len(sources),
+        "available_source_files": len(available_source_frame),
+        "logged_unavailable_source_files": len(unavailable_frame),
+        "failed_log_duplicate_rows": failed_log_duplicate_rows,
+        "failed_log_nonmanifest_urls": failed_log_nonmanifest_urls,
+        "failed_log_recovered_sources": failed_log_recovered_sources,
+        **dict(inventory_counts),
+        "source_rows": source_rows,
+        "malformed_rows": malformed_rows,
+        "presample_excluded_rows": (
+            source_rows - malformed_rows - sampled_rows
+        ),
+        "sampled_rows": sampled_rows,
+        "chemistry_rejections": chemistry_rejections,
+        "rejections_by_reason": rejection_by_reason,
+        "candidate_relations": candidate_relations,
+        "unique_charged_candidates": unique_charged_candidates,
+        "charged_duplicate_relations": (
+            candidate_relations - unique_charged_candidates
+        ),
+        "base_overlap_candidates": base_overlaps,
+        "existing_augmentation_overlap_candidates": len(
+            overlap_provenance
+        ),
+        "eligible_unique_by_role": eligible_counts,
+        "selected_new_by_role": dict(selected_counts),
+        "eligible_not_selected": (
+            sum(eligible_counts.values()) - selected_total
+        ),
+        "overlap_provenance_rows": len(overlap_provenance),
+        "base_entities_by_role": base_counts,
+        "augmentation_entities_by_role": augmentation_counts,
+        "final_unique_by_role": final_counts,
+        "minimum_per_ion_role": minimum_per_ion_role,
+        "minimum_met_by_role": minimum_met,
+        "excess_by_role": {
+            role: max(0, value - minimum_per_ion_role)
+            for role, value in final_counts.items()
+        },
+        "diversity_seed": diversity_seed,
+    }
+
+    with tempfile.TemporaryDirectory(dir=stage1_root) as temporary_dir:
+        staged = Path(temporary_dir) / "augmentation"
+        staged.mkdir()
+        current_audit = stage1_root / "augmentation" / "_audit"
+        audit_root = staged / "_audit"
+        if current_audit.is_dir():
+            shutil.copytree(current_audit, audit_root)
+        else:
+            audit_root.mkdir()
+        provenance_columns = [
+            "role",
+            "SMILES",
+            "parent_smiles_list",
+            "rule_list",
+            "family",
+            "layer",
+            "hac",
+            "logp_tranche",
+            "scaffold",
+            "zinc_id_list",
+            "source_shard_list",
+            "overlap",
+        ]
+        with (audit_root / "zinc_provenance.csv").open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as provenance_handle:
+            provenance_writer = csv.DictWriter(
+                provenance_handle,
+                fieldnames=provenance_columns,
+                lineterminator="\n",
+            )
+            provenance_writer.writeheader()
+            for role in ("anion", "cation"):
+                with (staged / f"{role}.csv").open(
+                    "w",
+                    encoding="utf-8",
+                    newline="",
+                ) as output_handle:
+                    output_writer = csv.DictWriter(
+                        output_handle,
+                        fieldnames=PRETRAIN_ENTITY_COLUMNS,
+                        lineterminator="\n",
+                    )
+                    output_writer.writeheader()
+                    existing_iterator = iter(sorted(existing[role].items()))
+                    selected_iterator = iter(
+                        connection.execute(
+                            """
+                            SELECT
+                                u.candidate_smiles,
+                                u.parent_smiles_all,
+                                u.rules_all,
+                                u.family,
+                                u.layer,
+                                u.hac,
+                                u.logp_tranche,
+                                u.scaffold,
+                                u.zinc_ids,
+                                u.source_paths
+                            FROM unique_zinc_candidates u
+                            INNER JOIN selected_zinc s
+                                ON s.role = u.role
+                                AND s.candidate_smiles = u.candidate_smiles
+                            WHERE u.role = ?
+                            ORDER BY u.candidate_smiles
+                            """,
+                            (role,),
+                        )
+                    )
+                    existing_item = next(existing_iterator, None)
+                    selected_item = next(selected_iterator, None)
+                    while existing_item is not None or selected_item is not None:
+                        selected_smiles = (
+                            str(selected_item[0])
+                            if selected_item is not None
+                            else None
+                        )
+                        if (
+                            existing_item is not None
+                            and selected_smiles == existing_item[0]
+                        ):
+                            raise TrainingSplitError(
+                                "Selected ZINC candidate overlaps existing "
+                                f"augmentation: {role} {selected_smiles}"
+                            )
+                        if selected_item is None or (
+                            existing_item is not None
+                            and existing_item[0] < str(selected_smiles)
+                        ):
+                            output_writer.writerow(
+                                _entity_output_record(existing_item[1])
+                            )
+                            existing_item = next(existing_iterator, None)
+                            continue
+
+                        (
+                            smiles,
+                            parents,
+                            rules,
+                            family,
+                            layer,
+                            hac,
+                            logp,
+                            scaffold,
+                            zinc_ids,
+                            source_paths,
+                        ) = selected_item
+                        output_writer.writerow(
+                            _entity_output_record(
+                                {
+                                    "SMILES": str(smiles),
+                                    "formal_charge": -1 if role == "anion" else 1,
+                                    "origin_list": {"zinc"},
+                                    "seed_smiles_list": set(
+                                        str(parents).split(",")
+                                    ),
+                                    "rule_list": set(str(rules).split(",")),
+                                    "pubchem_cid_list": set(),
+                                    "mol_id_list": set(),
+                                }
+                            )
+                        )
+                        provenance_writer.writerow(
+                            {
+                                "role": role,
+                                "SMILES": str(smiles),
+                                "parent_smiles_list": str(parents).replace(
+                                    ",", ";"
+                                ),
+                                "rule_list": str(rules).replace(",", ";"),
+                                "family": str(family),
+                                "layer": str(layer),
+                                "hac": int(hac),
+                                "logp_tranche": str(logp),
+                                "scaffold": str(scaffold),
+                                "zinc_id_list": str(zinc_ids).replace(
+                                    ",", ";"
+                                ),
+                                "source_shard_list": str(source_paths).replace(
+                                    ",", ";"
+                                ),
+                                "overlap": False,
+                            }
+                        )
+                        selected_item = next(selected_iterator, None)
+            for row in sorted(
+                overlap_provenance,
+                key=lambda item: (str(item["role"]), str(item["SMILES"])),
+            ):
+                provenance_writer.writerow(row)
+        if molecule_path.exists():
+            shutil.copy2(molecule_path, staged / "molecule.csv")
+        else:
+            write_dataframe(
+                staged / "molecule.csv",
+                pd.DataFrame(columns=PRETRAIN_ENTITY_COLUMNS),
+            )
+        write_dataframe(audit_root / "zinc_source_manifest.csv", source_frame)
+        write_dataframe(
+            audit_root / "zinc_unavailable_sources.csv",
+            unavailable_frame.loc[:, ["url", "relative_path", "role", "reason"]],
+        )
+        write_dataframe(audit_root / "zinc_rule_counts.csv", rule_counts)
+        write_dataframe(audit_root / "zinc_rejection_counts.csv", rejection_counts)
+        write_dataframe(audit_root / "zinc_rejection_samples.csv", rejection_samples)
+        write_dataframe(audit_root / "zinc_selection_balance.csv", balance)
+        (audit_root / "zinc_diversity_summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        augmentation_summary_path = audit_root / "augmentation_summary.json"
+        augmentation_summary: dict[str, object] = {}
+        if augmentation_summary_path.exists():
+            augmentation_summary = json.loads(
+                augmentation_summary_path.read_text(encoding="utf-8")
+            )
+        augmentation_summary.update(
+            {
+                "augmentation_entities": sum(augmentation_counts.values()),
+                "augmentation_entities_by_role": augmentation_counts,
+                "zinc_diversity": summary,
+            }
+        )
+        augmentation_summary_path.write_text(
+            json.dumps(
+                augmentation_summary,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        replace_directory(staged, stage1_root / "augmentation")
+    return summary
+
+
+def import_zinc_diversity(
+    output_root: Path,
+    *,
+    zinc_root: Path = DEFAULT_ZINC_ROOT,
+    zinc_manifest: Path = DEFAULT_ZINC_MANIFEST,
+    zinc_failed_log: Path = DEFAULT_ZINC_FAILED_LOG,
+    minimum_per_ion_role: int = 1_000_000,
+    target_per_ion_role: int | None = None,
+    diversity_seed: int = 42,
+    scan_only: bool = False,
+) -> dict[str, object]:
+    """Import local ZINC parents and satisfy a minimum per-ion-role size."""
+    if target_per_ion_role is not None:
+        if (
+            minimum_per_ion_role != 1_000_000
+            and minimum_per_ion_role != target_per_ion_role
+        ):
+            raise TrainingSplitError(
+                "minimum_per_ion_role conflicts with target_per_ion_role"
+            )
+        minimum_per_ion_role = target_per_ion_role
+    if minimum_per_ion_role <= 0:
+        raise TrainingSplitError("minimum_per_ion_role must be positive")
+    output_root = Path(output_root)
+    zinc_root = Path(zinc_root)
+    zinc_manifest = Path(zinc_manifest)
+    zinc_failed_log = Path(zinc_failed_log)
+    stage1_root = output_root / "stage1"
+    base = _combined_entity_frame(
+        stage1_root,
+        roles=("anion", "cation"),
+    )
+    existing = _read_augmentation_records(
+        stage1_root,
+        strip_zinc=True,
+        roles=("anion", "cation"),
+    )
+    sources = _read_zinc_manifest(zinc_manifest, zinc_root)
+    failed_urls, failed_log_duplicate_rows = _read_zinc_failed_log(
+        zinc_failed_log
+    )
+    snapshot, unavailable_sources, inventory_counts = _freeze_zinc_snapshot(
+        sources,
+        scan_only=scan_only,
+        failed_urls=failed_urls,
+    )
+    manifest_urls = {source.url for source in sources}
+    failed_log_nonmanifest_urls = len(failed_urls - manifest_urls)
+    failed_log_recovered_sources = sum(
+        source.url in failed_urls for source in snapshot
+    )
+    connection = _open_zinc_database(
+        output_root / ".cache" / "stage1_zinc_diversity.sqlite"
+    )
+    processed_files = 0
+    try:
+        base_counts = {
+            role: int(base["role"].eq(role).sum())
+            for role in ("anion", "cation")
+        }
+        deficits: dict[str, int] = {}
+        for role in ("anion", "cation"):
+            current = base_counts[role] + len(existing[role])
+            deficits[role] = max(0, minimum_per_ion_role - current)
+
+        multipliers = {
+            role: ZINC_PRESAMPLE_MULTIPLIER
+            for role in ("anion", "cation")
+        }
+        manifest_source_counts = {
+            role: sum(source.role == role for source in sources)
+            for role in ("anion", "cation")
+        }
+        while True:
+            budgets = {
+                role: max(
+                    sum(source.role == role for source in snapshot),
+                    deficits[role] * multipliers[role],
+                )
+                for role in ("anion", "cation")
+            }
+            processed, exhausted_by_role = _cache_zinc_snapshot(
+                connection,
+                snapshot,
+                unavailable_sources=unavailable_sources,
+                budgets=budgets,
+                manifest_source_counts=manifest_source_counts,
+                diversity_seed=diversity_seed,
+            )
+            processed_files += processed
+            _prepare_unique_zinc_candidates(
+                connection,
+                base=base,
+                existing=existing,
+            )
+            eligible = _eligible_zinc_counts(connection)
+            if scan_only or all(
+                eligible[role] >= deficits[role]
+                for role in ("anion", "cation")
+            ):
+                break
+            exhausted_shortages = {
+                role: deficits[role] - eligible[role]
+                for role in ("anion", "cation")
+                if (
+                    eligible[role] < deficits[role]
+                    and exhausted_by_role[role]
+                )
+            }
+            if exhausted_shortages:
+                shortage = {
+                    role: max(0, deficits[role] - eligible[role])
+                    for role in ("anion", "cation")
+                }
+                raise TrainingSplitError(
+                    f"ZINC chemistry candidates are insufficient: {shortage}"
+                )
+            for role in ("anion", "cation"):
+                if eligible[role] < deficits[role]:
+                    multipliers[role] *= 2
+
+        cache_counts = dict(
+            connection.execute(
+                "SELECT role, COUNT(*) FROM candidates GROUP BY role"
+            )
+        )
+        scan_summary: dict[str, object] = {
+            "completion_status": "scan_only" if scan_only else "ready",
+            "selection_mode": "all_eligible",
+            "manifest_files": len(sources),
+            "snapshot_files": len(snapshot),
+            "available_source_files": len(snapshot),
+            "logged_unavailable_source_files": len(unavailable_sources),
+            "failed_log_duplicate_rows": failed_log_duplicate_rows,
+            "failed_log_nonmanifest_urls": failed_log_nonmanifest_urls,
+            "failed_log_recovered_sources": failed_log_recovered_sources,
+            **inventory_counts,
+            "processed_files": processed_files,
+            "candidate_relations_by_role": {
+                role: int(cache_counts.get(role, 0))
+                for role in ("anion", "cation")
+            },
+            "eligible_unique_by_role": eligible,
+            "deficit_by_role": deficits,
+        }
+        if scan_only:
+            return scan_summary
+
+        selected_counts, balance = _select_all_eligible_zinc_candidates(
+            connection,
+        )
+        summary = _publish_zinc_augmentation(
+            stage1_root,
+            connection,
+            base=base,
+            existing=existing,
+            selected_counts=selected_counts,
+            balance=balance,
+            sources=sources,
+            minimum_per_ion_role=minimum_per_ion_role,
+            failed_log_duplicate_rows=failed_log_duplicate_rows,
+            failed_log_nonmanifest_urls=failed_log_nonmanifest_urls,
+            failed_log_recovered_sources=failed_log_recovered_sources,
+            inventory_counts=inventory_counts,
+            diversity_seed=diversity_seed,
+        )
+        with connection:
+            connection.executemany(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+                (
+                    ("publication_complete", "1"),
+                    ("selection_mode", "all_eligible"),
+                    ("minimum_per_ion_role", str(minimum_per_ion_role)),
+                    ("diversity_seed", str(diversity_seed)),
+                    ("zinc_root", str(zinc_root.resolve())),
+                    ("zinc_manifest", str(zinc_manifest.resolve())),
+                    ("zinc_failed_log", str(zinc_failed_log.resolve())),
+                ),
+            )
+        summary["processed_files"] = processed_files
+        return summary
+    finally:
+        connection.close()
 
 
 def system_type_for_columns(identity_columns: Sequence[str]) -> str:
@@ -3660,6 +5507,7 @@ def parse_args() -> argparse.Namespace:
         choices=(
             "extract-pretrain",
             "augment-pretrain",
+            "import-zinc-diversity",
             "build-splits",
             "all",
         ),
@@ -3675,6 +5523,30 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_ROOT,
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--zinc-root",
+        type=Path,
+        default=DEFAULT_ZINC_ROOT,
+    )
+    parser.add_argument(
+        "--zinc-manifest",
+        type=Path,
+        default=DEFAULT_ZINC_MANIFEST,
+    )
+    parser.add_argument(
+        "--zinc-failed-log",
+        type=Path,
+        default=DEFAULT_ZINC_FAILED_LOG,
+    )
+    parser.add_argument(
+        "--minimum-per-ion-role",
+        "--target-per-ion-role",
+        dest="minimum_per_ion_role",
+        type=int,
+        default=1_000_000,
+    )
+    parser.add_argument("--diversity-seed", type=int, default=42)
+    parser.add_argument("--scan-only", action="store_true")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--pubchem-threshold", type=int, default=90)
     parser.add_argument("--pubchem-max-records", type=int, default=100)
@@ -3714,6 +5586,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise TrainingSplitError(
             "--resonance-max-abs-charge cannot be negative"
         )
+    if args.minimum_per_ion_role <= 0:
+        raise TrainingSplitError(
+            "--minimum-per-ion-role must be positive"
+        )
+    if args.scan_only and args.command != "import-zinc-diversity":
+        raise TrainingSplitError(
+            "--scan-only is only valid with import-zinc-diversity"
+        )
 
 
 def main() -> None:
@@ -3743,6 +5623,29 @@ def main() -> None:
             f"(anion={counts['anion']:,}, cation={counts['cation']:,}, "
             f"molecule={counts['molecule']:,})"
         )
+    if args.command == "import-zinc-diversity":
+        zinc_summary = import_zinc_diversity(
+            args.output_root,
+            zinc_root=args.zinc_root,
+            zinc_manifest=args.zinc_manifest,
+            zinc_failed_log=args.zinc_failed_log,
+            minimum_per_ion_role=args.minimum_per_ion_role,
+            diversity_seed=args.diversity_seed,
+            scan_only=args.scan_only,
+        )
+        if args.scan_only:
+            print(
+                "Scanned ZINC snapshot: "
+                f"files={zinc_summary['snapshot_files']:,}/"
+                f"{zinc_summary['manifest_files']:,}, "
+                f"processed={zinc_summary['processed_files']:,}"
+            )
+        else:
+            counts = zinc_summary["final_unique_by_role"]
+            print(
+                "Published ZINC diversity augmentation: "
+                f"anion={counts['anion']:,}, cation={counts['cation']:,}"
+            )
     if args.command in {"build-splits", "all"}:
         catalog = build_training_splits(
             args.final_root,
