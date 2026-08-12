@@ -787,6 +787,7 @@ def extract_pretraining_entities(
 
     entities: dict[tuple[str, str], dict[str, object]] = {}
     ionic_liquids: set[tuple[str, str]] = set()
+    experiment_ionic_liquids: set[tuple[str, str]] = set()
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
         staged_stage1 = Path(temporary_dir) / "stage1"
         staged_stage1.mkdir()
@@ -816,16 +817,17 @@ def extract_pretraining_entities(
                         )
                     ):
                         try:
-                            ionic_liquids.add(
-                                (
-                                    canonicalize_smiles(str(values[0])),
-                                    canonicalize_smiles(str(values[1])),
-                                )
+                            ionic_liquid = (
+                                canonicalize_smiles(str(values[0])),
+                                canonicalize_smiles(str(values[1])),
                             )
                         except TrainingSplitError as exc:
                             raise TrainingSplitError(
                                 f"{relative} row {row_offset + local_row}: {exc}"
                             ) from exc
+                        ionic_liquids.add(ionic_liquid)
+                        if relative.startswith("experiment/"):
+                            experiment_ionic_liquids.add(ionic_liquid)
 
                 for column in columns:
                     role = STAGE1_SOURCE_ROLE_BY_COLUMN[column]
@@ -922,6 +924,14 @@ def extract_pretraining_entities(
             columns=["cation", "anion"],
         ).to_csv(
             staged_stage1 / "IL.csv",
+            index=False,
+            lineterminator="\n",
+        )
+        pd.DataFrame(
+            sorted(experiment_ionic_liquids),
+            columns=["cation", "anion"],
+        ).to_csv(
+            staged_stage1 / "experiment_IL.csv",
             index=False,
             lineterminator="\n",
         )

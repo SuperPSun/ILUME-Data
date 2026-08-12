@@ -52,7 +52,7 @@ Rebuild the Stage1 dataset entities from the top-level CSV files under `data/fin
 python scripts/build_training_splits.py extract-pretrain
 ```
 
-This atomically replaces `data/training_splits/stage1/`. The root `anion.csv`, `cation.csv`, and `molecule.csv` files contain only dataset entities. `simulation_mol.csv`, `solute.csv`, and `solvent.csv` retain neutral source-level records for auditing, while `molecule.csv` is their identity-deduplicated training entrypoint. Running extraction also removes any previous `stage1/augmentation/` directory.
+This atomically replaces `data/training_splits/stage1/`. The root `anion.csv`, `cation.csv`, and `molecule.csv` files contain only dataset entities. `IL.csv` contains the unique canonical ionic-liquid pairs observed across both experiment and simulation datasets, while `experiment_IL.csv` contains only those observed in experiment datasets. `simulation_mol.csv`, `solute.csv`, and `solvent.csv` retain neutral source-level records for auditing, while `molecule.csv` is their identity-deduplicated training entrypoint. Running extraction also removes any previous `stage1/augmentation/` directory.
 
 Generate the complete augmentation candidate pool separately:
 
