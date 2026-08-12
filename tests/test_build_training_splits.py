@@ -168,6 +168,17 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
         ],
     )
     write_csv(
+        final_root / "experiment" / "density.csv",
+        [
+            {
+                "cation": "C[NH3+]",
+                "anion": "CC(=O)[O-]",
+                "density_g/cm^3": 1.0,
+                "source_list": "experiment",
+            }
+        ],
+    )
+    write_csv(
         final_root / "simulation" / "molecules.csv",
         [
             {
@@ -187,6 +198,23 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
                 "mol_id": "positive_molecule",
                 "value": 3.0,
                 "source_list": "test",
+            },
+        ],
+    )
+    write_csv(
+        final_root / "simulation" / "density.csv",
+        [
+            {
+                "cation": "[Na+].[K+]",
+                "anion": "[Cl-].[Br-]",
+                "density_g/cm^3": 1.0,
+                "source_list": "simulation",
+            },
+            {
+                "cation": "[Na+]",
+                "anion": "[Cl-]",
+                "density_g/cm^3": 1.1,
+                "source_list": "simulation",
             },
         ],
     )
@@ -230,6 +258,7 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
         for path in (output_root / "stage1").glob("*.csv")
     } == {
         "IL.csv",
+        "experiment_IL.csv",
         "anion.csv",
         "cation.csv",
         "solute.csv",
@@ -240,10 +269,42 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
     il = pd.read_csv(output_root / "stage1" / "IL.csv")
     assert list(il.columns) == ["cation", "anion"]
     assert il.to_dict(orient="records") == [
-        {
-            "cation": canonicalize_smiles("[Na+].[K+]"),
-            "anion": canonicalize_smiles("[Cl-].[Br-]"),
-        }
+        {"cation": cation, "anion": anion}
+        for cation, anion in sorted(
+            {
+                (
+                    canonicalize_smiles("[Na+].[K+]"),
+                    canonicalize_smiles("[Cl-].[Br-]"),
+                ),
+                (
+                    canonicalize_smiles("C[NH3+]"),
+                    canonicalize_smiles("CC(=O)[O-]"),
+                ),
+                (
+                    canonicalize_smiles("[Na+]"),
+                    canonicalize_smiles("[Cl-]"),
+                ),
+            }
+        )
+    ]
+    experiment_il = pd.read_csv(
+        output_root / "stage1" / "experiment_IL.csv"
+    )
+    assert list(experiment_il.columns) == ["cation", "anion"]
+    assert experiment_il.to_dict(orient="records") == [
+        {"cation": cation, "anion": anion}
+        for cation, anion in sorted(
+            {
+                (
+                    canonicalize_smiles("[Na+].[K+]"),
+                    canonicalize_smiles("[Cl-].[Br-]"),
+                ),
+                (
+                    canonicalize_smiles("C[NH3+]"),
+                    canonicalize_smiles("CC(=O)[O-]"),
+                ),
+            }
+        )
     ]
     molecule = pd.read_csv(output_root / "stage1" / "molecule.csv")
     assert list(molecule.columns) == PRETRAIN_ENTITY_COLUMNS
@@ -278,6 +339,38 @@ def test_extract_pretraining_entities_splits_and_normalizes_roles_by_charge(
     assert not (output_root / "stage1" / "entity_sources.csv").exists()
     assert not (output_root / "stage1" / "augmentation").exists()
     assert structure_path.exists()
+
+
+def test_extract_pretraining_entities_writes_empty_experiment_il(
+    tmp_path: Path,
+):
+    final_root = tmp_path / "final"
+    write_csv(
+        final_root / "experiment" / "molecules.csv",
+        [{"SMILES": "CCO", "source_list": "experiment"}],
+    )
+    write_csv(
+        final_root / "simulation" / "density.csv",
+        [
+            {
+                "cation": "C[NH3+]",
+                "anion": "CC(=O)[O-]",
+                "density_g/cm^3": 1.1,
+                "source_list": "simulation",
+            }
+        ],
+    )
+
+    output_root = tmp_path / "training"
+    extract_pretraining_entities(final_root, output_root)
+
+    experiment_il = pd.read_csv(
+        output_root / "stage1" / "experiment_IL.csv"
+    )
+    assert list(experiment_il.columns) == ["cation", "anion"]
+    assert experiment_il.empty
+    il = pd.read_csv(output_root / "stage1" / "IL.csv")
+    assert len(il) == 1
 
 
 def test_rule_candidates_apply_shared_rules_to_neutral_entities():
