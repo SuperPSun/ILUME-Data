@@ -156,8 +156,15 @@ QM_TARGET_COLUMNS = (
     "gap_eV",
 )
 CATALOG_SCHEMA_VERSION = 1
-PARTIAL_CHARGE_RESOURCE_MANIFEST = (
+PARTIAL_CHARGE_SOURCE_RESOURCE_DIR = "simulation/charge_20260514"
+PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST = (
     "simulation/charge_20260514/structure_manifest.csv"
+)
+PARTIAL_CHARGE_MATERIALIZED_RESOURCE_DIR = (
+    "stage2/partial_atomic_charge/charge_20260514"
+)
+PARTIAL_CHARGE_MATERIALIZED_RESOURCE_MANIFEST = (
+    f"{PARTIAL_CHARGE_MATERIALIZED_RESOURCE_DIR}/structure_manifest.csv"
 )
 PARTIAL_CHARGE_RESOURCE_AUDIT_COLUMNS = (
     "task_id",
@@ -189,7 +196,8 @@ SIMULATION_TASK_REGISTRY = {
         "target_level": "atom",
         "sample_unit": "mol_id",
         "label_source": "structure_resource",
-        "resource_manifest": PARTIAL_CHARGE_RESOURCE_MANIFEST,
+        "source_resource_manifest": PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST,
+        "resource_manifest": PARTIAL_CHARGE_MATERIALIZED_RESOURCE_MANIFEST,
     },
     "simulation/simulated_qm_elec_hf.csv": {
         "task_id": "simulation/simulated_qm_elec_hf",
@@ -309,6 +317,7 @@ class TaskSpec:
     experiment_reference: str = ""
     materialized_path: str = ""
     label_source: str = "materialized_csv"
+    source_resource_manifest: str = ""
     resource_manifest: str = ""
 
 
@@ -4643,10 +4652,11 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
             "Unclassified simulation datasets: "
             + ", ".join(sorted(unknown_simulation))
         )
-    resource_manifest = final_root / PARTIAL_CHARGE_RESOURCE_MANIFEST
+    resource_manifest = final_root / PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST
     if not resource_manifest.is_file():
         raise TrainingSplitError(
-            f"Missing partial-charge structure manifest: {PARTIAL_CHARGE_RESOURCE_MANIFEST}"
+            "Missing partial-charge structure manifest: "
+            f"{PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST}"
         )
 
     tasks: list[TaskSpec] = []
@@ -4709,6 +4719,9 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
                         else f"stage2/{path.stem}"
                     ),
                     label_source=str(definition.get("label_source", "materialized_csv")),
+                    source_resource_manifest=str(
+                        definition.get("source_resource_manifest", "")
+                    ),
                     resource_manifest=str(definition.get("resource_manifest", "")),
                 )
             )
@@ -4829,13 +4842,14 @@ def exclude_missing_partial_charge_resources(
     task: TaskSpec,
     final_root: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    manifest_path = final_root / task.resource_manifest
+    manifest_path = final_root / task.source_resource_manifest
     manifest = pd.read_csv(manifest_path)
     required = {"mol_id", "relative_path", "format", "size_bytes", "sha256"}
     missing = required - set(manifest.columns)
     if missing:
         raise TrainingSplitError(
-            f"Missing columns in {task.resource_manifest}: {sorted(missing)}"
+            "Missing columns in "
+            f"{task.source_resource_manifest}: {sorted(missing)}"
         )
     available = set(manifest["mol_id"].dropna().astype(str))
     missing_mask = ~frame["mol_id"].astype(str).isin(available)
@@ -5487,6 +5501,11 @@ def build_training_splits(
                     partitions.eq("validation").to_numpy()
                 ].reset_index(drop=True),
             )
+            if task.source_file == "simulation/charge.csv":
+                shutil.copytree(
+                    final_root / PARTIAL_CHARGE_SOURCE_RESOURCE_DIR,
+                    task_root / Path(PARTIAL_CHARGE_SOURCE_RESOURCE_DIR).name,
+                )
             task_catalog_rows.append(
                 {
                     "catalog_schema_version": CATALOG_SCHEMA_VERSION,

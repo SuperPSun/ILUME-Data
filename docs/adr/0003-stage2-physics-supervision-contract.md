@@ -19,6 +19,8 @@ PBE/TZVP HOMO and LUMO are one multi-target task per ion role. The source gap is
 
 `charge.csv` is the identity and provenance index for `simulation/partial_atomic_charge`, not a total-charge target. Every mol_id is retained as a sample, duplicate canonical SMILES are not aggregated, and canonical SMILES is the split unit. RDKit formal charge must equal the source charge and determines cation/anion/neutral role without restricting charge magnitude. ILUME-Data does not parse MOL/MOL2 atoms or map them to Stage1 graph nodes. It inventories structure files in `structure_manifest.csv`; unreferenced files are allowed, while a charge row with no structure-manifest entry is excluded and audited without aborting the build.
 
+`build-splits` recursively copies the complete final-data `charge_20260514/` directory into `stage2/partial_atomic_charge/charge_20260514/` during staged publication. The catalog advertises the copied `structure_manifest.csv`, making the materialized Stage2 partial-charge dataset self-contained rather than dependent on the final-data directory.
+
 Property-local experiment exclusion remains limited to density, heat capacity, thermal expansion versus isobaric volume expansion, and organic transfer. Heat of vaporization and unrelated simulation objectives are not filtered against other experimental properties.
 
 The root `task_catalog.csv` is the producer interface. Task IDs remain globally qualified (`simulation/...` or `experiment/...`) and map to explicit materialized paths. `target_columns` is intentionally conditional: it contains physical CSV columns for object properties and the logical label name for atom properties. Consumers must use `task_kind`, `target_level`, and `label_source` to distinguish those cases. The catalog also records condition and identity columns, split and sample units, simulation method, experiment reference, optional resource manifest, and materialized statistics.
@@ -29,7 +31,7 @@ Benefits:
 
 - Simulation supervision can no longer silently enter Stage3.
 - HOMO/LUMO identities cannot leak across independent splits.
-- Partial-charge instances and structure provenance remain lossless without duplicating or parsing structure payloads.
+- Partial-charge instances and structure provenance remain lossless without parsing structure payloads.
 - The catalog makes producer output discoverable and versioned for a future ILUME migration.
 
 Limitations:
@@ -37,6 +39,7 @@ Limitations:
 - Adding a new simulation task requires a registry and test change until dynamic metadata is designed.
 - Gap mismatches do not block publication.
 - Missing structure references reduce the partial-charge task instead of failing the full build.
+- Each split build duplicates the complete structure resource, increasing publication time and disk usage.
 - The current ILUME Stage2 code cannot consume this contract; its catalog-driven migration is a separate architectural change.
 
 ## Alternatives considered

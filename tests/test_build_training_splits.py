@@ -211,11 +211,13 @@ def write_stage2_files(final_root: Path, count: int = 100) -> None:
         }
     )
     write_csv(final_root / "simulation" / "charge.csv", charge_rows)
+    structure_root = final_root / "simulation" / "charge_20260514"
+    for row in charge_rows:
+        structure_path = structure_root / f"{row['mol_id']}.mol2"
+        structure_path.parent.mkdir(parents=True, exist_ok=True)
+        structure_path.write_bytes(str(row["mol_id"]).encode("utf-8"))
     write_csv(
-        final_root
-        / "simulation"
-        / "charge_20260514"
-        / "structure_manifest.csv",
+        structure_root / "structure_manifest.csv",
         [
             {
                 "mol_id": row["mol_id"],
@@ -2453,7 +2455,7 @@ def test_partial_charge_missing_structure_is_excluded_and_audited(tmp_path: Path
         ("partial_atomic_charge",),
         ("SMILES",),
         "molecule",
-        resource_manifest=manifest_relative,
+        source_resource_manifest=manifest_relative,
     )
     frame, _ = prepare_task_frame(final_root, task, "checksum")
 
@@ -2675,6 +2677,9 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     )
     ignored_structure.parent.mkdir(parents=True, exist_ok=True)
     ignored_structure.write_text("invalid structure", encoding="utf-8")
+    nested_resource = ignored_structure.parent / "metadata" / "provenance.txt"
+    nested_resource.parent.mkdir()
+    nested_resource.write_text("copied recursively", encoding="utf-8")
 
     output_root = tmp_path / "training"
     extract_pretraining_entities(final_root, output_root)
@@ -3061,6 +3066,9 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert partial_catalog["split_unit"] == "SMILES"
     assert partial_catalog["label_source"] == "structure_resource"
     assert partial_catalog["materialized_path"] == "stage2/partial_atomic_charge"
+    assert partial_catalog["resource_manifest"] == (
+        "stage2/partial_atomic_charge/charge_20260514/structure_manifest.csv"
+    )
     partial_rows = pd.concat(
         [
             pd.read_csv(output_root / "stage2" / "partial_atomic_charge" / name)
@@ -3094,6 +3102,31 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         "reason",
     ]
     assert partial_resource_audit.empty
+    source_resource_root = final_root / "simulation" / "charge_20260514"
+    copied_resource_root = (
+        output_root
+        / "stage2"
+        / "partial_atomic_charge"
+        / "charge_20260514"
+    )
+    source_files = sorted(
+        path.relative_to(source_resource_root)
+        for path in source_resource_root.rglob("*")
+        if path.is_file()
+    )
+    copied_files = sorted(
+        path.relative_to(copied_resource_root)
+        for path in copied_resource_root.rglob("*")
+        if path.is_file()
+    )
+    assert copied_files == source_files
+    assert {
+        path: (source_resource_root / path).read_bytes()
+        for path in source_files
+    } == {
+        path: (copied_resource_root / path).read_bytes()
+        for path in copied_files
+    }
     for path in output_root.rglob("*.csv"):
         assert not {
             "row_id",
@@ -3105,6 +3138,11 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     checksummed_paths = [
         output_root / "stage1" / "IL.csv",
         output_root / "stage2" / "density" / "train.csv",
+        output_root
+        / "stage2"
+        / "partial_atomic_charge"
+        / "charge_20260514"
+        / "structure_manifest.csv",
         density_root / "test.csv",
         density_root / "IL" / "fold1.csv",
         small_root / "random" / "cv3" / "fold4.csv",
