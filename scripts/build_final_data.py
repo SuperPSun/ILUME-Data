@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
 import tempfile
 from pathlib import Path
+
+import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,11 +26,52 @@ EXCLUDED_EXPERIMENT_FILES = (
     "equilibrium_temperature.csv",
 )
 EXCLUDED_SIMULATION_FILES = ("3d_box.csv",)
+STRUCTURE_MANIFEST_COLUMNS = (
+    "mol_id",
+    "relative_path",
+    "format",
+    "size_bytes",
+    "sha256",
+    "referenced_by_charge",
+)
 
 
 def remove_charge_mapping(staged_root: Path) -> None:
     charge_structure_root = staged_root / "simulation" / "charge_20260514"
     (charge_structure_root / "mapping.csv").unlink(missing_ok=True)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_structure_manifest(staged_root: Path) -> None:
+    simulation_root = staged_root / "simulation"
+    structure_root = simulation_root / "charge_20260514"
+    charge = pd.read_csv(simulation_root / "charge.csv", usecols=["mol_id"])
+    referenced = set(charge["mol_id"].astype(str))
+    rows = []
+    for path in sorted(structure_root.iterdir(), key=lambda item: item.name):
+        if not path.is_file() or path.suffix.lower() not in {".mol", ".mol2"}:
+            continue
+        rows.append(
+            {
+                "mol_id": path.stem,
+                "relative_path": path.relative_to(structure_root).as_posix(),
+                "format": path.suffix.lower().removeprefix("."),
+                "size_bytes": path.stat().st_size,
+                "sha256": file_sha256(path),
+                "referenced_by_charge": path.stem in referenced,
+            }
+        )
+    pd.DataFrame(rows, columns=STRUCTURE_MANIFEST_COLUMNS).to_csv(
+        structure_root / "structure_manifest.csv",
+        index=False,
+    )
 
 
 def build_final_data(
@@ -54,6 +98,10 @@ def build_final_data(
         for filename in EXCLUDED_SIMULATION_FILES:
             (staged_root / "simulation" / filename).unlink(missing_ok=True)
         remove_charge_mapping(staged_root)
+        merged_audit = input_root / "_audit"
+        if merged_audit.exists():
+            shutil.copytree(merged_audit, staged_root / "_audit")
+        write_structure_manifest(staged_root)
 
         if output_root.exists():
             shutil.rmtree(output_root)

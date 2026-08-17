@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 
 import pandas as pd
 
@@ -11,6 +12,10 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
     simulation = merged_root / "simulation"
     experiment.mkdir(parents=True)
     simulation.mkdir()
+    merged_audit = merged_root / "_audit"
+    merged_audit.mkdir()
+    gap_audit = merged_audit / "orbital_gap_consistency_summary.csv"
+    gap_audit.write_text("source_file,checked_rows\norbital.csv,2\n")
 
     retained_experiment = experiment / "density.csv"
     retained_experiment.write_bytes(b"density,1\\n")
@@ -44,6 +49,8 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
     retained_mol.write_bytes(b"retained mol")
     retained_mol2 = charge_data_root / "mol_0022092.mol2"
     retained_mol2.write_bytes(b"retained mol2")
+    orphan = charge_data_root / "mol_orphan.mol2"
+    orphan.write_bytes(b"orphan")
     mapping = charge_data_root / "mapping.csv"
     mapping.write_text("mol_id,smiles,charge\\nmol_0000000,CCO,0\\nmol_0022092,CC,-1\\n")
 
@@ -65,6 +72,40 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
     assert (final_root / "simulation" / "charge_20260514" / retained_mol.name).exists()
     assert (final_root / "simulation" / "charge_20260514" / retained_mol2.name).exists()
     assert not (final_root / "simulation" / "charge_20260514" / "mapping.csv").exists()
+    manifest_path = (
+        final_root / "simulation" / "charge_20260514" / "structure_manifest.csv"
+    )
+    structure_manifest = pd.read_csv(manifest_path)
+    assert list(structure_manifest.columns) == [
+        "mol_id",
+        "relative_path",
+        "format",
+        "size_bytes",
+        "sha256",
+        "referenced_by_charge",
+    ]
+    assert structure_manifest["relative_path"].tolist() == [
+        "mol_0000000.mol2",
+        "mol_0022092.mol",
+        "mol_0022092.mol2",
+        "mol_orphan.mol2",
+    ]
+    assert structure_manifest["referenced_by_charge"].tolist() == [
+        True,
+        True,
+        True,
+        False,
+    ]
+    first = structure_manifest.iloc[0]
+    assert first["size_bytes"] == len(b"charge data")
+    assert first["sha256"] == hashlib.sha256(b"charge data").hexdigest()
+    assert not structure_manifest["relative_path"].eq("structure_manifest.csv").any()
+    assert (
+        final_root / "_audit" / "orbital_gap_consistency_summary.csv"
+    ).read_bytes() == gap_audit.read_bytes()
+    first_manifest = manifest_path.read_bytes()
+    build_final_data(merged_root, final_root, charge_data_root)
+    assert manifest_path.read_bytes() == first_manifest
     assert not stale_file.exists()
     for filename in (
         "thermal_diffusivity.csv",

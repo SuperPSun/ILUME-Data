@@ -82,6 +82,14 @@ def neutral_oxygen(index: int) -> str:
     return "O" + ("C" * index)
 
 
+def canonical_transfer_system(index: int) -> tuple[str, str]:
+    """Return the canonicalized transfer system generated for an index."""
+    return (
+        canonicalize_smiles(neutral_carbon(index)),
+        canonicalize_smiles(neutral_oxygen(index)),
+    )
+
+
 def write_stage2_files(final_root: Path, count: int = 100) -> None:
     pairs = [ion_pair(index) for index in range(1, count + 1)]
     for filename, target in (
@@ -138,6 +146,87 @@ def write_stage2_files(final_root: Path, count: int = 100) -> None:
     write_csv(
         final_root / "simulation" / "transfer_organic.csv",
         transfer_rows,
+    )
+    write_csv(
+        final_root / "simulation" / "heat_of_vaporization.csv",
+        [
+            {
+                "cation": cation,
+                "anion": anion,
+                "temperature_K": 298.0,
+                "heat_of_vaporization_kJ/mol": float(index),
+                "source_list": "simulation",
+            }
+            for index, (cation, anion) in enumerate(pairs)
+        ]
+        + [
+            {
+                "cation": pairs[0][0],
+                "anion": pairs[0][1],
+                "temperature_K": 320.0,
+                "heat_of_vaporization_kJ/mol": -1.0,
+                "source_list": "simulation",
+            }
+        ],
+    )
+    write_csv(
+        final_root / "simulation" / "pbe_tzvp_cation_orbitals.csv",
+        [
+            {
+                "cation": cation,
+                "HOMO_eV": -float(index + 2),
+                "LUMO_eV": -float(index),
+                "source_list": "simulation",
+            }
+            for index, (cation, _anion) in enumerate(pairs)
+        ],
+    )
+    write_csv(
+        final_root / "simulation" / "pbe_tzvp_anion_orbitals.csv",
+        [
+            {
+                "anion": anion,
+                "HOMO_eV": -float(index + 2),
+                "LUMO_eV": -float(index),
+                "source_list": "simulation",
+            }
+            for index, (_cation, anion) in enumerate(pairs)
+        ],
+    )
+    charge_rows = [
+        {
+            "mol_id": f"mol_{index:07d}",
+            "SMILES": neutral_carbon(index),
+            "charge": 0,
+            "source_list": "simulation",
+        }
+        for index in range(1, count + 1)
+    ]
+    charge_rows.append(
+        {
+            "mol_id": "mol_duplicate",
+            "SMILES": neutral_carbon(1),
+            "charge": 0,
+            "source_list": "simulation",
+        }
+    )
+    write_csv(final_root / "simulation" / "charge.csv", charge_rows)
+    write_csv(
+        final_root
+        / "simulation"
+        / "charge_20260514"
+        / "structure_manifest.csv",
+        [
+            {
+                "mol_id": row["mol_id"],
+                "relative_path": f"{row['mol_id']}.mol2",
+                "format": "mol2",
+                "size_bytes": 1,
+                "sha256": "0" * 64,
+                "referenced_by_charge": True,
+            }
+            for row in charge_rows
+        ],
     )
 
 
@@ -2261,7 +2350,7 @@ def test_task_group_kfold_rejects_too_few_or_indistinguishable_groups():
         )
 
 
-def test_charge_rows_are_deduplicated_and_conflicts_fail(tmp_path: Path):
+def test_partial_charge_rows_keep_mol_ids_and_validate_formal_charge(tmp_path: Path):
     final_root = tmp_path / "final"
     path = final_root / "simulation" / "charge.csv"
     write_csv(
@@ -2279,28 +2368,110 @@ def test_charge_rows_are_deduplicated_and_conflicts_fail(tmp_path: Path):
                 "charge": 0,
                 "source_list": "simulation",
             },
+            {
+                "mol_id": "mol_3",
+                "SMILES": "[NH4+]",
+                "charge": 1,
+                "source_list": "simulation",
+            },
+            {
+                "mol_id": "mol_4",
+                "SMILES": "[Cl-]",
+                "charge": -1,
+                "source_list": "simulation",
+            },
         ],
     )
     task = TaskSpec(
-        task_id="simulation/charge",
-        stage=3,
+        task_id="simulation/partial_atomic_charge",
+        stage=2,
         source_file="simulation/charge.csv",
-        target_columns=("charge",),
+        target_columns=("partial_atomic_charge",),
         identity_columns=("SMILES",),
         system_type="molecule",
     )
 
     frame, raw_rows = prepare_task_frame(final_root, task, "checksum")
-    assert raw_rows == 2
-    assert len(frame) == 1
-    assert frame.iloc[0]["SMILES"] == "CCO"
-    assert frame.iloc[0]["_mol_ids"] == "mol_1;mol_2"
+    assert raw_rows == 4
+    assert len(frame) == 4
+    assert frame["SMILES"].tolist()[:2] == ["CCO", "CCO"]
+    assert frame["mol_id"].tolist() == ["mol_1", "mol_2", "mol_3", "mol_4"]
+    assert frame["formal_charge"].tolist() == [0, 0, 1, -1]
+    assert frame["role"].tolist() == ["neutral", "neutral", "cation", "anion"]
+    assert frame.iloc[:2]["_system_id"].nunique() == 1
 
     conflicting = pd.read_csv(path)
     conflicting.loc[1, "charge"] = -1
     conflicting.to_csv(path, index=False)
-    with pytest.raises(TrainingSplitError, match="Conflicting charge labels"):
+    with pytest.raises(TrainingSplitError, match="Formal charge mismatch"):
         prepare_task_frame(final_root, task, "checksum")
+
+    duplicated = pd.read_csv(path)
+    duplicated.loc[1, "charge"] = 0
+    duplicated.loc[1, "mol_id"] = "mol_1"
+    duplicated.to_csv(path, index=False)
+    with pytest.raises(TrainingSplitError, match="Duplicate mol_id"):
+        prepare_task_frame(final_root, task, "checksum")
+
+
+def test_partial_charge_missing_structure_is_excluded_and_audited(tmp_path: Path):
+    final_root = tmp_path / "final"
+    write_csv(
+        final_root / "simulation" / "charge.csv",
+        [
+            {
+                "mol_id": "mol_present",
+                "SMILES": "CCO",
+                "charge": 0,
+                "source_list": "simulation",
+            },
+            {
+                "mol_id": "mol_missing",
+                "SMILES": "CCN",
+                "charge": 0,
+                "source_list": "simulation",
+            },
+        ],
+    )
+    manifest_relative = "simulation/charge_20260514/structure_manifest.csv"
+    write_csv(
+        final_root / manifest_relative,
+        [
+            {
+                "mol_id": "mol_present",
+                "relative_path": "mol_present.mol2",
+                "format": "mol2",
+                "size_bytes": 1,
+                "sha256": "0" * 64,
+            }
+        ],
+    )
+    task = TaskSpec(
+        "simulation/partial_atomic_charge",
+        2,
+        "simulation/charge.csv",
+        ("partial_atomic_charge",),
+        ("SMILES",),
+        "molecule",
+        resource_manifest=manifest_relative,
+    )
+    frame, _ = prepare_task_frame(final_root, task, "checksum")
+
+    filtered, audit = training_splits.exclude_missing_partial_charge_resources(
+        frame,
+        task,
+        final_root,
+    )
+
+    assert filtered["mol_id"].tolist() == ["mol_present"]
+    assert audit.to_dict("records") == [
+        {
+            "task_id": "simulation/partial_atomic_charge",
+            "mol_id": "mol_missing",
+            "SMILES": "CCN",
+            "reason": "missing_structure_resource",
+        }
+    ]
 
 
 def _system_rows(
@@ -2502,29 +2673,40 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     ignored_structure = (
         final_root / "simulation" / "charge_20260514" / "invalid.mol2"
     )
-    ignored_structure.parent.mkdir(parents=True)
+    ignored_structure.parent.mkdir(parents=True, exist_ok=True)
     ignored_structure.write_text("invalid structure", encoding="utf-8")
 
     output_root = tmp_path / "training"
     extract_pretraining_entities(final_root, output_root)
     catalog = build_training_splits(final_root, output_root, seed=42)
 
-    assert int(catalog["stage"].eq(2).sum()) == 5
+    assert int(catalog["stage"].eq(2).sum()) == 9
     assert set(
         catalog.loc[catalog["stage"].eq(2), "task_id"]
     ) == {
+        "simulation/pbe_tzvp_cation_orbitals",
+        "simulation/pbe_tzvp_anion_orbitals",
+        "simulation/partial_atomic_charge",
         "simulation/density",
         "simulation/heat_capacity",
+        "simulation/heat_of_vaporization",
         "simulation/simulated_qm_elec_hf",
         "simulation/thermal_expansion",
         "simulation/transfer_organic",
     }
     stage2 = catalog[catalog["stage"].eq(2)].set_index("task_id")
+    assert not set(stage2.index) & set(
+        catalog.loc[catalog["stage"].eq(3), "task_id"]
+    )
+    assert catalog.loc[catalog["stage"].eq(3), "task_id"].str.startswith(
+        "experiment/"
+    ).all()
     assert stage2.loc[
         [
             "simulation/density",
             "simulation/heat_capacity",
             "simulation/thermal_expansion",
+            "simulation/transfer_organic",
         ],
         ["raw_rows", "rows", "unique_systems"],
     ].to_dict("index") == {
@@ -2543,10 +2725,19 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
             "rows": 100,
             "unique_systems": 99,
         },
+        "simulation/transfer_organic": {
+            "raw_rows": 101,
+            "rows": 50,
+            "unique_systems": 50,
+        },
     }
     stage3 = catalog[catalog["stage"].eq(3)].set_index("task_id")
     assert stage3.loc["experiment/density", "tier"] == "large"
     assert stage3.loc["experiment/solvation", "tier"] == "medium"
+    assert stage3.loc[
+        "experiment/transfer_organic",
+        ["raw_rows", "rows", "unique_systems"],
+    ].tolist() == [50, 50, 50]
     assert (
         stage3.loc["experiment/dynamic_relative_permittivity", "tier"]
         == "small"
@@ -2711,7 +2902,17 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         ["cation", "anion"],
     )
     stage2_assignments("simulated_qm_elec_hf", ["SMILES"])
-    stage2_assignments("transfer_organic", ["solute", "solvent"])
+    stage2_assignments("pbe_tzvp_cation_orbitals", ["cation"])
+    stage2_assignments("pbe_tzvp_anion_orbitals", ["anion"])
+    stage2_assignments("partial_atomic_charge", ["SMILES"])
+    heat_of_vaporization_assignments = stage2_assignments(
+        "heat_of_vaporization",
+        ["cation", "anion"],
+    )
+    transfer_assignments = stage2_assignments(
+        "transfer_organic",
+        ["solute", "solvent"],
+    )
     assert density_assignments != heat_capacity_assignments
 
     assert set(density_assignments) == {
@@ -2722,6 +2923,23 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert canonical_ion_pair(3) not in thermal_expansion_assignments
     assert canonical_ion_pair(2) in thermal_expansion_assignments
     assert canonical_ion_pair(51) in thermal_expansion_assignments
+    assert set(transfer_assignments) == {
+        canonical_transfer_system(index) for index in range(51, 101)
+    }
+    assert set(heat_of_vaporization_assignments) == {
+        canonical_ion_pair(index) for index in range(1, 101)
+    }
+
+    transfer_stage3_root = (
+        output_root / "stage3" / "experiment" / "transfer_organic"
+    )
+    transfer_stage3_folds = [
+        pd.read_csv(
+            transfer_stage3_root / "random" / "cv1" / f"fold{fold}.csv"
+        )
+        for fold in range(1, 6)
+    ]
+    assert sum(map(len, transfer_stage3_folds)) == 50
 
     overlap_audit = pd.read_csv(
         output_root / "_audit" / "stage2_overlap_exclusions.csv"
@@ -2733,11 +2951,14 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         "anion",
         "excluded_stage2_rows",
         "matching_stage3_rows",
+        "solute",
+        "solvent",
     ]
     assert overlap_audit.groupby("stage2_task_id").size().to_dict() == {
         "simulation/density": 50,
         "simulation/heat_capacity": 1,
         "simulation/thermal_expansion": 1,
+        "simulation/transfer_organic": 50,
     }
     assert overlap_audit.groupby("stage2_task_id")[
         "excluded_stage2_rows"
@@ -2745,6 +2966,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         "simulation/density": 50,
         "simulation/heat_capacity": 1,
         "simulation/thermal_expansion": 1,
+        "simulation/transfer_organic": 51,
     }
     assert overlap_audit["matching_stage3_rows"].eq(1).all()
     density_overlap = overlap_audit.loc[
@@ -2769,6 +2991,28 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     ].tolist() == [
         "experiment/isobaric_coefficient_of_volume_expansion"
     ]
+    il_overlap = overlap_audit.loc[
+        overlap_audit["stage2_task_id"].ne(
+            "simulation/transfer_organic"
+        )
+    ]
+    assert il_overlap[["solute", "solvent"]].isna().all().all()
+    transfer_overlap = overlap_audit.loc[
+        overlap_audit["stage2_task_id"].eq(
+            "simulation/transfer_organic"
+        )
+    ]
+    assert transfer_overlap[["cation", "anion"]].isna().all().all()
+    assert set(
+        transfer_overlap[["solute", "solvent"]].itertuples(
+            index=False,
+            name=None,
+        )
+    ) == {canonical_transfer_system(index) for index in range(1, 51)}
+    assert transfer_overlap["stage3_task_id"].eq(
+        "experiment/transfer_organic"
+    ).all()
+    assert transfer_overlap["matching_stage3_rows"].eq(1).all()
 
     repeated_rows = pd.concat([train, valid], ignore_index=True)
     repeated_pair = repeated_rows.loc[
@@ -2783,7 +3027,6 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert len(repeated_rows) == 2
 
     legacy_paths = [
-        output_root / "task_catalog.csv",
         output_root / "manifest.json",
         output_root / "audit",
         output_root / "stage2" / "rows.csv",
@@ -2791,6 +3034,66 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         output_root / "stage3" / "test_groups.csv",
     ]
     assert not any(path.exists() for path in legacy_paths)
+    written_catalog = pd.read_csv(
+        output_root / "task_catalog.csv",
+        keep_default_na=False,
+    )
+    pd.testing.assert_frame_equal(written_catalog, catalog, check_dtype=False)
+    required_catalog_columns = {
+        "catalog_schema_version",
+        "task_kind",
+        "target_level",
+        "condition_columns",
+        "split_unit",
+        "sample_unit",
+        "simulation_method",
+        "experiment_reference",
+        "materialized_path",
+        "label_source",
+        "resource_manifest",
+    }
+    assert required_catalog_columns <= set(written_catalog.columns)
+    partial_catalog = stage2.loc["simulation/partial_atomic_charge"]
+    assert partial_catalog["target_columns"] == "partial_atomic_charge"
+    assert partial_catalog["task_kind"] == "atom_property"
+    assert partial_catalog["target_level"] == "atom"
+    assert partial_catalog["sample_unit"] == "mol_id"
+    assert partial_catalog["split_unit"] == "SMILES"
+    assert partial_catalog["label_source"] == "structure_resource"
+    assert partial_catalog["materialized_path"] == "stage2/partial_atomic_charge"
+    partial_rows = pd.concat(
+        [
+            pd.read_csv(output_root / "stage2" / "partial_atomic_charge" / name)
+            for name in ("train.csv", "valid.csv")
+        ],
+        ignore_index=True,
+    )
+    assert list(partial_rows.columns) == [
+        "mol_id",
+        "SMILES",
+        "role",
+        "formal_charge",
+        "source_list",
+    ]
+    assert len(partial_rows) == 101
+    assert partial_rows["mol_id"].nunique() == 101
+    partitions = {}
+    for partition in ("train", "valid"):
+        for mol_id in pd.read_csv(
+            output_root / "stage2" / "partial_atomic_charge" / f"{partition}.csv"
+        )["mol_id"]:
+            partitions[mol_id] = partition
+    assert partitions["mol_0000001"] == partitions["mol_duplicate"]
+    partial_resource_audit = pd.read_csv(
+        output_root / "_audit" / "partial_atomic_charge_resource_exclusions.csv"
+    )
+    assert list(partial_resource_audit.columns) == [
+        "task_id",
+        "mol_id",
+        "SMILES",
+        "reason",
+    ]
+    assert partial_resource_audit.empty
     for path in output_root.rglob("*.csv"):
         assert not {
             "row_id",
@@ -2834,9 +3137,121 @@ def test_discover_tasks_requires_stage2_overlap_references(tmp_path: Path):
             }
         ],
     )
+    write_csv(
+        final_root / "experiment" / "heat_capacity.csv",
+        [
+            {
+                "cation": cation,
+                "anion": anion,
+                "temperature_K": 298.15,
+                "heat_capacity_J/mol/K": 1.0,
+                "source_list": "experiment",
+            }
+        ],
+    )
+    write_csv(
+        final_root
+        / "experiment"
+        / "isobaric_coefficient_of_volume_expansion.csv",
+        [
+            {
+                "cation": cation,
+                "anion": anion,
+                "temperature_K": 298.15,
+                "isobaric_coefficient_of_volume_expansion_K^-1": 1.0,
+                "source_list": "experiment",
+            }
+        ],
+    )
 
     with pytest.raises(
         training_splits.TrainingSplitError,
-        match="Missing required stage-3 overlap references",
+        match=(
+            "Missing required stage-3 overlap references: "
+            "experiment/transfer_organic.csv"
+        ),
     ):
         discover_tasks(final_root)
+
+
+def test_discover_tasks_rejects_unclassified_simulation_dataset(tmp_path: Path):
+    final_root = tmp_path / "final"
+    write_stage2_files(final_root)
+    cation, anion = ion_pair(1)
+    for filename, target in (
+        ("density.csv", "density_g/cm^3"),
+        ("heat_capacity.csv", "heat_capacity_J/mol/K"),
+        (
+            "isobaric_coefficient_of_volume_expansion.csv",
+            "isobaric_coefficient_of_volume_expansion_K^-1",
+        ),
+    ):
+        write_csv(
+            final_root / "experiment" / filename,
+            [
+                {
+                    "cation": cation,
+                    "anion": anion,
+                    target: 1.0,
+                    "source_list": "experiment",
+                }
+            ],
+        )
+    write_csv(
+        final_root / "experiment" / "transfer_organic.csv",
+        [
+            {
+                "solute": "CC",
+                "solvent": "CO",
+                "transfer_organic_kcal/mol": 1.0,
+                "source_list": "experiment",
+            }
+        ],
+    )
+    write_csv(
+        final_root / "simulation" / "unknown_property.csv",
+        [
+            {
+                "SMILES": "CC",
+                "unknown": 1.0,
+                "source_list": "simulation",
+            }
+        ],
+    )
+
+    with pytest.raises(
+        TrainingSplitError,
+        match="Unclassified simulation datasets: simulation/unknown_property.csv",
+    ):
+        discover_tasks(final_root)
+
+
+def test_overlap_exclusion_rejects_mismatched_system_types():
+    """Reject overlap references that do not share one system identity."""
+    task = TaskSpec(
+        "simulation/transfer_organic",
+        2,
+        "simulation/transfer_organic.csv",
+        ("transfer_organic_kcal/mol",),
+        ("solute", "solvent"),
+        "solute_solvent",
+    )
+    reference_task = TaskSpec(
+        "experiment/density",
+        3,
+        "experiment/density.csv",
+        ("density_g/cm^3",),
+        ("cation", "anion"),
+        "il",
+    )
+
+    with pytest.raises(
+        training_splits.TrainingSplitError,
+        match="matching supported system type",
+    ):
+        training_splits.exclude_stage2_experiment_overlap(
+            pd.DataFrame(),
+            task,
+            reference_task,
+            pd.DataFrame(),
+        )

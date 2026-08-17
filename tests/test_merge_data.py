@@ -553,7 +553,7 @@ def test_simulation_stays_separate_from_experiment_for_same_property(tmp_path: P
     assert not (output_root / "simulation" / "density_err.csv").exists()
 
 
-def test_single_ion_orbitals_are_split_by_ion_and_error_labels_are_dropped(tmp_path: Path):
+def test_single_ion_orbitals_are_wide_and_gap_is_audited(tmp_path: Path):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
     write_csv(
@@ -562,7 +562,14 @@ def test_single_ion_orbitals_are_split_by_ion_and_error_labels_are_dropped(tmp_p
     )
     write_csv(
         input_root / "simulation" / "simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv",
-        [{"cation": "CC[n+]1ccn(C)c1", "HOMO_eV": -9.0, "LUMO_eV": -4.0, "gap_eV": 5.0}],
+        [
+            {
+                "cation": "CC[n+]1ccn(C)c1",
+                "HOMO_eV": -9.0,
+                "LUMO_eV": -4.0,
+                "gap_eV": 4.5,
+            }
+        ],
     )
     write_csv(
         input_root / "simulation" / "simulated_heat_capacity_structured.csv",
@@ -580,40 +587,35 @@ def test_single_ion_orbitals_are_split_by_ion_and_error_labels_are_dropped(tmp_p
     merge_data(input_root, output_root)
 
     simulation_root = output_root / "simulation"
-    anion_homo = pd.read_csv(simulation_root / "anion_homo.csv")
-    anion_lumo = pd.read_csv(simulation_root / "anion_lumo.csv")
-    cation_homo = pd.read_csv(simulation_root / "cation_homo.csv")
-    cation_lumo = pd.read_csv(simulation_root / "cation_lumo.csv")
-    assert list(anion_homo.columns) == ["anion", "anion_HOMO_eV", "source_list"]
-    assert list(anion_lumo.columns) == ["anion", "anion_LUMO_eV", "source_list"]
-    assert list(cation_homo.columns) == ["cation", "cation_HOMO_eV", "source_list"]
-    assert list(cation_lumo.columns) == ["cation", "cation_LUMO_eV", "source_list"]
-    assert anion_homo.loc[0, "anion_HOMO_eV"] == -1.0
-    assert anion_lumo.loc[0, "anion_LUMO_eV"] == 2.0
-    assert cation_homo.loc[0, "cation_HOMO_eV"] == -9.0
-    assert cation_lumo.loc[0, "cation_LUMO_eV"] == -4.0
+    anion = pd.read_csv(simulation_root / "pbe_tzvp_anion_orbitals.csv")
+    cation = pd.read_csv(simulation_root / "pbe_tzvp_cation_orbitals.csv")
+    assert list(anion.columns) == ["anion", "HOMO_eV", "LUMO_eV", "source_list"]
+    assert list(cation.columns) == ["cation", "HOMO_eV", "LUMO_eV", "source_list"]
+    assert anion.loc[0, ["HOMO_eV", "LUMO_eV"]].tolist() == [-1.0, 2.0]
+    assert cation.loc[0, ["HOMO_eV", "LUMO_eV"]].tolist() == [-9.0, -4.0]
     assert not (simulation_root / "homo.csv").exists()
     assert not (simulation_root / "lumo.csv").exists()
     assert not (simulation_root / "gap.csv").exists()
+    assert not (simulation_root / "anion_homo.csv").exists()
+    assert not (simulation_root / "cation_lumo.csv").exists()
 
     manifest = pd.read_csv(output_root / "merged_manifest.csv")
     orbital_rows = manifest[manifest["property_label"].isin(
-        {"anion_HOMO_eV", "anion_LUMO_eV", "cation_HOMO_eV", "cation_LUMO_eV"}
+        {"pbe_tzvp_anion_orbitals", "pbe_tzvp_cation_orbitals"}
     )]
     assert dict(zip(orbital_rows["property_label"], orbital_rows["output_file"])) == {
-        "anion_HOMO_eV": "simulation/anion_homo.csv",
-        "anion_LUMO_eV": "simulation/anion_lumo.csv",
-        "cation_HOMO_eV": "simulation/cation_homo.csv",
-        "cation_LUMO_eV": "simulation/cation_lumo.csv",
+        "pbe_tzvp_anion_orbitals": "simulation/pbe_tzvp_anion_orbitals.csv",
+        "pbe_tzvp_cation_orbitals": "simulation/pbe_tzvp_cation_orbitals.csv",
     }
     assert set(orbital_rows["input_rows"]) == {1}
     assert set(orbital_rows["output_rows"]) == {1}
-    assert set(orbital_rows.loc[orbital_rows["property_label"].str.startswith("anion_"), "input_files"]) == {
-        "simulation/simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv"
-    }
-    assert set(orbital_rows.loc[orbital_rows["property_label"].str.startswith("cation_"), "input_files"]) == {
-        "simulation/simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv"
-    }
+    summary = pd.read_csv(output_root / "_audit" / "orbital_gap_consistency_summary.csv")
+    assert summary["checked_rows"].tolist() == [1, 1]
+    assert summary["exceeded_rows"].tolist() == [0, 1]
+    anomalies = pd.read_csv(output_root / "_audit" / "orbital_gap_consistency_anomalies.csv")
+    assert len(anomalies) == 1
+    assert anomalies.loc[0, "identity_column"] == "cation"
+    assert anomalies.loc[0, "absolute_residual_eV"] == pytest.approx(0.5)
 
     heat_capacity = pd.read_csv(output_root / "simulation" / "heat_capacity.csv")
     assert list(heat_capacity.columns) == [
