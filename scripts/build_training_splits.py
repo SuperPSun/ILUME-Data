@@ -67,13 +67,14 @@ STAGE1_SOURCE_ROLE_BY_COLUMN = {
 }
 STAGE1_NEUTRAL_SOURCE_ROLES = ("simulation_mol", "solute", "solvent")
 STAGE1_SOURCE_ROLES = ("anion", "cation", *STAGE1_NEUTRAL_SOURCE_ROLES)
-CONDITION_COLUMNS = {
+CONDITION_COLUMN_ORDER = (
     "temperature_K",
     "pressure_kPa",
     "frequency_MHz",
     "wavelength_nm",
     "phase",
-}
+)
+CONDITION_COLUMNS = set(CONDITION_COLUMN_ORDER)
 METADATA_COLUMNS = {"source_list", "mol_id"}
 PRETRAIN_ENTITY_COLUMNS = [
     "SMILES",
@@ -123,19 +124,13 @@ ZINC_ALLOWED_ELEMENTS = {
     "I",
 }
 
-STAGE2_FILES = {
-    "simulation/density.csv",
-    "simulation/heat_capacity.csv",
-    "simulation/simulated_qm_elec_hf.csv",
-    "simulation/thermal_expansion.csv",
-    "simulation/transfer_organic.csv",
-}
 STAGE2_EXPERIMENT_REFERENCES = {
     "simulation/density.csv": "experiment/density.csv",
     "simulation/heat_capacity.csv": "experiment/heat_capacity.csv",
     "simulation/thermal_expansion.csv": (
         "experiment/isobaric_coefficient_of_volume_expansion.csv"
     ),
+    "simulation/transfer_organic.csv": "experiment/transfer_organic.csv",
 }
 STAGE2_OVERLAP_AUDIT_COLUMNS = [
     "stage2_task_id",
@@ -144,6 +139,8 @@ STAGE2_OVERLAP_AUDIT_COLUMNS = [
     "anion",
     "excluded_stage2_rows",
     "matching_stage3_rows",
+    "solute",
+    "solvent",
 ]
 QM_TARGET_COLUMNS = (
     "ESP_max",
@@ -158,6 +155,88 @@ QM_TARGET_COLUMNS = (
     "q_pos_frac",
     "gap_eV",
 )
+CATALOG_SCHEMA_VERSION = 1
+PARTIAL_CHARGE_SOURCE_RESOURCE_DIR = "simulation/charge_20260514"
+PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST = (
+    "simulation/charge_20260514/structure_manifest.csv"
+)
+PARTIAL_CHARGE_MATERIALIZED_RESOURCE_DIR = (
+    "stage2/partial_atomic_charge/charge_20260514"
+)
+PARTIAL_CHARGE_MATERIALIZED_RESOURCE_MANIFEST = (
+    f"{PARTIAL_CHARGE_MATERIALIZED_RESOURCE_DIR}/structure_manifest.csv"
+)
+PARTIAL_CHARGE_RESOURCE_AUDIT_COLUMNS = (
+    "task_id",
+    "mol_id",
+    "SMILES",
+    "reason",
+)
+SIMULATION_TASK_REGISTRY = {
+    "simulation/pbe_tzvp_cation_orbitals.csv": {
+        "task_id": "simulation/pbe_tzvp_cation_orbitals",
+        "identity_columns": ("cation",),
+        "system_type": "cation",
+        "target_columns": ("HOMO_eV", "LUMO_eV"),
+        "simulation_method": "PBE/TZVP",
+    },
+    "simulation/pbe_tzvp_anion_orbitals.csv": {
+        "task_id": "simulation/pbe_tzvp_anion_orbitals",
+        "identity_columns": ("anion",),
+        "system_type": "anion",
+        "target_columns": ("HOMO_eV", "LUMO_eV"),
+        "simulation_method": "PBE/TZVP",
+    },
+    "simulation/charge.csv": {
+        "task_id": "simulation/partial_atomic_charge",
+        "identity_columns": ("SMILES",),
+        "system_type": "molecule",
+        "target_columns": ("partial_atomic_charge",),
+        "task_kind": "atom_property",
+        "target_level": "atom",
+        "sample_unit": "mol_id",
+        "label_source": "structure_resource",
+        "source_resource_manifest": PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST,
+        "resource_manifest": PARTIAL_CHARGE_MATERIALIZED_RESOURCE_MANIFEST,
+    },
+    "simulation/simulated_qm_elec_hf.csv": {
+        "task_id": "simulation/simulated_qm_elec_hf",
+        "identity_columns": ("SMILES",),
+        "system_type": "molecule",
+        "target_columns": QM_TARGET_COLUMNS,
+        "simulation_method": "HF",
+    },
+    "simulation/density.csv": {
+        "task_id": "simulation/density",
+        "identity_columns": ("cation", "anion"),
+        "system_type": "il",
+        "target_columns": ("density_g/cm^3",),
+    },
+    "simulation/heat_capacity.csv": {
+        "task_id": "simulation/heat_capacity",
+        "identity_columns": ("cation", "anion"),
+        "system_type": "il",
+        "target_columns": ("heat_capacity_J/mol/K",),
+    },
+    "simulation/thermal_expansion.csv": {
+        "task_id": "simulation/thermal_expansion",
+        "identity_columns": ("cation", "anion"),
+        "system_type": "il",
+        "target_columns": ("thermal_expansion_K^-1",),
+    },
+    "simulation/heat_of_vaporization.csv": {
+        "task_id": "simulation/heat_of_vaporization",
+        "identity_columns": ("cation", "anion"),
+        "system_type": "il",
+        "target_columns": ("heat_of_vaporization_kJ/mol",),
+    },
+    "simulation/transfer_organic.csv": {
+        "task_id": "simulation/transfer_organic",
+        "identity_columns": ("solute", "solvent"),
+        "system_type": "solute_solvent",
+        "target_columns": ("transfer_organic_kcal/mol",),
+    },
+}
 
 SYSTEM_COLUMNS = {
     "il": ("cation", "anion"),
@@ -229,6 +308,17 @@ class TaskSpec:
     target_columns: tuple[str, ...]
     identity_columns: tuple[str, ...]
     system_type: str
+    condition_columns: tuple[str, ...] = ()
+    task_kind: str = "object_property"
+    target_level: str = "object"
+    split_unit: str = ""
+    sample_unit: str = "row"
+    simulation_method: str = ""
+    experiment_reference: str = ""
+    materialized_path: str = ""
+    label_source: str = "materialized_csv"
+    source_resource_manifest: str = ""
+    resource_manifest: str = ""
 
 
 @dataclass(frozen=True)
@@ -4537,7 +4627,7 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
         path.relative_to(final_root).as_posix()
         for path in paths
     }
-    missing_stage2 = STAGE2_FILES - relative_paths
+    missing_stage2 = set(SIMULATION_TASK_REGISTRY) - relative_paths
     if missing_stage2:
         raise TrainingSplitError(
             "Missing required stage-2 datasets: "
@@ -4551,11 +4641,91 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
             "Missing required stage-3 overlap references: "
             + ", ".join(sorted(missing_references))
         )
+    unknown_simulation = {
+        relative
+        for relative in relative_paths
+        if relative.startswith("simulation/")
+        and relative not in SIMULATION_TASK_REGISTRY
+    }
+    if unknown_simulation:
+        raise TrainingSplitError(
+            "Unclassified simulation datasets: "
+            + ", ".join(sorted(unknown_simulation))
+        )
+    resource_manifest = final_root / PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST
+    if not resource_manifest.is_file():
+        raise TrainingSplitError(
+            "Missing partial-charge structure manifest: "
+            f"{PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST}"
+        )
 
     tasks: list[TaskSpec] = []
     for path in paths:
         relative = path.relative_to(final_root).as_posix()
         columns = list(pd.read_csv(path, nrows=0).columns)
+        if relative.startswith("simulation/"):
+            definition = SIMULATION_TASK_REGISTRY[relative]
+            identity_columns = tuple(definition["identity_columns"])
+            missing_identity = set(identity_columns) - set(columns)
+            if missing_identity:
+                raise TrainingSplitError(
+                    f"Missing identity columns in {relative}: {sorted(missing_identity)}"
+                )
+            logical_targets = tuple(definition["target_columns"])
+            observed_targets = {
+                column
+                for column in columns
+                if column not in identity_columns
+                and column not in CONDITION_COLUMNS
+                and column not in METADATA_COLUMNS
+            }
+            if relative == "simulation/charge.csv":
+                required = {"mol_id", "SMILES", "charge", "source_list"}
+                missing = required - set(columns)
+                unexpected_targets = observed_targets - {"charge"}
+            else:
+                missing = set(logical_targets) - set(columns)
+                unexpected_targets = observed_targets - set(logical_targets)
+            if missing or unexpected_targets:
+                raise TrainingSplitError(
+                    f"Unexpected schema in {relative}; "
+                    f"missing={sorted(missing)}, extra_targets={sorted(unexpected_targets)}"
+                )
+            condition_columns = tuple(
+                column for column in CONDITION_COLUMN_ORDER if column in columns
+            )
+            system_type = str(definition["system_type"])
+            tasks.append(
+                TaskSpec(
+                    task_id=str(definition["task_id"]),
+                    stage=2,
+                    source_file=relative,
+                    target_columns=logical_targets,
+                    identity_columns=identity_columns,
+                    system_type=system_type,
+                    condition_columns=condition_columns,
+                    task_kind=str(definition.get("task_kind", "object_property")),
+                    target_level=str(definition.get("target_level", "object")),
+                    split_unit=";".join(SYSTEM_COLUMNS[system_type]),
+                    sample_unit=str(definition.get("sample_unit", "row")),
+                    simulation_method=str(definition.get("simulation_method", "")),
+                    experiment_reference=(
+                        STAGE2_EXPERIMENT_REFERENCES.get(relative, "")
+                        .removesuffix(".csv")
+                    ),
+                    materialized_path=(
+                        "stage2/partial_atomic_charge"
+                        if relative == "simulation/charge.csv"
+                        else f"stage2/{path.stem}"
+                    ),
+                    label_source=str(definition.get("label_source", "materialized_csv")),
+                    source_resource_manifest=str(
+                        definition.get("source_resource_manifest", "")
+                    ),
+                    resource_manifest=str(definition.get("resource_manifest", "")),
+                )
+            )
+            continue
         identity_columns = tuple(
             column for column in IDENTITY_COLUMNS if column in columns
         )
@@ -4569,17 +4739,7 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
             and column not in CONDITION_COLUMNS
             and column not in METADATA_COLUMNS
         )
-        stage = 2 if relative in STAGE2_FILES else 3
-        if relative == "simulation/simulated_qm_elec_hf.csv":
-            missing_qm = set(QM_TARGET_COLUMNS) - set(target_columns)
-            extra_qm = set(target_columns) - set(QM_TARGET_COLUMNS)
-            if missing_qm or extra_qm:
-                raise TrainingSplitError(
-                    f"Unexpected QM target columns in {relative}; "
-                    f"missing={sorted(missing_qm)}, extra={sorted(extra_qm)}"
-                )
-            target_columns = QM_TARGET_COLUMNS
-        elif len(target_columns) != 1:
+        if len(target_columns) != 1:
             raise TrainingSplitError(
                 f"Expected exactly one target column in {relative}, "
                 f"found {list(target_columns)}"
@@ -4587,11 +4747,16 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
         tasks.append(
             TaskSpec(
                 task_id=relative.removesuffix(".csv"),
-                stage=stage,
+                stage=3,
                 source_file=relative,
                 target_columns=target_columns,
                 identity_columns=identity_columns,
                 system_type=system_type,
+                condition_columns=tuple(
+                    column for column in CONDITION_COLUMN_ORDER if column in columns
+                ),
+                split_unit=";".join(SYSTEM_COLUMNS[system_type]),
+                materialized_path=f"stage3/{relative.removesuffix('.csv')}",
             )
         )
     return sorted(tasks, key=lambda task: (task.stage, task.source_file))
@@ -4630,36 +4795,73 @@ def _canonicalize_identity_column(
     return values.map(mapping)
 
 
-def _deduplicate_charge(frame: pd.DataFrame, source_file: str) -> pd.DataFrame:
+def _prepare_partial_atomic_charge(
+    frame: pd.DataFrame,
+    source_file: str,
+) -> pd.DataFrame:
     if "charge" not in frame.columns or "mol_id" not in frame.columns:
         raise TrainingSplitError(
             f"{source_file} must contain charge and mol_id columns"
         )
-    charges = pd.to_numeric(frame["charge"], errors="coerce")
-    if charges.isna().any():
-        raise TrainingSplitError(f"Non-numeric charge label in {source_file}")
-    frame = frame.copy()
-    frame["charge"] = charges
-    records: list[pd.Series] = []
-    for smiles, group in frame.groupby("SMILES", sort=False, dropna=False):
-        unique_charges = pd.unique(group["charge"])
-        if len(unique_charges) != 1:
-            values = sorted(float(value) for value in unique_charges)
-            raise TrainingSplitError(
-                f"Conflicting charge labels for {smiles}: {values}"
-            )
-        representative = group.sort_values("_source_row", kind="stable").iloc[0].copy()
-        representative["_mol_ids"] = ";".join(
-            dict.fromkeys(group["mol_id"].astype(str).tolist())
+    mol_ids = frame["mol_id"].astype(str)
+    if mol_ids.str.strip().eq("").any():
+        raise TrainingSplitError(f"Missing mol_id in {source_file}")
+    duplicated = mol_ids[mol_ids.duplicated(keep=False)]
+    if not duplicated.empty:
+        raise TrainingSplitError(
+            f"Duplicate mol_id in {source_file}: {sorted(duplicated.unique())[:5]}"
         )
-        records.append(representative)
-    if not records:
-        result = frame.iloc[0:0].copy()
-        result["_mol_ids"] = pd.Series(dtype="object")
-        return result
-    return pd.DataFrame(records).sort_values("_source_row", kind="stable").reset_index(
-        drop=True
+    charges = pd.to_numeric(frame["charge"], errors="coerce")
+    valid_charge = charges.notna() & np.isfinite(charges) & charges.eq(charges.round())
+    if not valid_charge.all():
+        raise TrainingSplitError(f"Non-integer charge value in {source_file}")
+    frame = frame.copy()
+    frame["mol_id"] = mol_ids
+    source_charges = charges.astype(int)
+    formal_charges = frame["SMILES"].map(
+        lambda smiles: Chem.GetFormalCharge(Chem.MolFromSmiles(str(smiles)))
     )
+    mismatched = source_charges.ne(formal_charges)
+    if mismatched.any():
+        first = frame.loc[mismatched].iloc[0]
+        index = first.name
+        raise TrainingSplitError(
+            "Formal charge mismatch in "
+            f"{source_file} for {first['mol_id']}: "
+            f"source={source_charges.at[index]}, rdkit={formal_charges.at[index]}"
+        )
+    frame["formal_charge"] = formal_charges.astype(int)
+    frame["role"] = frame["formal_charge"].map(
+        lambda value: "cation" if value > 0 else "anion" if value < 0 else "neutral"
+    )
+    return frame
+
+
+def exclude_missing_partial_charge_resources(
+    frame: pd.DataFrame,
+    task: TaskSpec,
+    final_root: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    manifest_path = final_root / task.source_resource_manifest
+    manifest = pd.read_csv(manifest_path)
+    required = {"mol_id", "relative_path", "format", "size_bytes", "sha256"}
+    missing = required - set(manifest.columns)
+    if missing:
+        raise TrainingSplitError(
+            "Missing columns in "
+            f"{task.source_resource_manifest}: {sorted(missing)}"
+        )
+    available = set(manifest["mol_id"].dropna().astype(str))
+    missing_mask = ~frame["mol_id"].astype(str).isin(available)
+    excluded = frame.loc[missing_mask, ["mol_id", "SMILES"]].copy()
+    if excluded.empty:
+        audit = pd.DataFrame(columns=PARTIAL_CHARGE_RESOURCE_AUDIT_COLUMNS)
+    else:
+        audit = excluded
+        audit.insert(0, "task_id", task.task_id)
+        audit["reason"] = "missing_structure_resource"
+        audit = audit.loc[:, PARTIAL_CHARGE_RESOURCE_AUDIT_COLUMNS]
+    return frame.loc[~missing_mask].reset_index(drop=True), audit
 
 
 def prepare_task_frame(
@@ -4679,9 +4881,7 @@ def prepare_task_frame(
         )
 
     if task.source_file == "simulation/charge.csv":
-        frame = _deduplicate_charge(frame, task.source_file)
-    else:
-        frame["_mol_ids"] = ""
+        frame = _prepare_partial_atomic_charge(frame, task.source_file)
 
     system_values = list(
         frame.loc[:, list(SYSTEM_COLUMNS[task.system_type])].itertuples(
@@ -4840,13 +5040,19 @@ def exclude_stage2_experiment_overlap(
     reference_task: TaskSpec,
     reference_systems: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Remove Stage-2 IL systems present in the paired experiment task."""
-    if task.system_type != "il" or reference_task.system_type != "il":
+    """Remove Stage-2 systems present in the paired experiment task."""
+    supported_system_types = {"il", "solute_solvent"}
+    if (
+        task.system_type != reference_task.system_type
+        or task.system_type not in supported_system_types
+    ):
         raise TrainingSplitError(
-            "Stage-2 overlap exclusion requires paired IL tasks: "
+            "Stage-2 overlap exclusion requires paired tasks with a "
+            "matching supported system type: "
             f"{task.task_id}, {reference_task.task_id}"
         )
 
+    identity_columns = list(SYSTEM_COLUMNS[task.system_type])
     reference_counts = reference_systems.set_index("_system_id")[
         "row_count"
     ]
@@ -4857,7 +5063,7 @@ def exclude_stage2_experiment_overlap(
     else:
         audit = (
             excluded.groupby(
-                ["_system_id", "cation", "anion"],
+                ["_system_id", *identity_columns],
                 sort=True,
                 dropna=False,
             )
@@ -4870,6 +5076,9 @@ def exclude_stage2_experiment_overlap(
         )
         audit.insert(0, "stage3_task_id", reference_task.task_id)
         audit.insert(0, "stage2_task_id", task.task_id)
+        for column in ("cation", "anion", "solute", "solvent"):
+            if column not in audit:
+                audit[column] = pd.NA
         audit = audit.loc[:, STAGE2_OVERLAP_AUDIT_COLUMNS]
 
     filtered = frame.loc[~excluded_mask].reset_index(drop=True)
@@ -5084,8 +5293,9 @@ def _materialized_task_frame(
     ]
     result = frame.loc[:, visible_columns].copy()
     if task.source_file == "simulation/charge.csv":
-        result = result.drop(columns=["mol_id"])
-        result["mol_id_list"] = frame["_mol_ids"].astype(str).to_numpy()
+        result = result.loc[
+            :, ["mol_id", "SMILES", "role", "formal_charge", "source_list"]
+        ]
     elif "mol_id" in result.columns:
         mol_ids = result.pop("mol_id")
         result["mol_id"] = mol_ids
@@ -5204,6 +5414,9 @@ def build_training_splits(
     task_catalog_rows: list[dict[str, object]] = []
     fold_balance_rows: list[dict[str, object]] = []
     stage2_overlap_audits: list[pd.DataFrame] = []
+    partial_charge_resource_audit = pd.DataFrame(
+        columns=PARTIAL_CHARGE_RESOURCE_AUDIT_COLUMNS
+    )
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
         staged_root = Path(temporary_dir) / "training_splits"
         stage2_root = staged_root / "stage2"
@@ -5219,6 +5432,14 @@ def build_training_splits(
                 task,
                 checksums[task.source_file],
             )
+            if task.source_file == "simulation/charge.csv":
+                frame, partial_charge_resource_audit = (
+                    exclude_missing_partial_charge_resources(
+                        frame,
+                        task,
+                        final_root,
+                    )
+                )
             reference_source = STAGE2_EXPERIMENT_REFERENCES.get(
                 task.source_file
             )
@@ -5266,7 +5487,7 @@ def build_training_splits(
                     f"Stage-2 system crosses partitions for {task.task_id}"
                 )
 
-            task_root = stage2_root / Path(task.source_file).stem
+            task_root = staged_root / task.materialized_path
             materialized = _materialized_task_frame(frame, task)
             write_dataframe(
                 task_root / "train.csv",
@@ -5280,14 +5501,30 @@ def build_training_splits(
                     partitions.eq("validation").to_numpy()
                 ].reset_index(drop=True),
             )
+            if task.source_file == "simulation/charge.csv":
+                shutil.copytree(
+                    final_root / PARTIAL_CHARGE_SOURCE_RESOURCE_DIR,
+                    task_root / Path(PARTIAL_CHARGE_SOURCE_RESOURCE_DIR).name,
+                )
             task_catalog_rows.append(
                 {
+                    "catalog_schema_version": CATALOG_SCHEMA_VERSION,
                     "stage": 2,
                     "task_id": task.task_id,
+                    "task_kind": task.task_kind,
+                    "target_level": task.target_level,
                     "source_file": task.source_file,
                     "target_columns": ";".join(task.target_columns),
                     "identity_columns": ";".join(task.identity_columns),
+                    "condition_columns": ";".join(task.condition_columns),
                     "system_type": task.system_type,
+                    "split_unit": task.split_unit,
+                    "sample_unit": task.sample_unit,
+                    "simulation_method": task.simulation_method,
+                    "experiment_reference": task.experiment_reference,
+                    "materialized_path": task.materialized_path,
+                    "label_source": task.label_source,
+                    "resource_manifest": task.resource_manifest,
                     "raw_rows": profile.raw_rows,
                     "rows": profile.rows,
                     "unique_systems": profile.system_count,
@@ -5332,7 +5569,7 @@ def build_training_splits(
                 raise TrainingSplitError(
                     f"Fewer than five development rows for {task.task_id}"
                 )
-            task_root = stage3_root / task.task_id
+            task_root = staged_root / task.materialized_path
             task_root.mkdir(parents=True)
 
             test_mask = partitions.eq("test")
@@ -5453,12 +5690,23 @@ def build_training_splits(
                     )
             task_catalog_rows.append(
                 {
+                    "catalog_schema_version": CATALOG_SCHEMA_VERSION,
                     "stage": 3,
                     "task_id": task.task_id,
+                    "task_kind": task.task_kind,
+                    "target_level": task.target_level,
                     "source_file": task.source_file,
                     "target_columns": ";".join(task.target_columns),
                     "identity_columns": ";".join(task.identity_columns),
+                    "condition_columns": ";".join(task.condition_columns),
                     "system_type": task.system_type,
+                    "split_unit": task.split_unit,
+                    "sample_unit": task.sample_unit,
+                    "simulation_method": task.simulation_method,
+                    "experiment_reference": task.experiment_reference,
+                    "materialized_path": task.materialized_path,
+                    "label_source": task.label_source,
+                    "resource_manifest": task.resource_manifest,
                     "raw_rows": profile.raw_rows,
                     "rows": profile.rows,
                     "unique_systems": profile.system_count,
@@ -5487,27 +5735,36 @@ def build_training_splits(
             stage2_overlap_audits,
             ignore_index=True,
         ).sort_values(
-            ["stage2_task_id", "cation", "anion"],
+            ["stage2_task_id", "cation", "anion", "solute", "solvent"],
             kind="stable",
         )
         write_dataframe(
             audit_root / "stage2_overlap_exclusions.csv",
             overlap_audit.reset_index(drop=True),
         )
+        write_dataframe(
+            audit_root / "partial_atomic_charge_resource_exclusions.csv",
+            partial_charge_resource_audit.reset_index(drop=True),
+        )
+        task_catalog = pd.DataFrame(task_catalog_rows).sort_values(
+            ["stage", "task_id"],
+            kind="stable",
+        ).reset_index(drop=True)
+        write_dataframe(staged_root / "task_catalog.csv", task_catalog)
         replace_directory(stage2_root, output_root / "stage2")
         replace_directory(stage3_root, output_root / "stage3")
         replace_directory(audit_root, output_root / "_audit")
+        os.replace(
+            staged_root / "task_catalog.csv",
+            output_root / "task_catalog.csv",
+        )
 
-    (output_root / "task_catalog.csv").unlink(missing_ok=True)
     (output_root / "manifest.json").unlink(missing_ok=True)
     legacy_audit = output_root / "audit"
     if legacy_audit.exists():
         shutil.rmtree(legacy_audit)
 
-    return pd.DataFrame(task_catalog_rows).sort_values(
-        ["stage", "task_id"],
-        kind="stable",
-    ).reset_index(drop=True)
+    return task_catalog
 
 
 def parse_args() -> argparse.Namespace:

@@ -26,10 +26,34 @@ WIDE_TABLE_FILES = {
     "simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF",
 }
 SINGLE_ION_ORBITAL_FILES = {
-    "simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv": "anion",
-    "simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv": "cation",
+    "simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv": (
+        "anion",
+        "pbe_tzvp_anion_orbitals",
+    ),
+    "simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv": (
+        "cation",
+        "pbe_tzvp_cation_orbitals",
+    ),
 }
-SINGLE_ION_ORBITAL_LABELS = {"HOMO_eV", "LUMO_eV"}
+ORBITAL_GAP_TOLERANCE_EV = 1.0e-8
+ORBITAL_GAP_SUMMARY_COLUMNS = (
+    "source_file",
+    "identity_column",
+    "checked_rows",
+    "exceeded_rows",
+    "max_absolute_residual_eV",
+    "tolerance_eV",
+)
+ORBITAL_GAP_ANOMALY_COLUMNS = (
+    "source_file",
+    "identity_column",
+    "identity",
+    "HOMO_eV",
+    "LUMO_eV",
+    "gap_eV",
+    "absolute_residual_eV",
+    "tolerance_eV",
+)
 PROPERTY_OUTPUT_SLUGS = {"pressure_kPa_log10": "equilibrium_pressure"}
 PROPERTY_LABEL_ALIASES = {
     ("after_AIonopedia", "partition_log10"): "transfer_kcal/mol",
@@ -581,8 +605,13 @@ def aggregate_qm_elec_hf(rows: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd.Dat
     return aggregated[columns].sort_values("SMILES").reset_index(drop=True), matching_rows
 
 
-def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list[pd.DataFrame]]:
+def collect_bucket(
+    input_root: Path,
+    sources: tuple[str, ...],
+) -> tuple[dict[str, list[pd.DataFrame]], list[dict[str, object]], list[dict[str, object]]]:
     properties: dict[str, list[pd.DataFrame]] = {}
+    orbital_gap_summaries: list[dict[str, object]] = []
+    orbital_gap_anomalies: list[dict[str, object]] = []
     for source in sources:
         source_dir = input_root / source
         if not source_dir.exists():
@@ -600,17 +629,62 @@ def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list
                 wide_df["source_file"] = path.name
                 properties.setdefault(wide_key, []).append(wide_df)
                 continue
-            ion_prefix = SINGLE_ION_ORBITAL_FILES.get(path.name)
+            orbital_spec = SINGLE_ION_ORBITAL_FILES.get(path.name)
+            if orbital_spec is not None:
+                identity_column, task_label = orbital_spec
+                required = {identity_column, "HOMO_eV", "LUMO_eV", "gap_eV"}
+                missing = required - set(df.columns)
+                if missing:
+                    raise ValueError(
+                        f"{path.name} is missing orbital columns: {sorted(missing)}"
+                    )
+                numeric = df[["HOMO_eV", "LUMO_eV", "gap_eV"]].apply(
+                    pd.to_numeric,
+                    errors="coerce",
+                )
+                residuals = (numeric["gap_eV"] - (numeric["LUMO_eV"] - numeric["HOMO_eV"])).abs()
+                anomaly_mask = residuals.gt(ORBITAL_GAP_TOLERANCE_EV) | residuals.isna()
+                finite_residuals = residuals.dropna()
+                orbital_gap_summaries.append(
+                    {
+                        "source_file": f"{source}/{path.name}",
+                        "identity_column": identity_column,
+                        "checked_rows": len(df),
+                        "exceeded_rows": int(anomaly_mask.sum()),
+                        "max_absolute_residual_eV": (
+                            float(finite_residuals.max()) if not finite_residuals.empty else pd.NA
+                        ),
+                        "tolerance_eV": ORBITAL_GAP_TOLERANCE_EV,
+                    }
+                )
+                for index in df.index[anomaly_mask]:
+                    orbital_gap_anomalies.append(
+                        {
+                            "source_file": f"{source}/{path.name}",
+                            "identity_column": identity_column,
+                            "identity": df.at[index, identity_column],
+                            "HOMO_eV": df.at[index, "HOMO_eV"],
+                            "LUMO_eV": df.at[index, "LUMO_eV"],
+                            "gap_eV": df.at[index, "gap_eV"],
+                            "absolute_residual_eV": residuals.at[index],
+                            "tolerance_eV": ORBITAL_GAP_TOLERANCE_EV,
+                        }
+                    )
+                orbital = df.loc[
+                    df[["HOMO_eV", "LUMO_eV"]].notna().any(axis=1),
+                    [identity_column, "HOMO_eV", "LUMO_eV"],
+                ].copy()
+                if not orbital.empty:
+                    orbital["source"] = source
+                    orbital["source_file"] = path.name
+                    properties.setdefault(task_label, []).append(orbital)
+                continue
             for label in label_columns(df):
-                if ion_prefix is not None and label == "gap_eV":
-                    continue
                 keep_columns = [column for column in BASE_COLUMNS if column in df.columns]
                 property_df = df.loc[df[label].notna(), [*keep_columns, label]].copy()
                 if property_df.empty:
                     continue
                 target_label = output_label(source, label)
-                if ion_prefix is not None and label in SINGLE_ION_ORBITAL_LABELS:
-                    target_label = f"{ion_prefix}_{label}"
                 if target_label != label:
                     property_df = property_df.rename(columns={label: target_label})
                 if label == "refractive_index_unitless":
@@ -623,11 +697,17 @@ def collect_bucket(input_root: Path, sources: tuple[str, ...]) -> dict[str, list
                 property_df["source"] = source
                 property_df["source_file"] = path.name
                 properties.setdefault(target_label, []).append(property_df)
-    return properties
+    return properties, orbital_gap_summaries, orbital_gap_anomalies
 
 
 def clean_output_root(output_root: Path) -> None:
-    for subdir in ("experiment", "simulation", "rejected_rows", "same_system_condition_rows"):
+    for subdir in (
+        "experiment",
+        "simulation",
+        "rejected_rows",
+        "same_system_condition_rows",
+        "_audit",
+    ):
         path = output_root / subdir
         if path.exists():
             shutil.rmtree(path)
@@ -655,7 +735,9 @@ def write_bucket(
         if label == "simulated_QM_elec_HF":
             merged, matching_rows = aggregate_qm_elec_hf(rows)
             close_value_exclusions = pd.DataFrame()
-        elif label in set(WIDE_TABLE_FILES.values()):
+        elif label in set(WIDE_TABLE_FILES.values()) | {
+            spec[1] for spec in SINGLE_ION_ORBITAL_FILES.values()
+        }:
             merged, matching_rows = aggregate_wide_table(rows)
             close_value_exclusions = pd.DataFrame()
         else:
@@ -701,10 +783,15 @@ def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     output_root.mkdir(parents=True, exist_ok=True)
     clean_output_root(output_root)
 
-    buckets = {
-        "experiment": collect_bucket(input_root, EXPERIMENT_SOURCES),
-        "simulation": collect_bucket(input_root, SIMULATION_SOURCES),
-    }
+    experiment, experiment_gap_summaries, experiment_gap_anomalies = collect_bucket(
+        input_root,
+        EXPERIMENT_SOURCES,
+    )
+    simulation, simulation_gap_summaries, simulation_gap_anomalies = collect_bucket(
+        input_root,
+        SIMULATION_SOURCES,
+    )
+    buckets = {"experiment": experiment, "simulation": simulation}
     identity_audit = normalize_chemical_identities(buckets)
 
     manifest_rows: list[dict[str, object]] = []
@@ -723,6 +810,16 @@ def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
         output_root / "chemical_identity_equivalences.csv",
         index=False,
     )
+    audit_root = output_root / "_audit"
+    audit_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [*experiment_gap_summaries, *simulation_gap_summaries],
+        columns=ORBITAL_GAP_SUMMARY_COLUMNS,
+    ).to_csv(audit_root / "orbital_gap_consistency_summary.csv", index=False)
+    pd.DataFrame(
+        [*experiment_gap_anomalies, *simulation_gap_anomalies],
+        columns=ORBITAL_GAP_ANOMALY_COLUMNS,
+    ).to_csv(audit_root / "orbital_gap_consistency_anomalies.csv", index=False)
     return manifest_rows
 
 
