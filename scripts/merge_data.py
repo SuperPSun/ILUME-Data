@@ -62,6 +62,17 @@ PROPERTY_LABEL_ALIASES = {
 SOURCE_COLUMNS = {"source", "source_file"}
 MISSING_TOKEN = "__ILUME_MISSING_CONDITION__"
 DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM = 589.0
+DEFAULT_EXPERIMENT_PRESSURE_KPA = 101.325
+EXPERIMENT_DEFAULT_PRESSURE_LABELS = frozenset(
+    {
+        "density_g/cm^3",
+        "electrical_conductivity_S/m_log10",
+        "heat_capacity_J/mol/K",
+        "refractive_index_unitless",
+        "thermal_conductivity_W/m/K",
+        "viscosity_mPa*s_log10",
+    }
+)
 SCALAR_VALUE_ABSOLUTE_TOLERANCE = Decimal("5e-7")
 SOLVATION_REVISION_PAIR_TOLERANCE = Decimal("0.005")
 FLOAT_SIGNIFICANT_DIGITS = 15
@@ -608,6 +619,8 @@ def aggregate_qm_elec_hf(rows: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd.Dat
 def collect_bucket(
     input_root: Path,
     sources: tuple[str, ...],
+    *,
+    default_pressure_labels: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, list[pd.DataFrame]], list[dict[str, object]], list[dict[str, object]]]:
     properties: dict[str, list[pd.DataFrame]] = {}
     orbital_gap_summaries: list[dict[str, object]] = []
@@ -687,6 +700,13 @@ def collect_bucket(
                 target_label = output_label(source, label)
                 if target_label != label:
                     property_df = property_df.rename(columns={label: target_label})
+                if target_label in default_pressure_labels:
+                    if "pressure_kPa" not in property_df.columns:
+                        property_df["pressure_kPa"] = DEFAULT_EXPERIMENT_PRESSURE_KPA
+                    else:
+                        property_df["pressure_kPa"] = property_df["pressure_kPa"].fillna(
+                            DEFAULT_EXPERIMENT_PRESSURE_KPA
+                        )
                 if label == "refractive_index_unitless":
                     if "wavelength_nm" not in property_df.columns:
                         property_df["wavelength_nm"] = DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM
@@ -786,6 +806,7 @@ def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     experiment, experiment_gap_summaries, experiment_gap_anomalies = collect_bucket(
         input_root,
         EXPERIMENT_SOURCES,
+        default_pressure_labels=EXPERIMENT_DEFAULT_PRESSURE_LABELS,
     )
     simulation, simulation_gap_summaries, simulation_gap_anomalies = collect_bucket(
         input_root,
