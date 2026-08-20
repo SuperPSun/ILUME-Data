@@ -3,7 +3,7 @@
 ## Global Summary
 
 - Analyzed properties: 42
-- Total data points across analyzed properties: 1689668
+- Total data points across analyzed properties: 1683144
 - Sum of property-level unique systems: 1439232
 - Properties recommended for system holdout test: 35
 - Properties recommended for grouped CV: 7
@@ -14,8 +14,8 @@
 | bucket | property | data_points | unique_systems | recommended_split |
 | --- | --- | --- | --- | --- |
 | simulation | transfer_organic | 1000000 | 1000000 | system_holdout_test |
-| experiment | density | 94246 | 5966 | system_holdout_test |
-| experiment | viscosity | 44514 | 2586 | system_holdout_test |
+| experiment | density | 100579 | 5966 | system_holdout_test |
+| experiment | viscosity | 39941 | 2586 | system_holdout_test |
 | simulation | charge | 28203 | 28203 | system_holdout_test |
 | simulation | dipole | 27258 | 27258 | system_holdout_test |
 | simulation | q_max | 27258 | 27258 | system_holdout_test |
@@ -39,11 +39,11 @@ These properties should not be split by random rows because repeated systems can
 | experiment | equilibrium_pressure | 95 | 0.9894736842105263 | 151 |
 | experiment | speed_of_sound | 216 | 0.9861111111111112 | 252 |
 | experiment | thermal_conductivity | 93 | 0.978494623655914 | 95 |
-| experiment | heat_capacity | 352 | 0.9573863636363636 | 3096 |
+| experiment | density | 5966 | 0.9446865571572243 | 2509 |
+| experiment | heat_capacity | 352 | 0.875 | 1757 |
 | experiment | surface_tension | 1141 | 0.845749342681858 | 180 |
-| experiment | electrical_conductivity | 703 | 0.8036984352773826 | 319 |
 | experiment | refractive_index | 726 | 0.803030303030303 | 237 |
-| experiment | density | 5966 | 0.7955078779751927 | 2544 |
+| experiment | electrical_conductivity | 703 | 0.7510668563300142 | 304 |
 
 ## System Holdout Test Candidates
 
