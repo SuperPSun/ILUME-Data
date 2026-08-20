@@ -11,6 +11,104 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
+DEFAULT_PRESSURE_PROPERTIES = (
+    ("density_g/cm^3", "density.csv"),
+    ("electrical_conductivity_S/m_log10", "electrical_conductivity.csv"),
+    ("heat_capacity_J/mol/K", "heat_capacity.csv"),
+    ("refractive_index_unitless", "refractive_index.csv"),
+    ("thermal_conductivity_W/m/K", "thermal_conductivity.csv"),
+    ("viscosity_mPa*s_log10", "viscosity.csv"),
+)
+
+
+@pytest.mark.parametrize(("label", "output_name"), DEFAULT_PRESSURE_PROPERTIES)
+@pytest.mark.parametrize("missing_kind", ("column_absent", "cell_missing"))
+def test_experiment_properties_default_missing_pressure(
+    tmp_path: Path,
+    label: str,
+    output_name: str,
+    missing_kind: str,
+):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    row = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+        label: 1.2,
+    }
+    if missing_kind == "cell_missing":
+        row["pressure_kPa"] = None
+    write_csv(input_root / "AIonopedia" / output_name, [row])
+
+    merge_data(input_root, output_root)
+
+    out = pd.read_csv(output_root / "experiment" / output_name)
+    assert out["pressure_kPa"].tolist() == [101.325]
+
+
+def test_default_pressure_merges_with_explicit_standard_pressure_only(tmp_path: Path):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    base = {
+        "cation": "CC[n+]1ccn(C)c1",
+        "anion": "F[B-](F)(F)F",
+        "temperature_K": 298.15,
+        "density_g/cm^3": 1.2,
+    }
+    write_csv(input_root / "AIonopedia" / "density.csv", [base])
+    write_csv(
+        input_root / "ILThermo" / "density.csv",
+        [{**base, "pressure_kPa": 101.325}],
+    )
+    write_csv(
+        input_root / "ILBERT" / "density.csv",
+        [{**base, "pressure_kPa": 100.0}],
+    )
+
+    merge_data(input_root, output_root)
+
+    out = pd.read_csv(output_root / "experiment" / "density.csv")
+    assert out["pressure_kPa"].tolist() == [100.0, 101.325]
+    assert out.loc[out["pressure_kPa"].eq(100.0), "source_list"].item() == "ILBERT"
+    assert (
+        out.loc[out["pressure_kPa"].eq(101.325), "source_list"].item()
+        == "AIonopedia; ILThermo"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "output_name"),
+    (
+        ("density_g/cm^3", "density.csv"),
+        ("heat_capacity_J/mol/K", "heat_capacity.csv"),
+    ),
+)
+def test_simulation_properties_do_not_receive_default_pressure(
+    tmp_path: Path,
+    label: str,
+    output_name: str,
+):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    write_csv(
+        input_root / "simulation" / output_name,
+        [
+            {
+                "cation": "CC[n+]1ccn(C)c1",
+                "anion": "F[B-](F)(F)F",
+                "temperature_K": 298.15,
+                label: 1.2,
+            }
+        ],
+    )
+
+    merge_data(input_root, output_root)
+
+    out = pd.read_csv(output_root / "simulation" / output_name)
+    assert "pressure_kPa" not in out.columns
+
+
 def test_property_slug_uses_stable_filename_rules():
     assert property_slug("density_g/cm^3") == "density"
     assert property_slug("viscosity_mPa*s_log10") == "viscosity"
@@ -157,7 +255,16 @@ def test_experiment_sources_merge_by_property_and_aggregate_identical_records(tm
 
     out = pd.read_csv(output_root / "experiment" / "density.csv")
     assert len(out) == 2
-    assert list(out.columns) == ["cation", "anion", "temperature_K", "phase", "density_g/cm^3", "source_list"]
+    assert list(out.columns) == [
+        "cation",
+        "anion",
+        "temperature_K",
+        "pressure_kPa",
+        "phase",
+        "density_g/cm^3",
+        "source_list",
+    ]
+    assert out["pressure_kPa"].eq(101.325).all()
     aggregated = out[out["density_g/cm^3"] == 1.2].iloc[0]
     assert aggregated["phase"] == "Liquid"
     assert aggregated["source_list"] == "AIonopedia; ILBERT; ILThermo"
@@ -319,6 +426,7 @@ def test_close_value_exclusions_are_saved_for_audit_and_stale_files_are_removed(
         "cation",
         "anion",
         "temperature_K",
+        "pressure_kPa",
         "density_g/cm^3",
         "retained_value",
         "absolute_difference",
@@ -424,6 +532,7 @@ def test_same_system_condition_rows_are_saved_before_value_collapsing(tmp_path: 
         "cation",
         "anion",
         "temperature_K",
+        "pressure_kPa",
         "density_g/cm^3",
         "matching_entry_count",
         "source",
@@ -722,15 +831,15 @@ def test_condition_subset_row_collapses_into_more_complete_record(tmp_path: Path
         "cation": "CC[n+]1ccn(C)c1",
         "anion": "F[B-](F)(F)F",
         "temperature_K": 298.15,
-        "density_g/cm^3": 1.2,
+        "surface_tension_mN/m": 30.0,
     }
     complete = {**partial, "pressure_kPa": 100.0}
-    write_csv(input_root / "AIonopedia" / "AIonopedia_density_structured.csv", [partial])
-    write_csv(input_root / "ILBERT" / "ILBERT_density_structured.csv", [complete])
+    write_csv(input_root / "AIonopedia" / "AIonopedia_surface_tension_structured.csv", [partial])
+    write_csv(input_root / "ILBERT" / "ILBERT_surface_tension_structured.csv", [complete])
 
     merge_data(input_root, output_root)
 
-    out = pd.read_csv(output_root / "experiment" / "density.csv")
+    out = pd.read_csv(output_root / "experiment" / "surface_tension.csv")
     assert len(out) == 1
     assert out.iloc[0]["pressure_kPa"] == 100.0
     assert out.iloc[0]["source_list"] == "AIonopedia; ILBERT"
@@ -775,7 +884,7 @@ def test_ambiguous_condition_subset_candidates_are_preserved(tmp_path: Path):
 
     out = pd.read_csv(output_root / "experiment" / "density.csv")
     assert len(out) == 3
-    assert out["pressure_kPa"].isna().sum() == 1
+    assert set(out["pressure_kPa"]) == {100.0, 101.325, 200.0}
 
 
 def test_complementary_condition_rows_are_preserved(tmp_path: Path):

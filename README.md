@@ -44,6 +44,8 @@ Structured files are written under:
 
 Output columns are ordered as system identifiers first, experimental conditions second, metadata next, and unit-explicit labels last. Condition columns keep stable names such as `temperature_K` and `pressure_kPa`; label columns preserve unit symbols in the unit suffix, for example `density_g/cm^3` and `surface_tension_mN/m`.
 
+When `scripts/merge_data.py` merges experimental density, electrical conductivity, heat capacity, refractive index, thermal conductivity, or viscosity data, a missing `pressure_kPa` is interpreted as the standard-pressure default `101.325` kPa. This default is applied before cross-source condition matching and aggregation, and it never replaces an explicitly reported pressure. Cleaned source data and simulation tasks retain their original pressure fields.
+
 ## Stage1 Pretraining Entities
 
 Rebuild the Stage1 dataset entities from the top-level CSV files under `data/final/experiment/` and `data/final/simulation/`:
