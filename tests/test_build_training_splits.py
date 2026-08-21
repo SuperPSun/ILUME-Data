@@ -2276,6 +2276,92 @@ def _group_partition_signature(
     )
 
 
+def test_stage2_three_way_grouped_partitions_are_balanced_and_deterministic():
+    groups = pd.Series([f"group_{index:03d}" for index in range(100)])
+    first = training_splits.stage2_grouped_partitions(
+        groups,
+        task_id="simulation/task",
+        system_type="molecule",
+        seed=42,
+        has_test=True,
+    )
+    reordered = training_splits.stage2_grouped_partitions(
+        groups.sample(frac=1, random_state=7),
+        task_id="simulation/task",
+        system_type="molecule",
+        seed=42,
+        has_test=True,
+    )
+    changed_seed = training_splits.stage2_grouped_partitions(
+        groups,
+        task_id="simulation/task",
+        system_type="molecule",
+        seed=43,
+        has_test=True,
+    )
+
+    assert first.value_counts().to_dict() == {
+        "train": 80,
+        "validation": 10,
+        "test": 10,
+    }
+    first_by_group = dict(zip(groups, first))
+    reordered_by_group = dict(zip(groups.loc[reordered.index], reordered))
+    assert first_by_group == reordered_by_group
+    assert first.tolist() != changed_seed.tolist()
+
+
+def test_stage2_three_way_grouped_partitions_round_and_reject_empty_splits():
+    groups = pd.Series([f"group_{index:03d}" for index in range(15)])
+    partitions = training_splits.stage2_grouped_partitions(
+        groups,
+        task_id="simulation/task",
+        system_type="molecule",
+        seed=42,
+        has_test=True,
+    )
+    assert partitions.value_counts().to_dict() == {
+        "train": 11,
+        "validation": 2,
+        "test": 2,
+    }
+
+    with pytest.raises(TrainingSplitError, match="80/10/10 split is empty"):
+        training_splits.stage2_grouped_partitions(
+            pd.Series([f"group_{index}" for index in range(4)]),
+            task_id="simulation/task",
+            system_type="molecule",
+            seed=42,
+            has_test=True,
+        )
+
+
+def test_stage2_train_valid_partitions_keep_legacy_hash_assignment():
+    groups = pd.Series([f"group_{index:03d}" for index in range(100)])
+    actual = training_splits.stage2_grouped_partitions(
+        groups,
+        task_id="simulation/task",
+        system_type="molecule",
+        seed=42,
+        has_test=False,
+    )
+    expected = groups.map(
+        lambda group: (
+            "validation"
+            if training_splits.stable_fraction(
+                42,
+                "stage2_validation",
+                "simulation/task",
+                "molecule",
+                group,
+            )
+            < 0.1
+            else "train"
+        )
+    )
+    pd.testing.assert_series_equal(actual, expected)
+
+
 def test_task_group_kfold_is_disjoint_distinct_and_deterministic():
     groups = pd.Series(
         [
@@ -2881,18 +2967,34 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     def stage2_assignments(
         task_name: str,
         columns: list[str],
+        *,
+        has_test: bool = False,
     ) -> dict[tuple[str, ...], str]:
         assignments: dict[tuple[str, ...], str] = {}
         task_root = output_root / "stage2" / task_name
-        for partition, filename in (
+        partition_files = [
             ("train", "train.csv"),
             ("valid", "valid.csv"),
-        ):
+        ]
+        if has_test:
+            partition_files.append(("test", "test.csv"))
+        for partition, filename in partition_files:
             frame = pd.read_csv(task_root / filename)
             for system in frame[columns].itertuples(index=False, name=None):
                 previous = assignments.setdefault(system, partition)
                 assert previous == partition
         return assignments
+
+    stage2_test_tasks = {
+        "heat_of_vaporization",
+        "pbe_tzvp_cation_orbitals",
+        "pbe_tzvp_anion_orbitals",
+        "partial_atomic_charge",
+    }
+    assert {
+        path.parent.name
+        for path in (output_root / "stage2").glob("*/test.csv")
+    } == stage2_test_tasks
 
     density_assignments = stage2_assignments(
         "density",
@@ -2907,12 +3009,25 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         ["cation", "anion"],
     )
     stage2_assignments("simulated_qm_elec_hf", ["SMILES"])
-    stage2_assignments("pbe_tzvp_cation_orbitals", ["cation"])
-    stage2_assignments("pbe_tzvp_anion_orbitals", ["anion"])
-    stage2_assignments("partial_atomic_charge", ["SMILES"])
+    cation_orbital_assignments = stage2_assignments(
+        "pbe_tzvp_cation_orbitals",
+        ["cation"],
+        has_test=True,
+    )
+    anion_orbital_assignments = stage2_assignments(
+        "pbe_tzvp_anion_orbitals",
+        ["anion"],
+        has_test=True,
+    )
+    stage2_assignments(
+        "partial_atomic_charge",
+        ["SMILES"],
+        has_test=True,
+    )
     heat_of_vaporization_assignments = stage2_assignments(
         "heat_of_vaporization",
         ["cation", "anion"],
+        has_test=True,
     )
     transfer_assignments = stage2_assignments(
         "transfer_organic",
@@ -2934,6 +3049,25 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert set(heat_of_vaporization_assignments) == {
         canonical_ion_pair(index) for index in range(1, 101)
     }
+    assert len(cation_orbital_assignments) == stage2.loc[
+        "simulation/pbe_tzvp_cation_orbitals",
+        "unique_systems",
+    ]
+    assert len(anion_orbital_assignments) == stage2.loc[
+        "simulation/pbe_tzvp_anion_orbitals",
+        "unique_systems",
+    ]
+    for task_name in (
+        "pbe_tzvp_cation_orbitals",
+        "pbe_tzvp_anion_orbitals",
+    ):
+        for filename in ("train.csv", "valid.csv", "test.csv"):
+            assert {"HOMO_eV", "LUMO_eV"} <= set(
+                pd.read_csv(
+                    output_root / "stage2" / task_name / filename,
+                    nrows=0,
+                ).columns
+            )
 
     transfer_stage3_root = (
         output_root / "stage3" / "experiment" / "transfer_organic"
@@ -3056,8 +3190,60 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         "materialized_path",
         "label_source",
         "resource_manifest",
+        "partitions",
+        "train_rows",
+        "valid_rows",
+        "test_rows",
+        "train_systems",
+        "valid_systems",
     }
     assert required_catalog_columns <= set(written_catalog.columns)
+    assert written_catalog["catalog_schema_version"].eq(2).all()
+    stage2_written = written_catalog.loc[
+        written_catalog["stage"].eq(2)
+    ].set_index("task_id")
+    for task_id, row in stage2_written.iterrows():
+        task_root = output_root / row["materialized_path"]
+        partition_files = {
+            "train": task_root / "train.csv",
+            "valid": task_root / "valid.csv",
+        }
+        if task_id.removeprefix("simulation/") in stage2_test_tasks:
+            partition_files["test"] = task_root / "test.csv"
+            assert row["partitions"] == "train;valid;test"
+            assert row["test_systems"] == int(
+                row["unique_systems"] * 0.1 + 0.5
+            )
+        else:
+            assert row["partitions"] == "train;valid"
+            assert not (task_root / "test.csv").exists()
+            assert row["test_rows"] == "0"
+            assert row["test_systems"] == 0
+        split_columns = str(row["split_unit"]).split(";")
+        for partition, path in partition_files.items():
+            frame = pd.read_csv(path)
+            assert int(row[f"{partition}_rows"]) == len(frame)
+            assert int(row[f"{partition}_systems"]) == len(
+                frame.loc[:, split_columns].drop_duplicates()
+            )
+        assert row["development_systems"] == (
+            int(row["train_systems"]) + int(row["valid_systems"])
+        )
+        assert row["rows"] == sum(
+            int(row[f"{partition}_rows"])
+            for partition in ("train", "valid", "test")
+        )
+    stage3_written = written_catalog.loc[written_catalog["stage"].eq(3)]
+    assert stage3_written[
+        [
+            "partitions",
+            "train_rows",
+            "valid_rows",
+            "test_rows",
+            "train_systems",
+            "valid_systems",
+        ]
+    ].eq("").all().all()
     partial_catalog = stage2.loc["simulation/partial_atomic_charge"]
     assert partial_catalog["target_columns"] == "partial_atomic_charge"
     assert partial_catalog["task_kind"] == "atom_property"
@@ -3072,7 +3258,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     partial_rows = pd.concat(
         [
             pd.read_csv(output_root / "stage2" / "partial_atomic_charge" / name)
-            for name in ("train.csv", "valid.csv")
+            for name in ("train.csv", "valid.csv", "test.csv")
         ],
         ignore_index=True,
     )
@@ -3086,7 +3272,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert len(partial_rows) == 101
     assert partial_rows["mol_id"].nunique() == 101
     partitions = {}
-    for partition in ("train", "valid"):
+    for partition in ("train", "valid", "test"):
         for mol_id in pd.read_csv(
             output_root / "stage2" / "partial_atomic_charge" / f"{partition}.csv"
         )["mol_id"]:
@@ -3147,6 +3333,11 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         density_root / "IL" / "fold1.csv",
         small_root / "random" / "cv3" / "fold4.csv",
     ]
+    checksummed_paths.extend(
+        output_root / "stage2" / task_name / filename
+        for task_name in sorted(stage2_test_tasks)
+        for filename in ("train.csv", "valid.csv", "test.csv")
+    )
     first_run = {path: path.read_bytes() for path in checksummed_paths}
     build_training_splits(final_root, output_root, seed=42)
     assert first_run == {path: path.read_bytes() for path in checksummed_paths}
