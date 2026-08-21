@@ -155,7 +155,7 @@ QM_TARGET_COLUMNS = (
     "q_pos_frac",
     "gap_eV",
 )
-CATALOG_SCHEMA_VERSION = 1
+CATALOG_SCHEMA_VERSION = 2
 PARTIAL_CHARGE_SOURCE_RESOURCE_DIR = "simulation/charge_20260514"
 PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST = (
     "simulation/charge_20260514/structure_manifest.csv"
@@ -179,6 +179,7 @@ SIMULATION_TASK_REGISTRY = {
         "system_type": "cation",
         "target_columns": ("HOMO_eV", "LUMO_eV"),
         "simulation_method": "PBE/TZVP",
+        "has_test": True,
     },
     "simulation/pbe_tzvp_anion_orbitals.csv": {
         "task_id": "simulation/pbe_tzvp_anion_orbitals",
@@ -186,6 +187,7 @@ SIMULATION_TASK_REGISTRY = {
         "system_type": "anion",
         "target_columns": ("HOMO_eV", "LUMO_eV"),
         "simulation_method": "PBE/TZVP",
+        "has_test": True,
     },
     "simulation/charge.csv": {
         "task_id": "simulation/partial_atomic_charge",
@@ -198,6 +200,7 @@ SIMULATION_TASK_REGISTRY = {
         "label_source": "structure_resource",
         "source_resource_manifest": PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST,
         "resource_manifest": PARTIAL_CHARGE_MATERIALIZED_RESOURCE_MANIFEST,
+        "has_test": True,
     },
     "simulation/simulated_qm_elec_hf.csv": {
         "task_id": "simulation/simulated_qm_elec_hf",
@@ -229,6 +232,7 @@ SIMULATION_TASK_REGISTRY = {
         "identity_columns": ("cation", "anion"),
         "system_type": "il",
         "target_columns": ("heat_of_vaporization_kJ/mol",),
+        "has_test": True,
     },
     "simulation/transfer_organic.csv": {
         "task_id": "simulation/transfer_organic",
@@ -319,6 +323,7 @@ class TaskSpec:
     label_source: str = "materialized_csv"
     source_resource_manifest: str = ""
     resource_manifest: str = ""
+    has_test: bool = False
 
 
 @dataclass(frozen=True)
@@ -360,6 +365,59 @@ def stable_id(namespace: str, *parts: object) -> str:
 def stable_fraction(seed: int, namespace: str, *parts: object) -> float:
     digest = stable_id(f"seed:{seed}:{namespace}", *parts)
     return int(digest[:16], 16) / float(2**64)
+
+
+def stage2_grouped_partitions(
+    system_ids: pd.Series,
+    *,
+    task_id: str,
+    system_type: str,
+    seed: int,
+    has_test: bool,
+) -> pd.Series:
+    """Assign each Stage-2 system to one task-local partition."""
+    if not has_test:
+        return system_ids.map(
+            lambda system_id_value: (
+                "validation"
+                if stable_fraction(
+                    seed,
+                    "stage2_validation",
+                    task_id,
+                    system_type,
+                    system_id_value,
+                )
+                < 0.1
+                else "train"
+            )
+        )
+
+    unique_systems = sorted({str(value) for value in system_ids})
+    holdout_systems = math.floor(len(unique_systems) * 0.1 + 0.5)
+    train_systems = len(unique_systems) - 2 * holdout_systems
+    if holdout_systems < 1 or train_systems < 1:
+        raise TrainingSplitError(
+            f"Stage-2 80/10/10 split is empty for {task_id}: "
+            f"{len(unique_systems)} systems"
+        )
+
+    derived_seed = int(
+        stable_id(f"seed:{seed}:stage2_three_way", task_id)[:16],
+        16,
+    )
+    shuffled = np.array(unique_systems, dtype=object)
+    np.random.default_rng(derived_seed).shuffle(shuffled)
+    assignments = {
+        system_id: (
+            "test"
+            if index < holdout_systems
+            else "validation"
+            if index < 2 * holdout_systems
+            else "train"
+        )
+        for index, system_id in enumerate(shuffled)
+    }
+    return system_ids.map(lambda value: assignments[str(value)])
 
 
 def balanced_unit_folds(
@@ -4723,6 +4781,7 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
                         definition.get("source_resource_manifest", "")
                     ),
                     resource_manifest=str(definition.get("resource_manifest", "")),
+                    has_test=bool(definition.get("has_test", False)),
                 )
             )
             continue
@@ -5453,21 +5512,17 @@ def build_training_splits(
                 )
                 stage2_overlap_audits.append(overlap_audit)
             profile = _profile_task(frame, raw_rows)
-            partitions = frame["_system_id"].map(
-                lambda system_id_value: (
-                    "validation"
-                    if stable_fraction(
-                        seed,
-                        "stage2_validation",
-                        task.task_id,
-                        task.system_type,
-                        system_id_value,
-                    )
-                    < 0.1
-                    else "train"
-                )
+            partitions = stage2_grouped_partitions(
+                frame["_system_id"],
+                task_id=task.task_id,
+                system_type=task.system_type,
+                seed=seed,
+                has_test=task.has_test,
             )
-            if not {"train", "validation"}.issubset(set(partitions)):
+            required_partitions = {"train", "validation"}
+            if task.has_test:
+                required_partitions.add("test")
+            if not required_partitions.issubset(set(partitions)):
                 raise TrainingSplitError(
                     f"Stage-2 split is empty for {task.task_id}: "
                     f"{sorted(set(partitions))}"
@@ -5501,11 +5556,30 @@ def build_training_splits(
                     partitions.eq("validation").to_numpy()
                 ].reset_index(drop=True),
             )
+            if task.has_test:
+                write_dataframe(
+                    task_root / "test.csv",
+                    materialized.loc[
+                        partitions.eq("test").to_numpy()
+                    ].reset_index(drop=True),
+                )
             if task.source_file == "simulation/charge.csv":
                 shutil.copytree(
                     final_root / PARTIAL_CHARGE_SOURCE_RESOURCE_DIR,
                     task_root / Path(PARTIAL_CHARGE_SOURCE_RESOURCE_DIR).name,
                 )
+            train_mask = partitions.eq("train")
+            valid_mask = partitions.eq("validation")
+            test_mask = partitions.eq("test")
+            train_systems = int(
+                frame.loc[train_mask, "_system_id"].nunique()
+            )
+            valid_systems = int(
+                frame.loc[valid_mask, "_system_id"].nunique()
+            )
+            test_systems = int(
+                frame.loc[test_mask, "_system_id"].nunique()
+            )
             task_catalog_rows.append(
                 {
                     "catalog_schema_version": CATALOG_SCHEMA_VERSION,
@@ -5529,9 +5603,19 @@ def build_training_splits(
                     "rows": profile.rows,
                     "unique_systems": profile.system_count,
                     "tier": "physics_guided",
-                    "test_systems": 0,
+                    "partitions": (
+                        "train;valid;test"
+                        if task.has_test
+                        else "train;valid"
+                    ),
+                    "train_rows": str(int(train_mask.sum())),
+                    "valid_rows": str(int(valid_mask.sum())),
+                    "test_rows": str(int(test_mask.sum())),
+                    "train_systems": str(train_systems),
+                    "valid_systems": str(valid_systems),
+                    "test_systems": test_systems,
                     "reserved_systems": 0,
-                    "development_systems": profile.system_count,
+                    "development_systems": train_systems + valid_systems,
                     "strategies": "system_holdout",
                     "repeats": 1,
                     "strategy_units": json.dumps(
@@ -5711,6 +5795,12 @@ def build_training_splits(
                     "rows": profile.rows,
                     "unique_systems": profile.system_count,
                     "tier": profile.tier,
+                    "partitions": "",
+                    "train_rows": "",
+                    "valid_rows": "",
+                    "test_rows": "",
+                    "train_systems": "",
+                    "valid_systems": "",
                     "test_systems": test_systems,
                     "reserved_systems": reserved_systems,
                     "development_systems": development_systems,
