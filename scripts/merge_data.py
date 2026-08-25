@@ -17,7 +17,12 @@ EXPERIMENT_SOURCES = ("AIonopedia", "ILBERT", "ILThermo", "after_AIonopedia")
 SIMULATION_SOURCES = ("simulation",)
 IDENTIFIER_COLUMNS = ("mol_id", "cation", "anion", "solute", "solvent", "smiles", "SMILES")
 CONDITION_COLUMNS = ("temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
-METADATA_COLUMNS = ("standard_state_note",)
+ORBITAL_AUDIT_COLUMNS = (
+    "ion_role",
+    "provenance_source_file",
+    "provenance_source_row",
+)
+METADATA_COLUMNS = ("standard_state_note", *ORBITAL_AUDIT_COLUMNS)
 BASE_COLUMNS = (*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS, *METADATA_COLUMNS)
 NON_LABEL_COLUMNS = set(BASE_COLUMNS)
 ERROR_LABEL_PATTERNS = ("_err", "_error", "stddev", "stderr")
@@ -26,15 +31,10 @@ WIDE_TABLE_FILES = {
     "simulated_QM_elec_HF_structured.csv": "simulated_QM_elec_HF",
 }
 SINGLE_ION_ORBITAL_FILES = {
-    "simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv": (
-        "anion",
-        "pbe_tzvp_anion_orbitals",
-    ),
-    "simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv": (
-        "cation",
-        "pbe_tzvp_cation_orbitals",
-    ),
+    "simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv": ("anion", "anion"),
+    "simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv": ("cation", "cation"),
 }
+ORBITAL_OUTPUTS = {"HOMO_eV": "homo", "LUMO_eV": "lumo"}
 ORBITAL_GAP_TOLERANCE_EV = 1.0e-8
 ORBITAL_GAP_SUMMARY_COLUMNS = (
     "source_file",
@@ -644,7 +644,7 @@ def collect_bucket(
                 continue
             orbital_spec = SINGLE_ION_ORBITAL_FILES.get(path.name)
             if orbital_spec is not None:
-                identity_column, task_label = orbital_spec
+                identity_column, ion_role = orbital_spec
                 required = {identity_column, "HOMO_eV", "LUMO_eV", "gap_eV"}
                 missing = required - set(df.columns)
                 if missing:
@@ -683,11 +683,22 @@ def collect_bucket(
                             "tolerance_eV": ORBITAL_GAP_TOLERANCE_EV,
                         }
                     )
-                orbital = df.loc[
-                    df[["HOMO_eV", "LUMO_eV"]].notna().any(axis=1),
-                    [identity_column, "HOMO_eV", "LUMO_eV"],
-                ].copy()
-                if not orbital.empty:
+                provenance_rows = pd.Series(
+                    range(2, len(df) + 2), index=df.index, dtype="int64"
+                )
+                for target, task_label in ORBITAL_OUTPUTS.items():
+                    orbital = df.loc[
+                        df[target].notna(), [identity_column, target]
+                    ].rename(columns={identity_column: "SMILES"})
+                    if orbital.empty:
+                        continue
+                    orbital["ion_role"] = ion_role
+                    orbital["provenance_source_file"] = (
+                        f"{source}/{path.name}"
+                    )
+                    orbital["provenance_source_row"] = provenance_rows.loc[
+                        orbital.index
+                    ]
                     orbital["source"] = source
                     orbital["source_file"] = path.name
                     properties.setdefault(task_label, []).append(orbital)
@@ -755,9 +766,9 @@ def write_bucket(
         if label == "simulated_QM_elec_HF":
             merged, matching_rows = aggregate_qm_elec_hf(rows)
             close_value_exclusions = pd.DataFrame()
-        elif label in set(WIDE_TABLE_FILES.values()) | {
-            spec[1] for spec in SINGLE_ION_ORBITAL_FILES.values()
-        }:
+        elif label in set(WIDE_TABLE_FILES.values()) | set(
+            ORBITAL_OUTPUTS.values()
+        ):
             merged, matching_rows = aggregate_wide_table(rows)
             close_value_exclusions = pd.DataFrame()
         else:

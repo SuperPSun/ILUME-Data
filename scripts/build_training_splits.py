@@ -75,7 +75,12 @@ CONDITION_COLUMN_ORDER = (
     "phase",
 )
 CONDITION_COLUMNS = set(CONDITION_COLUMN_ORDER)
-METADATA_COLUMNS = {"source_list", "mol_id"}
+ORBITAL_AUDIT_COLUMNS = (
+    "ion_role",
+    "provenance_source_file",
+    "provenance_source_row",
+)
+METADATA_COLUMNS = {"source_list", "mol_id", *ORBITAL_AUDIT_COLUMNS}
 PRETRAIN_ENTITY_COLUMNS = [
     "SMILES",
     "formal_charge",
@@ -172,20 +177,40 @@ PARTIAL_CHARGE_RESOURCE_AUDIT_COLUMNS = (
     "SMILES",
     "reason",
 )
+ORBITAL_TASK_IDS = ("simulation/homo", "simulation/lumo")
+LEGACY_ORBITAL_TASK_BY_ROLE = {
+    "cation": "simulation/pbe_tzvp_cation_orbitals",
+    "anion": "simulation/pbe_tzvp_anion_orbitals",
+}
+ORBITAL_SOURCE_FILE_BY_ROLE = {
+    "cation": (
+        "simulation/simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv"
+    ),
+    "anion": (
+        "simulation/simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv"
+    ),
+}
+ORBITAL_SPLIT_AUDIT_COLUMNS = (
+    "ion_role",
+    "SMILES",
+    "legacy_task_id",
+    "partition",
+)
+
 SIMULATION_TASK_REGISTRY = {
-    "simulation/pbe_tzvp_cation_orbitals.csv": {
-        "task_id": "simulation/pbe_tzvp_cation_orbitals",
-        "identity_columns": ("cation",),
-        "system_type": "cation",
-        "target_columns": ("HOMO_eV", "LUMO_eV"),
+    "simulation/homo.csv": {
+        "task_id": "simulation/homo",
+        "identity_columns": ("SMILES",),
+        "system_type": "molecule",
+        "target_columns": ("HOMO_eV",),
         "simulation_method": "PBE/TZVP",
         "has_test": True,
     },
-    "simulation/pbe_tzvp_anion_orbitals.csv": {
-        "task_id": "simulation/pbe_tzvp_anion_orbitals",
-        "identity_columns": ("anion",),
-        "system_type": "anion",
-        "target_columns": ("HOMO_eV", "LUMO_eV"),
+    "simulation/lumo.csv": {
+        "task_id": "simulation/lumo",
+        "identity_columns": ("SMILES",),
+        "system_type": "molecule",
+        "target_columns": ("LUMO_eV",),
         "simulation_method": "PBE/TZVP",
         "has_test": True,
     },
@@ -418,6 +443,68 @@ def stage2_grouped_partitions(
         for index, system_id in enumerate(shuffled)
     }
     return system_ids.map(lambda value: assignments[str(value)])
+
+
+def inherited_orbital_partitions(
+    frames: Mapping[str, pd.DataFrame], *, seed: int
+) -> tuple[dict[str, pd.Series], pd.DataFrame]:
+    """Reproduce the legacy role-task split, then share it across HOMO/LUMO."""
+    if set(frames) != set(ORBITAL_TASK_IDS):
+        raise TrainingSplitError("Orbital split inheritance requires HOMO and LUMO")
+    systems = (
+        pd.concat(
+            [frame.loc[:, ["ion_role", "SMILES"]] for frame in frames.values()],
+            ignore_index=True,
+        )
+        .drop_duplicates()
+        .sort_values(["ion_role", "SMILES"], kind="stable")
+        .reset_index(drop=True)
+    )
+    assignments: dict[tuple[str, str], str] = {}
+    audit_rows: list[dict[str, str]] = []
+    for role, role_systems in systems.groupby("ion_role", sort=True):
+        role_text = str(role)
+        legacy_task = LEGACY_ORBITAL_TASK_BY_ROLE[role_text]
+        legacy_ids = role_systems["SMILES"].map(
+            lambda smiles: group_id(role_text, (str(smiles),))
+        )
+        partitions = stage2_grouped_partitions(
+            legacy_ids,
+            task_id=legacy_task,
+            system_type=role_text,
+            seed=seed,
+            has_test=True,
+        )
+        for smiles, partition in zip(
+            role_systems["SMILES"], partitions, strict=True
+        ):
+            key = (role_text, str(smiles))
+            assignments[key] = str(partition)
+            audit_rows.append(
+                {
+                    "ion_role": role_text,
+                    "SMILES": str(smiles),
+                    "legacy_task_id": legacy_task,
+                    "partition": (
+                        "valid" if partition == "validation" else str(partition)
+                    ),
+                }
+            )
+    task_partitions = {
+        task_id: pd.Series(
+            [
+                assignments[(str(role), str(smiles))]
+                for role, smiles in frame.loc[
+                    :, ["ion_role", "SMILES"]
+                ].itertuples(index=False, name=None)
+            ],
+            index=frame.index,
+            dtype="object",
+        )
+        for task_id, frame in frames.items()
+    }
+    audit = pd.DataFrame(audit_rows, columns=ORBITAL_SPLIT_AUDIT_COLUMNS)
+    return task_partitions, audit
 
 
 def balanced_unit_folds(
@@ -4730,6 +4817,20 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
                     f"Missing identity columns in {relative}: {sorted(missing_identity)}"
                 )
             logical_targets = tuple(definition["target_columns"])
+            task_id = str(definition["task_id"])
+            audit_columns = set(ORBITAL_AUDIT_COLUMNS) & set(columns)
+            if task_id in ORBITAL_TASK_IDS:
+                missing_audit = set(ORBITAL_AUDIT_COLUMNS) - set(columns)
+                if missing_audit:
+                    raise TrainingSplitError(
+                        f"Missing orbital audit columns in {relative}: "
+                        f"{sorted(missing_audit)}"
+                    )
+            elif audit_columns:
+                raise TrainingSplitError(
+                    f"Orbital audit columns are not allowed in {relative}: "
+                    f"{sorted(audit_columns)}"
+                )
             observed_targets = {
                 column
                 for column in columns
@@ -4755,7 +4856,7 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
             system_type = str(definition["system_type"])
             tasks.append(
                 TaskSpec(
-                    task_id=str(definition["task_id"]),
+                    task_id=task_id,
                     stage=2,
                     source_file=relative,
                     target_columns=logical_targets,
@@ -4939,6 +5040,42 @@ def prepare_task_frame(
             column=column,
         )
 
+    if task.task_id in ORBITAL_TASK_IDS:
+        roles = frame["ion_role"].astype(str)
+        invalid_roles = sorted(set(roles) - set(LEGACY_ORBITAL_TASK_BY_ROLE))
+        if invalid_roles:
+            raise TrainingSplitError(
+                f"Invalid ion_role values in {task.source_file}: {invalid_roles}"
+            )
+        expected_sources = roles.map(ORBITAL_SOURCE_FILE_BY_ROLE)
+        actual_sources = frame["provenance_source_file"].astype(str)
+        if not actual_sources.eq(expected_sources).all():
+            raise TrainingSplitError(
+                f"Orbital provenance source/role mismatch in {task.source_file}"
+            )
+        provenance_rows = pd.to_numeric(
+            frame["provenance_source_row"], errors="coerce"
+        )
+        if (
+            provenance_rows.isna().any()
+            or provenance_rows.lt(2).any()
+            or provenance_rows.mod(1).ne(0).any()
+        ):
+            raise TrainingSplitError(
+                f"Invalid orbital provenance_source_row in {task.source_file}"
+            )
+        frame["provenance_source_row"] = provenance_rows.astype("int64")
+        def inferred_role(smiles: object) -> str:
+            molecule = Chem.MolFromSmiles(str(smiles))
+            assert molecule is not None
+            charge = sum(atom.GetFormalCharge() for atom in molecule.GetAtoms())
+            return "cation" if charge > 0 else "anion" if charge < 0 else "neutral"
+
+        inferred_roles = frame["SMILES"].map(inferred_role)
+        if not roles.eq(inferred_roles).all():
+            raise TrainingSplitError(
+                f"Orbital ion_role/formal-charge mismatch in {task.source_file}"
+            )
     if task.source_file == "simulation/charge.csv":
         frame = _prepare_partial_atomic_charge(frame, task.source_file)
 
@@ -5476,6 +5613,23 @@ def build_training_splits(
     partial_charge_resource_audit = pd.DataFrame(
         columns=PARTIAL_CHARGE_RESOURCE_AUDIT_COLUMNS
     )
+    orbital_tasks = {
+        task.task_id: task
+        for task in stage2_tasks
+        if task.task_id in ORBITAL_TASK_IDS
+    }
+    orbital_frames = {
+        task_id: prepare_task_frame(
+            final_root,
+            task,
+            checksums[task.source_file],
+        )[0]
+        for task_id, task in orbital_tasks.items()
+    }
+    orbital_partitions, orbital_split_audit = inherited_orbital_partitions(
+        orbital_frames,
+        seed=seed,
+    )
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
         staged_root = Path(temporary_dir) / "training_splits"
         stage2_root = staged_root / "stage2"
@@ -5486,11 +5640,15 @@ def build_training_splits(
         audit_root.mkdir()
 
         for task in stage2_tasks:
-            frame, raw_rows = prepare_task_frame(
-                final_root,
-                task,
-                checksums[task.source_file],
-            )
+            if task.task_id in orbital_frames:
+                frame = orbital_frames[task.task_id]
+                raw_rows = len(frame)
+            else:
+                frame, raw_rows = prepare_task_frame(
+                    final_root,
+                    task,
+                    checksums[task.source_file],
+                )
             if task.source_file == "simulation/charge.csv":
                 frame, partial_charge_resource_audit = (
                     exclude_missing_partial_charge_resources(
@@ -5512,12 +5670,16 @@ def build_training_splits(
                 )
                 stage2_overlap_audits.append(overlap_audit)
             profile = _profile_task(frame, raw_rows)
-            partitions = stage2_grouped_partitions(
-                frame["_system_id"],
-                task_id=task.task_id,
-                system_type=task.system_type,
-                seed=seed,
-                has_test=task.has_test,
+            partitions = (
+                orbital_partitions[task.task_id]
+                if task.task_id in orbital_partitions
+                else stage2_grouped_partitions(
+                    frame["_system_id"],
+                    task_id=task.task_id,
+                    system_type=task.system_type,
+                    seed=seed,
+                    has_test=task.has_test,
+                )
             )
             required_partitions = {"train", "validation"}
             if task.has_test:
@@ -5616,10 +5778,22 @@ def build_training_splits(
                     "test_systems": test_systems,
                     "reserved_systems": 0,
                     "development_systems": train_systems + valid_systems,
-                    "strategies": "system_holdout",
+                    "strategies": (
+                        "inherited_system_holdout"
+                        if task.task_id in ORBITAL_TASK_IDS
+                        else "system_holdout"
+                    ),
                     "repeats": 1,
                     "strategy_units": json.dumps(
-                        {"system_holdout": "system_id"},
+                        (
+                            {
+                                "inherited_system_holdout": (
+                                    "legacy_role_task_system_id"
+                                )
+                            }
+                            if task.task_id in ORBITAL_TASK_IDS
+                            else {"system_holdout": "system_id"}
+                        ),
                         sort_keys=True,
                         separators=(",", ":"),
                     ),
@@ -5835,6 +6009,10 @@ def build_training_splits(
         write_dataframe(
             audit_root / "partial_atomic_charge_resource_exclusions.csv",
             partial_charge_resource_audit.reset_index(drop=True),
+        )
+        write_dataframe(
+            audit_root / "stage2_orbital_split_inheritance.csv",
+            orbital_split_audit.reset_index(drop=True),
         )
         task_catalog = pd.DataFrame(task_catalog_rows).sort_values(
             ["stage", "task_id"],
