@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-08-17
 
+> The role-oriented multi-target orbital and split clauses are superseded by [ADR 0004](0004-stage2-homo-lumo-scalar-tasks.md). The remaining producer contract stays in force.
+
 ## Context
 
 The split pipeline previously routed only five whitelisted simulation files to Stage2. Other simulation outputs, including single-ion orbitals, total-charge metadata, and heat of vaporization, fell through to the experiment-oriented Stage3 workflow. HOMO and LUMO were also split into independent tasks, and `charge.csv` was treated as a scalar total-charge label even though its associated MOL2 resources contain the intended atom-level supervision.

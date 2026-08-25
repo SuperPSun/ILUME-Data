@@ -662,7 +662,9 @@ def test_simulation_stays_separate_from_experiment_for_same_property(tmp_path: P
     assert not (output_root / "simulation" / "density_err.csv").exists()
 
 
-def test_single_ion_orbitals_are_wide_and_gap_is_audited(tmp_path: Path):
+def test_single_ion_orbitals_become_pooled_scalar_tasks_with_provenance(
+    tmp_path: Path,
+):
     input_root = tmp_path / "cleaned"
     output_root = tmp_path / "merged"
     write_csv(
@@ -696,28 +698,43 @@ def test_single_ion_orbitals_are_wide_and_gap_is_audited(tmp_path: Path):
     merge_data(input_root, output_root)
 
     simulation_root = output_root / "simulation"
-    anion = pd.read_csv(simulation_root / "pbe_tzvp_anion_orbitals.csv")
-    cation = pd.read_csv(simulation_root / "pbe_tzvp_cation_orbitals.csv")
-    assert list(anion.columns) == ["anion", "HOMO_eV", "LUMO_eV", "source_list"]
-    assert list(cation.columns) == ["cation", "HOMO_eV", "LUMO_eV", "source_list"]
-    assert anion.loc[0, ["HOMO_eV", "LUMO_eV"]].tolist() == [-1.0, 2.0]
-    assert cation.loc[0, ["HOMO_eV", "LUMO_eV"]].tolist() == [-9.0, -4.0]
-    assert not (simulation_root / "homo.csv").exists()
-    assert not (simulation_root / "lumo.csv").exists()
+    homo = pd.read_csv(simulation_root / "homo.csv")
+    lumo = pd.read_csv(simulation_root / "lumo.csv")
+    audit_columns = [
+        "SMILES",
+        "ion_role",
+        "provenance_source_file",
+        "provenance_source_row",
+    ]
+    assert list(homo.columns) == [*audit_columns, "HOMO_eV", "source_list"]
+    assert list(lumo.columns) == [*audit_columns, "LUMO_eV", "source_list"]
+    assert homo.groupby("ion_role")["HOMO_eV"].first().to_dict() == {
+        "anion": -1.0,
+        "cation": -9.0,
+    }
+    assert lumo.groupby("ion_role")["LUMO_eV"].first().to_dict() == {
+        "anion": 2.0,
+        "cation": -4.0,
+    }
+    assert set(homo["provenance_source_row"]) == {2}
+    assert set(homo["provenance_source_file"]) == {
+        "simulation/simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv",
+        "simulation/simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv",
+    }
+    assert not (simulation_root / "pbe_tzvp_anion_orbitals.csv").exists()
+    assert not (simulation_root / "pbe_tzvp_cation_orbitals.csv").exists()
     assert not (simulation_root / "gap.csv").exists()
     assert not (simulation_root / "anion_homo.csv").exists()
     assert not (simulation_root / "cation_lumo.csv").exists()
 
     manifest = pd.read_csv(output_root / "merged_manifest.csv")
-    orbital_rows = manifest[manifest["property_label"].isin(
-        {"pbe_tzvp_anion_orbitals", "pbe_tzvp_cation_orbitals"}
-    )]
+    orbital_rows = manifest[manifest["property_label"].isin({"homo", "lumo"})]
     assert dict(zip(orbital_rows["property_label"], orbital_rows["output_file"])) == {
-        "pbe_tzvp_anion_orbitals": "simulation/pbe_tzvp_anion_orbitals.csv",
-        "pbe_tzvp_cation_orbitals": "simulation/pbe_tzvp_cation_orbitals.csv",
+        "homo": "simulation/homo.csv",
+        "lumo": "simulation/lumo.csv",
     }
-    assert set(orbital_rows["input_rows"]) == {1}
-    assert set(orbital_rows["output_rows"]) == {1}
+    assert set(orbital_rows["input_rows"]) == {2}
+    assert set(orbital_rows["output_rows"]) == {2}
     summary = pd.read_csv(output_root / "_audit" / "orbital_gap_consistency_summary.csv")
     assert summary["checked_rows"].tolist() == [1, 1]
     assert summary["exceeded_rows"].tolist() == [0, 1]

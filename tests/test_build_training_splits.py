@@ -169,30 +169,37 @@ def write_stage2_files(final_root: Path, count: int = 100) -> None:
             }
         ],
     )
-    write_csv(
-        final_root / "simulation" / "pbe_tzvp_cation_orbitals.csv",
-        [
-            {
-                "cation": cation,
-                "HOMO_eV": -float(index + 2),
-                "LUMO_eV": -float(index),
-                "source_list": "simulation",
-            }
-            for index, (cation, _anion) in enumerate(pairs)
-        ],
-    )
-    write_csv(
-        final_root / "simulation" / "pbe_tzvp_anion_orbitals.csv",
-        [
-            {
-                "anion": anion,
-                "HOMO_eV": -float(index + 2),
-                "LUMO_eV": -float(index),
-                "source_list": "simulation",
-            }
-            for index, (_cation, anion) in enumerate(pairs)
-        ],
-    )
+    orbital_rows = [
+        {
+            "SMILES": smiles,
+            "ion_role": role,
+            "provenance_source_file": (
+                "simulation/simulated_HOMO+LUMO_PBE_TZVP_"
+                f"{role}s_structured.csv"
+            ),
+            "provenance_source_row": index + 2,
+            "HOMO_eV": -float(index + 2),
+            "LUMO_eV": -float(index),
+            "source_list": "simulation",
+        }
+        for role, values in (("cation", pairs), ("anion", pairs))
+        for index, smiles in enumerate(
+            pair[0] if role == "cation" else pair[1]
+            for pair in values
+        )
+    ]
+    for filename, target in (("homo.csv", "HOMO_eV"), ("lumo.csv", "LUMO_eV")):
+        write_csv(
+            final_root / "simulation" / filename,
+            [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key not in {"HOMO_eV", "LUMO_eV"} or key == target
+                }
+                for row in orbital_rows
+            ],
+        )
     charge_rows = [
         {
             "mol_id": f"mol_{index:07d}",
@@ -2562,6 +2569,47 @@ def test_partial_charge_missing_structure_is_excluded_and_audited(tmp_path: Path
     ]
 
 
+def test_orbital_audit_must_match_formal_charge_and_source_role(
+    tmp_path: Path,
+) -> None:
+    final_root = tmp_path / "final"
+    path = final_root / "simulation" / "homo.csv"
+    row = {
+        "SMILES": "[Na+]",
+        "ion_role": "cation",
+        "provenance_source_file": (
+            "simulation/simulated_HOMO+LUMO_PBE_TZVP_cations_structured.csv"
+        ),
+        "provenance_source_row": 2,
+        "HOMO_eV": -5.0,
+        "source_list": "simulation",
+    }
+    write_csv(path, [row])
+    task = TaskSpec(
+        "simulation/homo",
+        2,
+        "simulation/homo.csv",
+        ("HOMO_eV",),
+        ("SMILES",),
+        "molecule",
+    )
+    prepared, _ = prepare_task_frame(final_root, task, "checksum")
+    assert prepared["ion_role"].tolist() == ["cation"]
+
+    row["ion_role"] = "anion"
+    row["provenance_source_file"] = (
+        "simulation/simulated_HOMO+LUMO_PBE_TZVP_anions_structured.csv"
+    )
+    write_csv(path, [row])
+    with pytest.raises(TrainingSplitError, match="formal-charge mismatch"):
+        prepare_task_frame(final_root, task, "checksum")
+
+    row["ion_role"] = "cation"
+    write_csv(path, [row])
+    with pytest.raises(TrainingSplitError, match="source/role mismatch"):
+        prepare_task_frame(final_root, task, "checksum")
+
+
 def _system_rows(
     rows: list[tuple[str, str, int]],
 ) -> pd.DataFrame:
@@ -2775,8 +2823,8 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert set(
         catalog.loc[catalog["stage"].eq(2), "task_id"]
     ) == {
-        "simulation/pbe_tzvp_cation_orbitals",
-        "simulation/pbe_tzvp_anion_orbitals",
+        "simulation/homo",
+        "simulation/lumo",
         "simulation/partial_atomic_charge",
         "simulation/density",
         "simulation/heat_capacity",
@@ -2987,8 +3035,8 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
 
     stage2_test_tasks = {
         "heat_of_vaporization",
-        "pbe_tzvp_cation_orbitals",
-        "pbe_tzvp_anion_orbitals",
+        "homo",
+        "lumo",
         "partial_atomic_charge",
     }
     assert {
@@ -3009,14 +3057,14 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         ["cation", "anion"],
     )
     stage2_assignments("simulated_qm_elec_hf", ["SMILES"])
-    cation_orbital_assignments = stage2_assignments(
-        "pbe_tzvp_cation_orbitals",
-        ["cation"],
+    homo_assignments = stage2_assignments(
+        "homo",
+        ["ion_role", "SMILES"],
         has_test=True,
     )
-    anion_orbital_assignments = stage2_assignments(
-        "pbe_tzvp_anion_orbitals",
-        ["anion"],
+    lumo_assignments = stage2_assignments(
+        "lumo",
+        ["ion_role", "SMILES"],
         has_test=True,
     )
     stage2_assignments(
@@ -3049,25 +3097,66 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert set(heat_of_vaporization_assignments) == {
         canonical_ion_pair(index) for index in range(1, 101)
     }
-    assert len(cation_orbital_assignments) == stage2.loc[
-        "simulation/pbe_tzvp_cation_orbitals",
-        "unique_systems",
+    assert homo_assignments == lumo_assignments
+    assert len(homo_assignments) == stage2.loc[
+        "simulation/homo", "unique_systems"
     ]
-    assert len(anion_orbital_assignments) == stage2.loc[
-        "simulation/pbe_tzvp_anion_orbitals",
-        "unique_systems",
-    ]
-    for task_name in (
-        "pbe_tzvp_cation_orbitals",
-        "pbe_tzvp_anion_orbitals",
+    for role, legacy_task in (
+        ("cation", "simulation/pbe_tzvp_cation_orbitals"),
+        ("anion", "simulation/pbe_tzvp_anion_orbitals"),
     ):
+        smiles = sorted(
+            {
+                canonicalize_smiles(pair[0] if role == "cation" else pair[1])
+                for pair in (ion_pair(index) for index in range(1, 101))
+            }
+        )
+        legacy_ids = pd.Series(
+            [training_splits.group_id(role, (value,)) for value in smiles]
+        )
+        expected = training_splits.stage2_grouped_partitions(
+            legacy_ids,
+            task_id=legacy_task,
+            system_type=role,
+            seed=42,
+            has_test=True,
+        )
+        assert {
+            (role, value): (
+                "valid" if partition == "validation" else partition
+            )
+            for value, partition in zip(smiles, expected, strict=True)
+        } == {
+            key: partition
+            for key, partition in homo_assignments.items()
+            if key[0] == role
+        }
+    for task_name, target in (("homo", "HOMO_eV"), ("lumo", "LUMO_eV")):
         for filename in ("train.csv", "valid.csv", "test.csv"):
-            assert {"HOMO_eV", "LUMO_eV"} <= set(
+            columns = list(
                 pd.read_csv(
-                    output_root / "stage2" / task_name / filename,
-                    nrows=0,
+                    output_root / "stage2" / task_name / filename, nrows=0
                 ).columns
             )
+            assert columns == [
+                "SMILES",
+                "ion_role",
+                "provenance_source_file",
+                "provenance_source_row",
+                target,
+                "source_list",
+            ]
+
+    inheritance = pd.read_csv(
+        output_root / "_audit" / "stage2_orbital_split_inheritance.csv"
+    )
+    assert list(inheritance.columns) == [
+        "ion_role",
+        "SMILES",
+        "legacy_task_id",
+        "partition",
+    ]
+    assert len(inheritance) == len(homo_assignments)
 
     transfer_stage3_root = (
         output_root / "stage3" / "experiment" / "transfer_organic"
