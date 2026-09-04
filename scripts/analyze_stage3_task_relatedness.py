@@ -501,18 +501,11 @@ def _candidate_wins(
     index: int,
     best_score: float,
     best_index: int,
-    *,
-    source_index: int,
-    same_task: bool,
 ) -> bool:
     if score > best_score:
         return True
     if score < best_score:
         return False
-    candidate_is_self = same_task and index == source_index
-    best_is_self = same_task and best_index == source_index
-    if candidate_is_self != best_is_self:
-        return candidate_is_self
     return best_index < 0 or index < best_index
 
 
@@ -531,8 +524,6 @@ def match_task_pair(
     chemistry_scores = np.full(row_count, np.nan)
     condition_scores = np.full(row_count, np.nan)
     combined_scores = np.full(row_count, np.nan)
-    same_task = source.task_id == target.task_id
-
     for query_group_index, query_rows in enumerate(source.chemistry_groups):
         group_chemistry = chemistry_similarities(
             source.chemistry_fingerprints[query_group_index],
@@ -558,17 +549,12 @@ def match_task_pair(
                 combined = CHEMISTRY_WEIGHT * chemistry + CONDITION_WEIGHT * conditions
                 local_score = float(np.max(combined))
                 local_candidates = rows[combined == local_score]
-                if same_task and source_index in local_candidates:
-                    local_index = source_index
-                else:
-                    local_index = int(local_candidates[0])
+                local_index = int(local_candidates[0])
                 if _candidate_wins(
                     local_score,
                     local_index,
                     best_combined,
                     best_index,
-                    source_index=source_index,
-                    same_task=same_task,
                 ):
                     local_position = int(np.flatnonzero(rows == local_index)[0])
                     best_index = local_index
@@ -616,7 +602,6 @@ def brute_force_match_task_pair(
     chemistry_selected: list[float] = []
     condition_selected: list[float] = []
     combined_selected: list[float] = []
-    same_task = source.task_id == target.task_id
     source_row_to_group = np.empty(len(source.frame), dtype=np.int64)
     for group_index, rows in enumerate(source.chemistry_groups):
         source_row_to_group[rows] = group_index
@@ -634,10 +619,7 @@ def brute_force_match_task_pair(
         combined = CHEMISTRY_WEIGHT * chemistry + CONDITION_WEIGHT * conditions
         best_score = float(np.max(combined))
         candidates = all_target_indices[combined == best_score]
-        if same_task and source_index in candidates:
-            best_index = source_index
-        else:
-            best_index = int(candidates[0])
+        best_index = int(candidates[0])
         selected.append(best_index)
         chemistry_selected.append(float(chemistry[best_index]))
         condition_selected.append(float(conditions[best_index]))
@@ -779,7 +761,7 @@ def _write_metadata(
             "many_to_one": True,
             "threshold_enabled": False,
             "cross_task_tie_break": "lowest_original_target_row",
-            "same_task_tie_break": "query_row_then_lowest_original_target_row",
+            "same_task_policy": "skipped; diagonal matrix entries are NaN",
         },
         "versions": {
             "python": platform.python_version(),
@@ -810,7 +792,9 @@ def analyze_stage3_task_relatedness(
     matches_path = output_dir / "matches.csv.gz"
     total_pairs = len(tasks) * len(tasks)
     total_work = sum(
-        len(source.frame) if source.roles == target.roles else 1
+        len(source.frame)
+        if source.task_id != target.task_id and source.roles == target.roles
+        else 1
         for source in tasks
         for target in tasks
     )
@@ -822,7 +806,10 @@ def analyze_stage3_task_relatedness(
             for source in tasks:
                 for target in tasks:
                     pair_work = (
-                        len(source.frame) if source.roles == target.roles else 1
+                        len(source.frame)
+                        if source.task_id != target.task_id
+                        and source.roles == target.roles
+                        else 1
                     )
                     progress.start_pair(
                         source.task_id, target.task_id, pair_work=pair_work
@@ -836,11 +823,26 @@ def analyze_stage3_task_relatedness(
                         "target_rows": len(target.frame),
                         "excluded_query_count": 0,
                     }
+                    if source.task_id == target.task_id:
+                        summaries.append(
+                            {
+                                **base_summary,
+                                "compatible": True,
+                                "computed": False,
+                                "matched_pairs": 0,
+                                "spearman_rho": math.nan,
+                                "undefined_reason": "same_task_skipped",
+                            }
+                        )
+                        progress.advance_work()
+                        progress.finish_pair()
+                        continue
                     if source.roles != target.roles:
                         summaries.append(
                             {
                                 **base_summary,
                                 "compatible": False,
+                                "computed": False,
                                 "matched_pairs": 0,
                                 "spearman_rho": math.nan,
                                 "undefined_reason": "incompatible_topology",
@@ -865,6 +867,7 @@ def analyze_stage3_task_relatedness(
                     summary = {
                         **base_summary,
                         "compatible": True,
+                        "computed": True,
                         "matched_pairs": len(matches.target_indices),
                         "spearman_rho": rho,
                         "undefined_reason": undefined_reason,
@@ -915,10 +918,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     matrix, summary = analyze_stage3_task_relatedness(
         args.input_root, args.output_dir
     )
-    compatible = int(summary["compatible"].sum())
+    computed = int(summary["computed"].sum())
     print(
         f"Wrote {matrix.shape[0]}x{matrix.shape[1]} directed Spearman matrix "
-        f"with {compatible} compatible task pairs to {args.output_dir}"
+        f"with {computed} distinct compatible task pairs to {args.output_dir}"
     )
 
 

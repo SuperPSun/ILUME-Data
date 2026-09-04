@@ -253,7 +253,7 @@ def test_pruned_matcher_equals_brute_force_on_random_small_inputs(
     np.testing.assert_allclose(pruned.combined_similarity, brute_force.combined_similarity)
 
 
-def test_duplicate_ties_and_same_task_diagonal_policy(tmp_path: Path):
+def test_duplicate_target_ties_select_earliest_row(tmp_path: Path):
     duplicate_rows = [
         il_row("C[N+](C)(C)C", "[Cl-]", 1.0),
         il_row("C[N+](C)(C)C", "[Cl-]", 2.0),
@@ -263,15 +263,8 @@ def test_duplicate_ties_and_same_task_diagonal_policy(tmp_path: Path):
     scales = compute_condition_scales([source, target])
 
     cross_task = match_task_pair(source, target, scales)
-    same_task = match_task_pair(source, source, scales)
 
     np.testing.assert_array_equal(cross_task.target_indices, [0, 0])
-    np.testing.assert_array_equal(same_task.target_indices, [0, 1])
-    rho, reason = _spearman(
-        source.property_values, source.property_values[same_task.target_indices]
-    )
-    assert rho == pytest.approx(1.0)
-    assert reason == ""
 
 
 def test_low_similarity_query_still_gets_one_match(tmp_path: Path):
@@ -388,13 +381,19 @@ def test_full_analysis_writes_directed_21_by_21_outputs(tmp_path: Path):
     assert matrix.shape == (21, 21)
     assert tuple(matrix.index) == EXPECTED_STAGE3_TASK_IDS
     assert tuple(matrix.columns) == EXPECTED_STAGE3_TASK_IDS
-    np.testing.assert_allclose(np.diag(matrix), 1.0)
+    assert np.isnan(np.diag(matrix)).all()
     assert np.isnan(
         matrix.loc["experiment/density", "experiment/transfer_organic"]
     )
     assert len(summary) == 21 * 21
     assert int(summary["compatible"].sum()) == 18**2 + 2**2 + 1
+    assert int(summary["computed"].sum()) == 18 * 17 + 2 * 1
     assert summary["excluded_query_count"].eq(0).all()
+    diagonal = summary[summary["source_task"].eq(summary["target_task"])]
+    assert len(diagonal) == 21
+    assert diagonal["computed"].eq(False).all()
+    assert diagonal["matched_pairs"].eq(0).all()
+    assert diagonal["undefined_reason"].eq("same_task_skipped").all()
 
     written_matrix = pd.read_csv(output_dir / "spearman_matrix.csv", index_col=0)
     assert written_matrix.shape == (21, 21)
@@ -403,7 +402,7 @@ def test_full_analysis_writes_directed_21_by_21_outputs(tmp_path: Path):
     assert metadata["task_order"] == list(EXPECTED_STAGE3_TASK_IDS)
     with gzip.open(output_dir / "matches.csv.gz", "rt", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert len(rows) == 18 * 18 * 2 + 2 * 2 * 2 + 1 * 1 * 2
+    assert len(rows) == 18 * 17 * 2 + 2 * 1 * 2
     assert set(rows[0]) >= {
         "source_task",
         "target_task",
