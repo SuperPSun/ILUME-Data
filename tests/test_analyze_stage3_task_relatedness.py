@@ -1,5 +1,6 @@
 import csv
 import gzip
+import io
 import json
 import math
 from pathlib import Path
@@ -16,6 +17,7 @@ from scripts.analyze_stage3_task_relatedness import (
     DEFAULT_EXPERIMENT_PRESSURE_KPA,
     DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM,
     EXPECTED_STAGE3_TASK_IDS,
+    _PairProgress,
     _load_task,
     _spearman,
     analyze_stage3_task_relatedness,
@@ -25,6 +27,11 @@ from scripts.analyze_stage3_task_relatedness import (
     condition_similarity,
     match_task_pair,
 )
+
+
+class TtyBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -54,6 +61,48 @@ def il_row(
     **conditions: object,
 ) -> dict[str, object]:
     return {"cation": cation, "anion": anion, **conditions, "property": value}
+
+
+def test_pair_progress_shows_current_pair_completion_and_elapsed_time():
+    stream = TtyBuffer()
+    progress = _PairProgress(total_pairs=2, total_work=3, stream=stream)
+
+    progress.start_pair(
+        "experiment/density", "experiment/viscosity", pair_work=2
+    )
+    progress.advance_work()
+    progress.advance_work()
+    progress.finish_pair()
+    progress.start_pair(
+        "experiment/density", "experiment/solvation", pair_work=1
+    )
+    progress.advance_work()
+    progress.finish_pair()
+    progress.close()
+
+    output = stream.getvalue()
+    assert "0/3" in output
+    assert "density -> viscosity" in output
+    assert "3/3" in output
+    assert "pair   2/2" in output
+    assert "rows 1/1" in output
+    assert "elapsed" in output
+    assert "current: done" in output
+    assert output.endswith("\n")
+
+
+def test_pair_progress_is_silent_for_non_tty_streams():
+    stream = io.StringIO()
+    progress = _PairProgress(total_pairs=1, total_work=1, stream=stream)
+
+    progress.start_pair(
+        "experiment/density", "experiment/viscosity", pair_work=1
+    )
+    progress.advance_work()
+    progress.finish_pair()
+    progress.close()
+
+    assert stream.getvalue() == ""
 
 
 def test_chemistry_similarity_is_geometric_mean_by_role():

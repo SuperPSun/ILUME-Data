@@ -9,9 +9,11 @@ import hashlib
 import json
 import math
 import platform
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence, TextIO
 
 import numpy as np
 import pandas as pd
@@ -104,6 +106,84 @@ MATCH_COLUMNS = (
 
 class TaskRelatednessError(RuntimeError):
     """Raised when Stage-3 inputs do not satisfy the analysis contract."""
+
+
+class _PairProgress:
+    """Single-line task-pair progress for interactive terminals."""
+
+    def __init__(
+        self,
+        total_pairs: int,
+        total_work: int,
+        stream: TextIO | None = None,
+    ):
+        self.total_pairs = total_pairs
+        self.total_work = total_work
+        self.stream = stream or sys.stderr
+        self.enabled = self.stream.isatty()
+        self.completed_pairs = 0
+        self.completed_work = 0
+        self.pair_work = 0
+        self.pair_completed_work = 0
+        self.started_at = time.monotonic()
+        self.last_rendered_at = -math.inf
+        self.current = ""
+
+    def start_pair(
+        self,
+        source_task: str,
+        target_task: str,
+        pair_work: int,
+    ) -> None:
+        self.current = (
+            f"{source_task.removeprefix('experiment/')} -> "
+            f"{target_task.removeprefix('experiment/')}"
+        )
+        self.pair_work = pair_work
+        self.pair_completed_work = 0
+        self._render(force=True)
+
+    def advance_work(self) -> None:
+        self.completed_work += 1
+        self.pair_completed_work += 1
+        self._render(force=False)
+
+    def finish_pair(self) -> None:
+        self.completed_pairs += 1
+        self._render(force=True)
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        self.current = (
+            "done" if self.completed_pairs == self.total_pairs else "stopped"
+        )
+        self._render(force=True)
+        self.stream.write("\n")
+        self.stream.flush()
+
+    def _render(self, *, force: bool) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_rendered_at < 0.2:
+            return
+        self.last_rendered_at = now
+        fraction = self.completed_work / self.total_work if self.total_work else 1.0
+        filled = min(24, int(fraction * 24))
+        bar = "#" * filled + "-" * (24 - filled)
+        elapsed = max(0, int(now - self.started_at))
+        hours, remainder = divmod(elapsed, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        pair_number = min(self.completed_pairs + 1, self.total_pairs)
+        self.stream.write(
+            f"\rWork [{bar}] {self.completed_work:>7}/{self.total_work} "
+            f"({fraction:>6.1%}) elapsed {hours:02}:{minutes:02}:{seconds:02} "
+            f"pair {pair_number:>3}/{self.total_pairs} "
+            f"current: {self.current} "
+            f"rows {self.pair_completed_work}/{self.pair_work}\033[K"
+        )
+        self.stream.flush()
 
 
 @dataclass
@@ -440,6 +520,7 @@ def match_task_pair(
     source: TaskData,
     target: TaskData,
     scales: dict[str, float],
+    progress_callback: Callable[[], None] | None = None,
 ) -> PairMatches:
     if source.roles != target.roles:
         raise TaskRelatednessError(
@@ -502,6 +583,8 @@ def match_task_pair(
             chemistry_scores[source_index] = best_chemistry
             condition_scores[source_index] = best_condition
             combined_scores[source_index] = best_combined
+            if progress_callback is not None:
+                progress_callback()
 
     return PairMatches(
         target_indices=target_indices,
@@ -725,55 +808,87 @@ def analyze_stage3_task_relatedness(
     matrix.index.name = "source_task"
     summaries: list[dict[str, object]] = []
     matches_path = output_dir / "matches.csv.gz"
-    with gzip.open(matches_path, "wt", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=MATCH_COLUMNS)
-        writer.writeheader()
-        for source in tasks:
-            for target in tasks:
-                base_summary: dict[str, object] = {
-                    "source_task": source.task_id,
-                    "target_task": target.task_id,
-                    "source_topology": source.topology,
-                    "target_topology": target.topology,
-                    "source_rows": len(source.frame),
-                    "target_rows": len(target.frame),
-                    "excluded_query_count": 0,
-                }
-                if source.roles != target.roles:
-                    summaries.append(
-                        {
-                            **base_summary,
-                            "compatible": False,
-                            "matched_pairs": 0,
-                            "spearman_rho": math.nan,
-                            "undefined_reason": "incompatible_topology",
-                        }
+    total_pairs = len(tasks) * len(tasks)
+    total_work = sum(
+        len(source.frame) if source.roles == target.roles else 1
+        for source in tasks
+        for target in tasks
+    )
+    progress = _PairProgress(total_pairs=total_pairs, total_work=total_work)
+    try:
+        with gzip.open(matches_path, "wt", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=MATCH_COLUMNS)
+            writer.writeheader()
+            for source in tasks:
+                for target in tasks:
+                    pair_work = (
+                        len(source.frame) if source.roles == target.roles else 1
                     )
-                    continue
-                matches = match_task_pair(source, target, scales)
-                target_values = target.property_values[matches.target_indices]
-                rho, undefined_reason = _spearman(
-                    source.property_values, target_values
-                )
-                matrix.loc[source.task_id, target.task_id] = rho
-                summary = {
-                    **base_summary,
-                    "compatible": True,
-                    "matched_pairs": len(matches.target_indices),
-                    "spearman_rho": rho,
-                    "undefined_reason": undefined_reason,
-                }
-                summary.update(
-                    _similarity_summary("chemistry", matches.chemistry_similarity)
-                )
-                summary.update(
-                    _similarity_summary("condition", matches.condition_similarity)
-                )
-                summary.update(
-                    _similarity_summary("combined", matches.combined_similarity)
-                )
-                summaries.append(summary)
-                _write_pair_matches(writer, source, target, matches)
+                    progress.start_pair(
+                        source.task_id, target.task_id, pair_work=pair_work
+                    )
+                    base_summary: dict[str, object] = {
+                        "source_task": source.task_id,
+                        "target_task": target.task_id,
+                        "source_topology": source.topology,
+                        "target_topology": target.topology,
+                        "source_rows": len(source.frame),
+                        "target_rows": len(target.frame),
+                        "excluded_query_count": 0,
+                    }
+                    if source.roles != target.roles:
+                        summaries.append(
+                            {
+                                **base_summary,
+                                "compatible": False,
+                                "matched_pairs": 0,
+                                "spearman_rho": math.nan,
+                                "undefined_reason": "incompatible_topology",
+                            }
+                        )
+                        progress.advance_work()
+                        progress.finish_pair()
+                        continue
+                    matches = match_task_pair(
+                        source,
+                        target,
+                        scales,
+                        progress_callback=(
+                            progress.advance_work if progress.enabled else None
+                        ),
+                    )
+                    target_values = target.property_values[matches.target_indices]
+                    rho, undefined_reason = _spearman(
+                        source.property_values, target_values
+                    )
+                    matrix.loc[source.task_id, target.task_id] = rho
+                    summary = {
+                        **base_summary,
+                        "compatible": True,
+                        "matched_pairs": len(matches.target_indices),
+                        "spearman_rho": rho,
+                        "undefined_reason": undefined_reason,
+                    }
+                    summary.update(
+                        _similarity_summary(
+                            "chemistry", matches.chemistry_similarity
+                        )
+                    )
+                    summary.update(
+                        _similarity_summary(
+                            "condition", matches.condition_similarity
+                        )
+                    )
+                    summary.update(
+                        _similarity_summary(
+                            "combined", matches.combined_similarity
+                        )
+                    )
+                    summaries.append(summary)
+                    _write_pair_matches(writer, source, target, matches)
+                    progress.finish_pair()
+    finally:
+        progress.close()
 
     summary_frame = pd.DataFrame(summaries)
     matrix.to_csv(output_dir / "spearman_matrix.csv")
