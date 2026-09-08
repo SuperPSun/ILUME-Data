@@ -232,6 +232,91 @@ def test_analyze_merged_properties_uses_equilibrium_pressure_name(tmp_path: Path
     assert plot_manifest["path"].str.contains("experiment_equilibrium_pressure").any()
 
 
+def test_analyze_merged_properties_reports_experiment_il_property_system_overlap(tmp_path: Path):
+    input_root = tmp_path / "merged"
+    output_dir = input_root / "analysis"
+    write_csv(
+        input_root / "merged_manifest.csv",
+        [
+            {
+                "bucket": "experiment",
+                "property_label": "density_g/cm^3",
+                "output_file": "experiment/density.csv",
+                "input_files": "density.csv",
+                "input_rows": 4,
+                "output_rows": 4,
+            },
+            {
+                "bucket": "experiment",
+                "property_label": "viscosity_mPa*s_log10",
+                "output_file": "experiment/viscosity.csv",
+                "input_files": "viscosity.csv",
+                "input_rows": 3,
+                "output_rows": 3,
+            },
+            {
+                "bucket": "experiment",
+                "property_label": "melting_point_K",
+                "output_file": "experiment/melting_point.csv",
+                "input_files": "melting_point.csv",
+                "input_rows": 1,
+                "output_rows": 1,
+            },
+        ],
+    )
+    write_csv(
+        input_root / "experiment" / "density.csv",
+        [
+            {"cation": "cat1", "anion": "an1", "temperature_K": 298.15, "density_g/cm^3": 1.0},
+            {"cation": "cat1", "anion": "an1", "temperature_K": 318.15, "density_g/cm^3": 0.9},
+            {"cation": "cat2", "anion": "an2", "temperature_K": 298.15, "density_g/cm^3": 1.1},
+            {"cation": None, "anion": "an3", "temperature_K": 298.15, "density_g/cm^3": 1.2},
+        ],
+    )
+    write_csv(
+        input_root / "experiment" / "viscosity.csv",
+        [
+            {"cation": "cat1", "anion": "an1", "temperature_K": 333.15, "viscosity_mPa*s_log10": 2.0},
+            {"cation": "cat2", "anion": "an2", "temperature_K": 298.15, "viscosity_mPa*s_log10": None},
+            {"cation": "cat3", "anion": "an3", "temperature_K": 298.15, "viscosity_mPa*s_log10": 2.2},
+        ],
+    )
+    write_csv(
+        input_root / "experiment" / "melting_point.csv",
+        [{"cation": "cat1", "melting_point_K": 250.0}],
+    )
+
+    analyze_merged_properties(input_root, output_dir)
+
+    overlap = pd.read_csv(output_dir / "property_system_overlap.csv")
+    density_viscosity = overlap[
+        overlap["property_a"].eq("density") & overlap["property_b"].eq("viscosity")
+    ].iloc[0]
+    assert density_viscosity["bucket"] == "experiment"
+    assert density_viscosity["property_a_label"] == "density_g/cm^3"
+    assert density_viscosity["property_b_label"] == "viscosity_mPa*s_log10"
+    assert density_viscosity["property_a_unique_systems"] == 2
+    assert density_viscosity["property_b_unique_systems"] == 2
+    assert density_viscosity["shared_systems"] == 1
+    assert density_viscosity["property_a_overlap_ratio"] == 0.5
+    assert density_viscosity["property_b_overlap_ratio"] == 0.5
+    density_diagonal = overlap[
+        overlap["property_a"].eq("density") & overlap["property_b"].eq("density")
+    ].iloc[0]
+    assert density_diagonal["shared_systems"] == 2
+    assert len(overlap) == 4
+    assert (
+        output_dir
+        / "figures"
+        / "property_system_overlap"
+        / "experiment_property_system_overlap_heatmap.png"
+    ).exists()
+    plot_manifest = pd.read_csv(output_dir / "plot_manifest.csv")
+    assert "property_system_overlap" in set(plot_manifest["figure_type"])
+    report = (output_dir / "property_analysis_report.md").read_text()
+    assert "Cross-property IL System Overlap" in report
+
+
 def test_analyze_merged_properties_preserves_self_diffusion_log_label(tmp_path: Path):
     input_root = tmp_path / "merged"
     output_dir = input_root / "analysis"
@@ -625,6 +710,7 @@ def test_analyze_merged_properties_can_skip_plots(tmp_path: Path):
     analyze_merged_properties(input_root, output_dir, skip_plots=True)
 
     assert (output_dir / "property_analysis_summary.csv").exists()
+    assert (output_dir / "property_system_overlap.csv").exists()
     assert (output_dir / "property_analysis_report.md").exists()
     assert not (output_dir / "plot_manifest.csv").exists()
     assert not (output_dir / "figures").exists()

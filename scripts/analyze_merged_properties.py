@@ -63,6 +63,19 @@ SUMMARY_COLUMNS = [
     "recommended_test_systems",
 ]
 
+PROPERTY_SYSTEM_OVERLAP_COLUMNS = [
+    "bucket",
+    "property_a",
+    "property_a_label",
+    "property_a_unique_systems",
+    "property_b",
+    "property_b_label",
+    "property_b_unique_systems",
+    "shared_systems",
+    "property_a_overlap_ratio",
+    "property_b_overlap_ratio",
+]
+
 NUMERIC_CONDITION_COLUMNS = tuple(column for column in CONDITION_COLUMNS if column != "phase")
 PLOTTING_CONDITION_DEFAULTS = {
     "temperature_K": 298.15,
@@ -231,6 +244,8 @@ def analyze_property_manifest(
     summary = pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
     output_dir.mkdir(parents=True, exist_ok=True)
     summary.to_csv(output_dir / "property_analysis_summary.csv", index=False)
+    property_system_overlap = analyze_experiment_property_system_overlap(input_root, manifest)
+    property_system_overlap.to_csv(output_dir / "property_system_overlap.csv", index=False)
     if skip_plots:
         clean_plot_outputs(output_dir)
         plot_manifest = pd.DataFrame()
@@ -244,9 +259,15 @@ def analyze_property_manifest(
             high_coverage_threshold=high_coverage_threshold,
             medium_coverage_threshold=medium_coverage_threshold,
             max_condition_scatter_points=max_condition_scatter_points,
+            property_system_overlap=property_system_overlap,
         )
         plot_manifest.to_csv(output_dir / "plot_manifest.csv", index=False)
-    write_markdown_report(summary, output_dir / "property_analysis_report.md", plot_manifest)
+    write_markdown_report(
+        summary,
+        output_dir / "property_analysis_report.md",
+        plot_manifest,
+        property_system_overlap,
+    )
     return summary
 
 
@@ -287,6 +308,46 @@ def clean_plot_outputs(output_dir: Path) -> None:
     plot_manifest = output_dir / "plot_manifest.csv"
     if plot_manifest.exists():
         plot_manifest.unlink()
+
+
+def experiment_il_systems(df: pd.DataFrame, value_column: str) -> set[tuple[str, str]]:
+    if value_column not in df.columns or not {"cation", "anion"}.issubset(df.columns):
+        return set()
+    present = numeric_property_values(df[value_column]).notna()
+    systems = df.loc[present, ["cation", "anion"]].dropna().drop_duplicates()
+    return set(systems.itertuples(index=False, name=None))
+
+
+def analyze_experiment_property_system_overlap(input_root: Path, manifest: pd.DataFrame) -> pd.DataFrame:
+    property_systems: dict[str, tuple[str, set[tuple[str, str]]]] = {}
+    experiment_manifest = manifest[manifest["bucket"].eq("experiment")]
+    for manifest_row in experiment_manifest.itertuples(index=False):
+        property_label = str(manifest_row.property_label)
+        df = pd.read_csv(input_root / str(manifest_row.output_file))
+        for value_column in value_columns_for_row(df, property_label):
+            systems = experiment_il_systems(df, value_column)
+            if systems:
+                property_systems[output_slug(value_column)] = (value_column, systems)
+
+    rows: list[dict[str, object]] = []
+    for property_a, (property_a_label, systems_a) in property_systems.items():
+        for property_b, (property_b_label, systems_b) in property_systems.items():
+            shared_systems = len(systems_a & systems_b)
+            rows.append(
+                {
+                    "bucket": "experiment",
+                    "property_a": property_a,
+                    "property_a_label": property_a_label,
+                    "property_a_unique_systems": len(systems_a),
+                    "property_b": property_b,
+                    "property_b_label": property_b_label,
+                    "property_b_unique_systems": len(systems_b),
+                    "shared_systems": shared_systems,
+                    "property_a_overlap_ratio": shared_systems / len(systems_a),
+                    "property_b_overlap_ratio": shared_systems / len(systems_b),
+                }
+            )
+    return pd.DataFrame(rows, columns=PROPERTY_SYSTEM_OVERLAP_COLUMNS)
 
 
 def coverage_group(data_points: int, high_threshold: int, medium_threshold: int) -> str:
@@ -362,6 +423,7 @@ def generate_plots(
     high_coverage_threshold: int,
     medium_coverage_threshold: int,
     max_condition_scatter_points: int,
+    property_system_overlap: pd.DataFrame,
 ) -> pd.DataFrame:
     clean_plot_outputs(output_dir)
     figures_dir = output_dir / "figures"
@@ -461,6 +523,20 @@ def generate_plots(
         output_dir=output_dir,
         data_points=int(summary["data_points"].sum()) if not summary.empty else 0,
         unique_systems=int(summary["unique_systems"].sum()) if not summary.empty else 0,
+        coverage="all",
+    )
+
+    overlap_heatmap_path = figures_dir / "property_system_overlap" / "experiment_property_system_overlap_heatmap.png"
+    plot_property_system_overlap(property_system_overlap, overlap_heatmap_path, dpi)
+    plot_record(
+        plot_records,
+        figure_type="property_system_overlap",
+        bucket="experiment",
+        property_name="property_system_overlap",
+        path=overlap_heatmap_path,
+        output_dir=output_dir,
+        data_points=int(property_system_overlap["shared_systems"].sum()) if not property_system_overlap.empty else 0,
+        unique_systems=int(property_system_overlap["property_a_unique_systems"].max()) if not property_system_overlap.empty else 0,
         coverage="all",
     )
     return pd.DataFrame(
@@ -875,6 +951,36 @@ def plot_condition_availability(rows: list[dict[str, object]], output_path: Path
     save_figure(fig, output_path, dpi)
 
 
+def plot_property_system_overlap(overlap: pd.DataFrame, output_path: Path, dpi: int) -> None:
+    properties = sorted(overlap["property_a"].unique()) if not overlap.empty else []
+    fig_size = max(7, min(24, 0.45 * max(len(properties), 1)))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    if not properties:
+        ax.text(0.5, 0.5, "No experimental IL property systems to compare", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        save_figure(fig, output_path, dpi)
+        return
+    matrix = (
+        overlap.pivot(index="property_a", columns="property_b", values="shared_systems")
+        .reindex(index=properties, columns=properties)
+        .fillna(0)
+    )
+    image = ax.imshow(matrix, cmap="YlGnBu")
+    ax.set_xticks(range(len(properties)))
+    ax.set_xticklabels(properties, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(properties)))
+    ax.set_yticklabels(properties, fontsize=8)
+    ax.set_title("Experimental IL Property System Overlap")
+    ax.set_xlabel("Property B")
+    ax.set_ylabel("Property A")
+    for row_index, row in enumerate(matrix.to_numpy()):
+        for column_index, value in enumerate(row):
+            ax.text(column_index, row_index, str(int(value)), ha="center", va="center", fontsize=6)
+    cbar = fig.colorbar(image, ax=ax)
+    cbar.set_label("Shared IL systems (cation + anion; conditions ignored)")
+    save_figure(fig, output_path, dpi)
+
+
 def plot_condition_spaces(
     df: pd.DataFrame,
     value_column: str,
@@ -952,7 +1058,12 @@ def markdown_table(df: pd.DataFrame, columns: list[str], max_rows: int = 12) -> 
     return lines
 
 
-def write_markdown_report(summary: pd.DataFrame, output_path: Path, plot_manifest: pd.DataFrame | None = None) -> None:
+def write_markdown_report(
+    summary: pd.DataFrame,
+    output_path: Path,
+    plot_manifest: pd.DataFrame | None = None,
+    property_system_overlap: pd.DataFrame | None = None,
+) -> None:
     total_points = int(summary["data_points"].sum()) if not summary.empty else 0
     total_systems = int(summary["unique_systems"].sum()) if not summary.empty else 0
     holdout = summary[summary["recommended_split"].eq("system_holdout_test")].sort_values("data_points", ascending=False)
@@ -1001,6 +1112,13 @@ def write_markdown_report(summary: pd.DataFrame, output_path: Path, plot_manifes
         "",
         *markdown_table(small, ["bucket", "property", "unique_systems", "data_points"]),
         "",
+        "## Cross-property IL System Overlap",
+        "",
+        "Experimental ionic-liquid systems are keyed by `(cation, anion)`; measurement conditions are ignored.",
+        "",
+        "- Full pairwise statistics: `property_system_overlap.csv`",
+        f"- Properties with IL systems: {len(property_system_overlap['property_a'].unique()) if property_system_overlap is not None and not property_system_overlap.empty else 0}",
+        "",
         "## Generated Figures",
         "",
     ]
@@ -1017,6 +1135,7 @@ def write_markdown_report(summary: pd.DataFrame, output_path: Path, plot_manifes
                 "- `figures/coverage/property_coverage_all.png`",
                 "- `figures/condition_availability/property_condition_availability_heatmap.png`",
                 "- `figures/normalized_distributions/property_normalized_violin.png`",
+                "- `figures/property_system_overlap/experiment_property_system_overlap_heatmap.png`",
             ]
         )
     output_path.write_text("\n".join(lines))
