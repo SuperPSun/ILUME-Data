@@ -8,6 +8,12 @@ import pytest
 from scripts import analyze_dataset_relationship_graph as graph
 
 
+EXPECTED_METRICS = {
+    'spearman', 'distance_correlation', 'binary_mi', 'binary_i_over_h',
+    'multiclass_mi', 'predictability_cv_nmae',
+}
+
+
 @pytest.fixture
 def config():
     return graph.load_config(graph.DEFAULT_CONFIG)
@@ -104,7 +110,6 @@ def test_metrics_symmetry_pair_bins_small_and_ties():
     first,_=graph.metric_values(np.arange(30.),np.arange(30.))
     assert first['binary_mi']==pytest.approx(np.log(2))
     assert graph.quantile_labels(np.ones(30),3) is None
-    assert np.isnan(graph.ksg_mi(np.ones(30),np.ones(30)))
 
 
 def test_cv_and_train_fold_scaling(monkeypatch):
@@ -128,13 +133,15 @@ def fixture_root(tmp_path):
     for stage,task,source,targets,system_type,repeats in [
         (2,'simulation/a','simulation/a.csv','a;b','il',1),
         (3,'experiment/b','experiment/b.csv','b','il',2),
+        (3,'experiment/c','experiment/c.csv','b','il',1),
         (2,'simulation/qm','simulation/qm.csv','q1;q2','molecule',1)]:
         materialized=f'stage{stage}/{task.split("/")[-1]}'
         entries.append(dict(stage=stage,task_id=task,source_file=source,target_columns=targets,
                             system_type=system_type,materialized_path=materialized,repeats=repeats,condition_columns=''))
         if system_type!='il':continue
         directory=root/materialized;directory.mkdir(parents=True)
-        names=['train.csv','valid.csv'] if stage==2 else [f'IL/cv1/fold{i}.csv' for i in range(1,6)]
+        fold_dir = 'IL/cv1' if repeats > 1 else 'IL'
+        names=['train.csv','valid.csv'] if stage==2 else [f'{fold_dir}/fold{i}.csv' for i in range(1,6)]
         for i,name in enumerate(names):
             p=directory/name;p.parent.mkdir(parents=True,exist_ok=True)
             pd.DataFrame({'cation':[f'c{i}'],'anion':['a'],'a':[i+1],'b':[i+2]}).to_csv(p,index=False)
@@ -148,21 +155,36 @@ def fixture_root(tmp_path):
 
 def test_discovery_and_end_to_end(tmp_path,config):
     root=fixture_root(tmp_path)
-    config['formulas'].update({'simulation/a.csv':'unconditioned','experiment/b.csv':'unconditioned'})
+    config['formulas'].update({'simulation/a.csv':'unconditioned','experiment/b.csv':'unconditioned',
+                              'experiment/c.csv':'unconditioned'})
     config['stability'].update(bootstrap=2,permutation=2,cv_repeats=2,cv_permutation=2)
     nodes,inputs=graph.discover(root,config)
-    assert len(nodes)==5
+    assert len(nodes)==6
     assert all('test.csv' not in p and '/cv2/' not in p for p in inputs)
     inv,review,sig,units=graph.build_signatures(nodes,config)
-    assert len(sig)==9
+    assert len(sig)==14
     assert not set(sig.cation)&{'TEST','REPEAT'}
     assert inv.excluded_reason.eq('excluded_non_il_identity').sum()==2
     out=tmp_path/'results';out.mkdir()
     graph.compute_graphs(nodes,sig,config,out,42)
     ee=pd.read_csv(out/'G_EE/n_shared.csv',index_col=0)
+    assert ee.shape==(2,2)
     assert ee.iloc[0,0]==5
     se=pd.read_csv(out/'G_SE/n_shared.csv',index_col=0)
-    assert se.shape==(2,1) and (se.to_numpy()==2).all()
+    assert se.shape==(2,2) and (se.to_numpy()==2).all()
+    assert set(graph.METRICS) == EXPECTED_METRICS
+    for name in ('G_EE', 'G_SE'):
+        directory = out/name
+        expected_files = {f'{m}.csv' for m in EXPECTED_METRICS} | {
+            'n_shared.csv', 'n_observation_shared.csv', 'pairs.csv', 'confidence.csv', 'na_reasons.csv',
+        }
+        assert {p.name for p in directory.iterdir()} == expected_files
+        pairs = pd.read_csv(directory/'pairs.csv')
+        assert {c[:-7] for c in pairs if c.endswith('_status')} == EXPECTED_METRICS
+        assert set(pairs.columns) & EXPECTED_METRICS == EXPECTED_METRICS
+        assert not any(c.startswith('continuous_mi') for c in pairs)
+        assert set(pd.read_csv(directory/'confidence.csv').metric) == EXPECTED_METRICS
+        assert set(pd.read_csv(directory/'na_reasons.csv').metric) <= EXPECTED_METRICS
     assert not (out/'G_SS').exists()
     cp=tmp_path/'config.json';cp.write_text(json.dumps(config))
     audit=tmp_path/'audit';graph.run('audit',root,audit,cp)
@@ -171,14 +193,50 @@ def test_discovery_and_end_to_end(tmp_path,config):
         graph.run('audit',root,audit,cp)
 
 
-def test_bootstrap_degenerate_reporting(config):
-    x=np.arange(30.);y=x**2
+def test_discrete_mi_stability_and_degenerate_reporting(config):
+    x=np.arange(30.);y=np.ones(30)
     vals,_=graph.metric_values(x,y)
     settings=dict(config['stability'],bootstrap=3,permutation=2,cv_repeats=2,cv_permutation=2)
     rows=graph.confidence_rows(x,y,vals,(None,None),42,settings)
-    mi=next(r for r in rows if r['metric']=='continuous_mi')
-    assert mi['status']=='insufficient_valid_bootstrap' and mi['bootstrap_failed']==3
+    mi=next(r for r in rows if r['metric']=='binary_mi')
+    assert vals['binary_mi'] == 0
+    assert mi['status']=='insufficient_valid_bootstrap'
+    assert mi['bootstrap_valid']==3 and mi['bootstrap_failed']==0
+    assert mi['permutation_valid']==2 and mi['permutation_p']==1
+    for metric in ('binary_i_over_h', 'multiclass_mi'):
+        assert next(r for r in rows if r['metric']==metric)['status']=='metric_unavailable'
+    assert {r['metric'] for r in rows} == EXPECTED_METRICS
     assert rows==graph.confidence_rows(x,y,vals,(None,None),42,settings)
+
+
+@pytest.mark.parametrize('n,bins,counts', [
+    (29,None,None),(30,3,[10]*3),(79,3,[26,26,27]),
+    (80,4,[20]*4),(149,4,[37,37,37,38]),(150,5,[30]*5),
+])
+def test_multiclass_sample_boundaries(n,bins,counts):
+    # Uneven value spacing distinguishes quantile bins from equal-width bins.
+    x=np.exp(np.linspace(0,5,n))
+    values,states=graph.metric_values(x,x)
+    if bins is None:
+        assert np.isnan(values['multiclass_mi']) and states['multiclass_mi']=='insufficient_samples'
+    else:
+        assert np.bincount(graph.quantile_labels(x,bins)).tolist()==counts
+        probabilities=np.array(counts)/n
+        assert values['multiclass_mi']==pytest.approx(-np.sum(probabilities*np.log(probabilities)))
+
+
+def test_binary_threshold_and_directed_normalization():
+    x=np.arange(40.); y=np.r_[np.zeros(30),np.ones(10)]
+    values,_=graph.metric_values(x,y)
+    reverse,_=graph.metric_values(y,x)
+    expected_mi=.5*np.log(4/3)+.25*np.log(2/3)+.25*np.log(2)
+    target_entropy=-.75*np.log(.75)-.25*np.log(.25)
+    assert values['binary_mi']==pytest.approx(expected_mi)
+    assert reverse['binary_mi']==pytest.approx(expected_mi)
+    assert values['binary_i_over_h']==pytest.approx(expected_mi/target_entropy)
+    assert reverse['binary_i_over_h']==pytest.approx(expected_mi/np.log(2))
+    threshold_values,_=graph.metric_values(x,y,(100.,None))
+    assert threshold_values['binary_mi']==0 and threshold_values['binary_i_over_h']==0
 
 
 def test_nmae_is_oof_median_error_ratio(monkeypatch):

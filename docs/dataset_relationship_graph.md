@@ -83,7 +83,6 @@ experiment only. Continuous z-scores use ddof=0.
 |---|---:|---|
 | Spearman | 3 | Rank correlation; constants are NA |
 | Distance correlation | 5 | Biased doubly centered distance-matrix estimator |
-| Continuous MI | 20 | Symmetric KSG-1, k=3, Chebyshev neighbor radius |
 | Binary MI | 2 | Natural-log MI, high class is strictly above pair median |
 | Binary I/H | 2 | MI divided by target-label entropy; zero entropy is NA |
 | Multiclass MI | 30 | 3 bins at 30, 4 at 80, 5 at 150; pair quantiles |
@@ -92,8 +91,14 @@ experiment only. Continuous z-scores use ddof=0.
 `binary_thresholds` is empty in the approved config; optional entries are keyed
 by exact node ID and must use the signature's units. Otherwise each side uses
 its own median on the current shared subset. Degenerate quantile cuts do not
-fall back to fewer bins. Continuous MI does not jitter duplicated coordinates;
-finite-sample KSG estimates can be negative and are not silently clipped.
+fall back to fewer bins. MI uses two discrete resolutions (binary and multiclass)
+and directed normalized MI (`I/H`), all with natural logarithms; these do not
+measure complete continuous mutual information.
+
+Continuous KSG MI was intentionally removed because its nearest-neighbor estimator
+and ordinary paired bootstrap were incompatible in the current auditable pipeline.
+Dependency evidence is retained through Spearman, distance correlation, binary MI,
+multiclass MI, directed I/H, and CV-NMAE.
 
 Predictability uses StandardScaler, SplineTransformer(degree=3, n_knots=3), and
 Ridge(alpha=1), all fitted within each of five shuffled training folds. At least
@@ -103,8 +108,7 @@ the baseline's error; smaller is better. B→A is fitted separately from A→B.
 
 Nonpredictive metrics use 200 paired-system bootstrap replicates and 199 target
 permutations. Scaling and discretization are rebuilt in each replicate. Bootstrap
-intervals require at least 100 finite replicates. Duplicate coordinates in ordinary
-bootstrap often make KSG MI intervals unavailable; failure counts are explicit.
+intervals require at least 100 finite replicates; failure counts are explicit.
 Discrete MI may remain zero for constant labels, but I/H is unavailable for a
 constant target. Spearman permutation tests use absolute correlation; other
 nonpredictive tests use the upper tail. CV uses 20 repeated fold partitions for

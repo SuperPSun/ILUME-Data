@@ -169,6 +169,9 @@ python scripts/analyze_dataset_relationship_graph.py compute \
 Use `audit` instead of `compute` to inspect signatures and formula approvals
 without pairwise metrics. Outputs include separate Stage3×Stage3 and
 Stage2→Stage3 matrices, signature provenance, NA reasons, and stability tables.
+The six relationship metrics are Spearman, distance correlation, binary MI,
+directed binary I/H, multiclass MI, and predictability CV-NMAE, alongside
+`N_shared` and `N_observation_shared` counts.
 Existing nonempty output directories are rejected. Dynamic permittivity and
 CO₂ multi-observation signatures remain pending manual formula approval.
 See [the analysis contract](docs/dataset_relationship_graph.md) for formulas,

@@ -13,8 +13,6 @@ import pandas as pd
 import scipy
 import sklearn
 from scipy.optimize import least_squares
-from scipy.spatial import cKDTree
-from scipy.special import digamma
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.stats import spearmanr
@@ -26,7 +24,7 @@ from sklearn.preprocessing import SplineTransformer, StandardScaler
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "configs/dataset_relationship_formulas_v1.json"
-METRICS = ("spearman", "distance_correlation", "continuous_mi", "binary_mi",
+METRICS = ("spearman", "distance_correlation", "binary_mi",
            "binary_i_over_h", "multiclass_mi", "predictability_cv_nmae")
 SYMMETRIC = set(METRICS) - {"binary_i_over_h", "predictability_cv_nmae"}
 FORMULAS = {"linear_temperature", "linear_temperature_pressure", "log_density",
@@ -405,19 +403,6 @@ def quantile_labels(values, bins):
     return labels if len(np.unique(labels)) == bins else None
 
 
-def ksg_mi(x, y, k=3):
-    xy = np.column_stack([x, y])
-    if len(np.unique(xy, axis=0)) != len(xy):
-        return np.nan
-    radii = cKDTree(xy).query(xy, k=k + 1, p=np.inf)[0][:, -1]
-    if (radii <= 0).any():
-        return np.nan
-    radii = np.nextafter(radii, 0)
-    nx = cKDTree(x[:, None]).query_ball_point(x[:, None], radii, p=np.inf, return_length=True) - 1
-    ny = cKDTree(y[:, None]).query_ball_point(y[:, None], radii, p=np.inf, return_length=True) - 1
-    return float(digamma(k) + digamma(len(x)) - np.mean(digamma(nx + 1) + digamma(ny + 1)))
-
-
 def distance_correlation(x, y):
     a = np.abs(x[:, None] - x[None, :])
     b = np.abs(y[:, None] - y[None, :])
@@ -442,7 +427,7 @@ def metric_values(x, y, thresholds=(None, None)):
         reasons["binary_i_over_h"] = "zero_target_entropy" if h == 0 else "ok"
         if h:
             values["binary_i_over_h"] = values["binary_mi"] / h
-    for metric, minimum in (("spearman", 3), ("distance_correlation", 5), ("continuous_mi", 20)):
+    for metric, minimum in (("spearman", 3), ("distance_correlation", 5)):
         if n >= minimum:
             reasons[metric] = "constant_signature" if constant else "ok"
             if not constant:
@@ -450,9 +435,7 @@ def metric_values(x, y, thresholds=(None, None)):
                     values[metric] = float(spearmanr(x, y).statistic)
                 else:
                     zx, zy = (x - x.mean()) / x.std(), (y - y.mean()) / y.std()
-                    values[metric] = distance_correlation(zx, zy) if metric == "distance_correlation" else ksg_mi(zx, zy)
-                    if not np.isfinite(values[metric]):
-                        reasons[metric] = "degenerate_duplicate_coordinates"
+                    values[metric] = distance_correlation(zx, zy)
     if n >= 30:
         bins = 5 if n >= 150 else 4 if n >= 80 else 3
         lx, ly = quantile_labels(x, bins), quantile_labels(y, bins)
