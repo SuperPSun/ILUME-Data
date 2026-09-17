@@ -155,3 +155,21 @@ These values are single-snapshot finite-box fingerprints, not trajectory average
 ## Legacy Scripts
 
 Older structuring scripts have been moved to `trash/`. Non-structuring scripts such as crawlers and plotting utilities remain in `scripts/`.
+
+## Dataset Relationship Graph
+
+Analyze shared ionic-liquid systems using development labels from
+`data/training_splits`, without changing splits or training:
+
+```bash
+python scripts/analyze_dataset_relationship_graph.py compute \
+  --output-dir data/analysis/dataset_relationship_graph_v1 --seed 42
+```
+
+Use `audit` instead of `compute` to inspect signatures and formula approvals
+without pairwise metrics. Outputs include separate Stage3×Stage3 and
+Stage2→Stage3 matrices, signature provenance, NA reasons, and stability tables.
+Existing nonempty output directories are rejected. Dynamic permittivity and
+CO₂ multi-observation signatures remain pending manual formula approval.
+See [the analysis contract](docs/dataset_relationship_graph.md) for formulas,
+statistical definitions, limitations, and validation commands.
