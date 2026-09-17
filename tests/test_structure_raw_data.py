@@ -384,6 +384,42 @@ def test_structure_simulation_pbe_tzvp_renames_outputs_and_drops_smiles(tmp_path
     assert not (output_dir / "simulated_PBE_TZVP_cations_structured.csv").exists()
 
 
+def test_structure_simulation_uses_260905_property_sources(tmp_path: Path):
+    input_dir = tmp_path / "raw"
+    output_dir = tmp_path / "structured"
+    input_dir.mkdir()
+    identity = {
+        "cation": ["CC[n+]1ccn(C)c1"],
+        "anion": ["F[B-](F)(F)F"],
+        "temperature": [313],
+    }
+    sources = {
+        "density_260905.csv": ("density", 1250.0, "density_err", 0.5),
+        "heat_capacity_260905.csv": ("Cp", 510.0, "Cp_err", 2.0),
+        "thermal_expansion_260905.csv": ("alpha", 0.0005, "alpha_err", 0.00001),
+        "heat_of_vaporization_260905.csv": ("Hvap", 150.0, "Hvap_err", 0.3),
+    }
+    for filename, (label, value, error_label, error_value) in sources.items():
+        pd.DataFrame(
+            {**identity, label: [value], error_label: [error_value]}
+        ).to_csv(input_dir / filename, index=False)
+
+    structure_simulation(input_dir, output_dir)
+
+    assert pd.read_csv(
+        output_dir / "simulated_density_structured.csv"
+    ).loc[0, "density"] == 1250.0
+    assert pd.read_csv(
+        output_dir / "simulated_heat_capacity_structured.csv"
+    ).loc[0, "Cp"] == 510.0
+    assert pd.read_csv(
+        output_dir / "simulated_thermal_expansion_structured.csv"
+    ).loc[0, "alpha"] == 0.0005
+    assert pd.read_csv(
+        output_dir / "simulated_heat_of_vaporization_structured.csv"
+    ).loc[0, "Hvap"] == 150.0
+
+
 def test_structure_simulation_mappings_preserve_mol_id(tmp_path: Path):
     input_dir = tmp_path / "raw"
     output_dir = tmp_path / "structured"

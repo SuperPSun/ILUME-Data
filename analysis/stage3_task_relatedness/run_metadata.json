@@ -1,0 +1,392 @@
+{
+  "defaults": {
+    "pressure_kPa": {
+      "tasks": [
+        "experiment/density",
+        "experiment/electrical_conductivity",
+        "experiment/heat_capacity",
+        "experiment/refractive_index",
+        "experiment/thermal_conductivity",
+        "experiment/viscosity"
+      ],
+      "value": 101.325
+    },
+    "wavelength_nm": {
+      "tasks": [
+        "experiment/refractive_index"
+      ],
+      "value": 589.0
+    }
+  },
+  "input_files": {
+    "experiment/density": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/density.csv",
+      "property": "density_g/cm^3",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 100579,
+      "sha256": "bd9e107e8bb8124df4d13cf262a8b17203282df99869fdb5f857395d87a4f73d",
+      "topology": "il"
+    },
+    "experiment/dynamic_relative_permittivity": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa",
+        "frequency_MHz"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/dynamic_relative_permittivity.csv",
+      "property": "dynamic_relative_permittivity_unitless",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 882,
+      "sha256": "50d8d78e2e24dfb80b3bd3314fade5e0d978b2804fbb0126f0bcaa90d488b48e",
+      "topology": "il"
+    },
+    "experiment/electrical_conductivity": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/electrical_conductivity.csv",
+      "property": "electrical_conductivity_S/m_log10",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 9464,
+      "sha256": "69442cb38f8041d4b3e8e566725d4b75f64184c9aea1dfb76bc626154c2ac013",
+      "topology": "il"
+    },
+    "experiment/equilibrium_pressure": {
+      "conditions": [
+        "temperature_K"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/equilibrium_pressure.csv",
+      "property": "pressure_kPa_log10",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 2029,
+      "sha256": "bb8509bb4df189b94a52af326e0d09db4d449083894d437a8a27b672c2002015",
+      "topology": "il"
+    },
+    "experiment/glass_transition_temperature": {
+      "conditions": [],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/glass_transition_temperature.csv",
+      "property": "glass_transition_temperature_K",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 793,
+      "sha256": "0828605c06cf38e64afaae68302c6fed219ff37cad1efe01454a4a28f5b9c662",
+      "topology": "il"
+    },
+    "experiment/heat_capacity": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/heat_capacity.csv",
+      "property": "heat_capacity_J/mol/K",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 15215,
+      "sha256": "3171a135488e73b9509a87361b97ad8b05ef176e57c788b1e9af613e3181d75a",
+      "topology": "il"
+    },
+    "experiment/isobaric_coefficient_of_volume_expansion": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/isobaric_coefficient_of_volume_expansion.csv",
+      "property": "isobaric_coefficient_of_volume_expansion_K^-1",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 894,
+      "sha256": "088211f947b2ca6d21dfee71990577ac06672f8e0b235cc276edd084731fdf56",
+      "topology": "il"
+    },
+    "experiment/melting_point": {
+      "conditions": [],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/melting_point.csv",
+      "property": "melting_point_K",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 4688,
+      "sha256": "a296bf0a00ae9cba3efaf1ce61d382d4682f69e7ec06e7cf4f1a11d80f625245",
+      "topology": "il"
+    },
+    "experiment/pec50": {
+      "conditions": [],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/pec50.csv",
+      "property": "pEC50",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 330,
+      "sha256": "6f293f5fe7251dfb9602b4fbdbb216d026cc3cd5f7b6e59357bc054060eec1d3",
+      "topology": "il"
+    },
+    "experiment/refractive_index": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa",
+        "wavelength_nm"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/refractive_index.csv",
+      "property": "refractive_index_unitless",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 10764,
+      "sha256": "4b070c1a2c3bcc197fa0377baa424dd8c510ed3f50e3db755baec4807413637d",
+      "topology": "il"
+    },
+    "experiment/self_diffusion_coefficient": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/self_diffusion_coefficient.csv",
+      "property": "self_diffusion_coefficient_10^-9*m^2/s_log10",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 382,
+      "sha256": "498195bacb3d911a07211db590c86d89560ff4ca3075d4807fd2262a9c56883f",
+      "topology": "il"
+    },
+    "experiment/solvation": {
+      "conditions": [
+        "temperature_K"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/solvation.csv",
+      "property": "solvation_kcal/mol",
+      "roles": [
+        "cation",
+        "anion",
+        "solute"
+      ],
+      "rows": 23783,
+      "sha256": "10e896ee86f0f3e5b1e41c4229a3bc91f8690d781b7ce30248e9ad611f4e7ea4",
+      "topology": "il_solute"
+    },
+    "experiment/speed_of_sound": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/speed_of_sound.csv",
+      "property": "speed_of_sound_m/s",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 6819,
+      "sha256": "f64ab2b697a16ef402340f8d22191c55499b63d9d9feeccc756d61a4decd981a",
+      "topology": "il"
+    },
+    "experiment/static_relative_permittivity": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/static_relative_permittivity.csv",
+      "property": "static_relative_permittivity_unitless",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 65,
+      "sha256": "496316ba5b01894b0a0ca978be302d6806a6c7c6342ddddd1f8ad0440cf40c1d",
+      "topology": "il"
+    },
+    "experiment/surface_tension": {
+      "conditions": [
+        "temperature_K"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/surface_tension.csv",
+      "property": "surface_tension_mN/m",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 10142,
+      "sha256": "16adf6a3883186bda42e1d935dda8263f83fe1a5892050d1346805e72d8dd19d",
+      "topology": "il"
+    },
+    "experiment/thermal_conductivity": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/thermal_conductivity.csv",
+      "property": "thermal_conductivity_W/m/K",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 1540,
+      "sha256": "37dcf3cd65cf90f0241550d4b2bab762241dfbc2e7617813666f5d7ecc6338ff",
+      "topology": "il"
+    },
+    "experiment/thermal_decomposition_temperature": {
+      "conditions": [],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/thermal_decomposition_temperature.csv",
+      "property": "thermal_decomposition_temperature_K",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 2775,
+      "sha256": "ea220970238ad2afdff22f6bf6cecd31295e16ee10c5c4bd7655aafe65016069",
+      "topology": "il"
+    },
+    "experiment/transfer": {
+      "conditions": [
+        "temperature_K"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/transfer.csv",
+      "property": "transfer_kcal/mol",
+      "roles": [
+        "cation",
+        "anion",
+        "solute"
+      ],
+      "rows": 3079,
+      "sha256": "d45e0a658a43fc425b58e6de93e846869a33a3fc1ba0375e754b2c5aa712b095",
+      "topology": "il_solute"
+    },
+    "experiment/transfer_organic": {
+      "conditions": [
+        "temperature_K"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/transfer_organic.csv",
+      "property": "transfer_organic_kcal/mol",
+      "roles": [
+        "solute",
+        "solvent"
+      ],
+      "rows": 1914,
+      "sha256": "d626f1bca88e8f5146ba32bf401073215a15d8cb038aa9a1935643baf52020c6",
+      "topology": "solute_solvent"
+    },
+    "experiment/viscosity": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/viscosity.csv",
+      "property": "viscosity_mPa*s_log10",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 39941,
+      "sha256": "91d39fb0a17110f910674ba7d8b92b85b8a920d861cc024d6efb172bc0be6bb3",
+      "topology": "il"
+    },
+    "experiment/x_co2": {
+      "conditions": [
+        "temperature_K",
+        "pressure_kPa"
+      ],
+      "path": "/data/pengs/ILUME-Data/data/final/experiment/x_co2.csv",
+      "property": "x_CO2_unitless",
+      "roles": [
+        "cation",
+        "anion"
+      ],
+      "rows": 9536,
+      "sha256": "c5481c4ce7b4e758f30d2a8068f9711194cad375a918ff54c51ebf389d99e4d1",
+      "topology": "il"
+    }
+  },
+  "matching": {
+    "cross_task_tie_break": "lowest_original_target_row",
+    "many_to_one": true,
+    "neighbors_per_query": 1,
+    "same_task_policy": "skipped; diagonal matrix entries are NaN",
+    "threshold_enabled": false,
+    "topology_policy": "exact_role_tuple_only"
+  },
+  "similarity": {
+    "chemistry_weight": 0.7,
+    "condition_aggregation": "arithmetic_mean_of_applicable_dimensions",
+    "condition_weight": 0.3,
+    "fingerprint": {
+      "bits": 2048,
+      "metric": "Tanimoto",
+      "radius": 2,
+      "system_aggregation": "geometric_mean_by_role",
+      "type": "Morgan/ECFP4"
+    },
+    "log1p_conditions": [
+      "frequency_MHz",
+      "pressure_kPa",
+      "wavelength_nm"
+    ],
+    "missing_condition_similarity": 0.5,
+    "numeric_condition_scales": {
+      "frequency_MHz": 0.9653931862924292,
+      "pressure_kPa": 2.890119085888352,
+      "temperature_K": 85.36749999999995,
+      "wavelength_nm": 0.2853810051395351
+    },
+    "numeric_condition_similarity": "2 ** (-absolute_distance / scale)",
+    "phase_normalization": "strip and casefold",
+    "scale_estimator": "IQR of unique transformed values; full-range fallback",
+    "threshold": null
+  },
+  "task_count": 21,
+  "task_order": [
+    "experiment/density",
+    "experiment/dynamic_relative_permittivity",
+    "experiment/electrical_conductivity",
+    "experiment/equilibrium_pressure",
+    "experiment/glass_transition_temperature",
+    "experiment/heat_capacity",
+    "experiment/isobaric_coefficient_of_volume_expansion",
+    "experiment/melting_point",
+    "experiment/pec50",
+    "experiment/refractive_index",
+    "experiment/self_diffusion_coefficient",
+    "experiment/solvation",
+    "experiment/speed_of_sound",
+    "experiment/static_relative_permittivity",
+    "experiment/surface_tension",
+    "experiment/thermal_conductivity",
+    "experiment/thermal_decomposition_temperature",
+    "experiment/transfer",
+    "experiment/transfer_organic",
+    "experiment/viscosity",
+    "experiment/x_co2"
+  ],
+  "versions": {
+    "numpy": "2.4.3",
+    "pandas": "3.0.2",
+    "python": "3.12.12",
+    "rdkit": "2025.09.5",
+    "scipy": "1.16.2"
+  }
+}
