@@ -8,10 +8,17 @@ import platform
 import sys
 from pathlib import Path
 
+import matplotlib
 import numpy as np
 import pandas as pd
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import networkx as nx
 import scipy
 import sklearn
+from matplotlib.lines import Line2D
 from scipy.optimize import least_squares
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -24,8 +31,8 @@ from sklearn.preprocessing import SplineTransformer, StandardScaler
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "configs/dataset_relationship_formulas_v1.json"
-METRICS = ("spearman", "distance_correlation", "binary_mi",
-           "binary_i_over_h", "multiclass_mi", "predictability_cv_nmae")
+METRICS = ("spearman", "distance_correlation", "binary_i_over_h",
+           "multiclass_mi", "predictability_cv_nmae")
 SYMMETRIC = set(METRICS) - {"binary_i_over_h", "predictability_cv_nmae"}
 FORMULAS = {"linear_temperature", "linear_temperature_pressure", "log_density",
             "vft", "cauchy", "inverse_temperature", "solute_linear_temperature",
@@ -422,11 +429,11 @@ def metric_values(x, y, thresholds=(None, None)):
     if n >= 2:
         lx = x > (np.median(x) if thresholds[0] is None else thresholds[0])
         ly = y > (np.median(y) if thresholds[1] is None else thresholds[1])
-        values["binary_mi"] = float(mutual_info_score(lx, ly)); reasons["binary_mi"] = "ok"
+        binary_mi = float(mutual_info_score(lx, ly))
         h = entropy(ly)
         reasons["binary_i_over_h"] = "zero_target_entropy" if h == 0 else "ok"
         if h:
-            values["binary_i_over_h"] = values["binary_mi"] / h
+            values["binary_i_over_h"] = binary_mi / h
     for metric, minimum in (("spearman", 3), ("distance_correlation", 5)):
         if n >= minimum:
             reasons[metric] = "constant_signature" if constant else "ok"
@@ -518,10 +525,197 @@ def write_csv(frame, path):
     frame.to_csv(path, index=False, na_rep="NA")
 
 
-def compute_graphs(nodes, signatures, config, out, seed):
+def dataset_labels(nodes):
+    included = [node for node in nodes if not node["excluded_reason"]]
+    source_counts = pd.Series([node["source_dataset"] for node in included]).value_counts()
+    labels = {}
+    for node in included:
+        base = Path(node["source_dataset"]).with_suffix("").as_posix()
+        if source_counts[node["source_dataset"]] > 1:
+            base += f"::{node['target_property']}"
+        labels[node["node_id"]] = base
+    if len(set(labels.values())) != len(labels):
+        raise ValueError("Dataset display labels are not unique")
+    return labels
+
+
+def write_overlap_outputs(matrix, labels, directory, dpi):
+    display = matrix.rename(index=labels, columns=labels)
+    display.rename_axis("source_dataset").to_csv(
+        directory / "signature_overlap_matrix.csv", na_rep="NA"
+    )
+
+    height = max(4.5, 0.48 * len(display.index) + 2.4)
+    width = max(6.5, 0.48 * len(display.columns) + 3.2)
+    figure, axis = plt.subplots(figsize=(width, height))
+    values = display.to_numpy(float)
+    masked = np.ma.masked_invalid(values)
+    palette = plt.get_cmap("YlGnBu").copy()
+    palette.set_bad("white")
+    finite = values[np.isfinite(values)]
+    maximum = max(1., float(finite.max())) if finite.size else 1.
+    image = axis.imshow(masked, cmap=palette, vmin=0, vmax=maximum, aspect="auto")
+    axis.set_xticks(range(len(display.columns)), display.columns, rotation=45, ha="right")
+    axis.set_yticks(range(len(display.index)), display.index)
+    axis.set_xlabel("Target dataset")
+    axis.set_ylabel("Source dataset")
+    axis.set_title("Shared valid system signatures")
+    for row in range(values.shape[0]):
+        for column in range(values.shape[1]):
+            if np.isfinite(values[row, column]):
+                color = "white" if values[row, column] > maximum * 0.55 else "black"
+                axis.text(column, row, str(int(values[row, column])), ha="center", va="center",
+                          color=color, fontsize=7)
+    figure.colorbar(image, ax=axis, label="N_shared")
+    figure.tight_layout()
+    figure.savefig(directory / "signature_overlap_heatmap.png", dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+
+
+def knowledge_graph_edges(metric, graph_results):
+    symmetric = metric in SYMMETRIC
+    edges = []
+    for group_name, result in graph_results.items():
+        pairs = result["pairs"]
+        confidence = result["confidence"]
+        p_values = {(row.source, row.target, row.metric): row.permutation_p
+                    for row in confidence.itertuples()
+                    if hasattr(row, "permutation_p")}
+        for row in pairs.itertuples():
+            value = getattr(row, metric)
+            if not np.isfinite(value):
+                continue
+            if symmetric and group_name == "G_EE" and row.source > row.target:
+                continue
+            p_value = p_values.get((row.source, row.target, metric), np.nan)
+            edges.append({"source": row.source, "target": row.target, "value": float(value),
+                          "permutation_p": float(p_value) if np.isfinite(p_value) else np.nan,
+                          "significant": bool(np.isfinite(p_value) and p_value <= .05),
+                          "negative": bool(metric == "spearman" and value < 0),
+                          "group": group_name})
+    return edges
+
+
+def build_knowledge_graph(metric, nodes, graph_results, labels):
+    graph = nx.Graph() if metric in SYMMETRIC else nx.DiGraph()
+    for node in nodes:
+        graph.add_node(node["node_id"], stage=node["stage"], label=labels[node["node_id"]])
+    for edge in knowledge_graph_edges(metric, graph_results):
+        graph.add_edge(edge.pop("source"), edge.pop("target"), **edge)
+    return graph
+
+
+def edge_strength(metric, value):
+    if metric == "spearman":
+        return abs(value)
+    if metric == "predictability_cv_nmae":
+        return 1 / (1 + value)
+    return value
+
+
+def edge_widths(metric, edges):
+    strengths = np.asarray([edge_strength(metric, data["value"]) for _, _, data in edges], float)
+    if not len(strengths):
+        return []
+    if np.ptp(strengths) == 0:
+        return [2.] * len(strengths)
+    return (0.6 + 3.4 * (strengths - strengths.min()) / np.ptp(strengths)).tolist()
+
+
+def draw_knowledge_graph(graph, metric, positions, path, dpi):
+    figure, axis = plt.subplots(figsize=(16, 13))
+    for stage, marker, color in ((2, "s", "#377EB8"), (3, "o", "#FF9F1C")):
+        node_list = [node for node, data in graph.nodes(data=True) if data["stage"] == stage]
+        nx.draw_networkx_nodes(graph, positions, nodelist=node_list, node_shape=marker,
+                               node_color=color, node_size=720, edgecolors="white",
+                               linewidths=1.2, ax=axis)
+    labels = {node: data["label"] for node, data in graph.nodes(data=True)}
+    nx.draw_networkx_labels(graph, positions, labels=labels, font_size=7, ax=axis)
+
+    all_edges = list(graph.edges(data=True))
+    widths = edge_widths(metric, all_edges)
+    for significant in (False, True):
+        for negative in ((False, True) if metric == "spearman" else (False,)):
+            selected = [(edge, width) for edge, width in zip(all_edges, widths)
+                        if edge[2]["significant"] == significant
+                        and edge[2]["negative"] == negative]
+            if not selected:
+                continue
+            edge_list = [(source, target) for (source, target, _), _ in selected]
+            edge_width = [width for _, width in selected]
+            draw_options = {
+                "edgelist": edge_list, "width": edge_width,
+                "edge_color": "#D62728" if significant else "#A7ADB5",
+                "alpha": .88 if significant else .28,
+                "style": "dashed" if negative else "solid", "ax": axis,
+            }
+            if graph.is_directed():
+                draw_options.update(arrows=True, arrowstyle="-|>", arrowsize=12,
+                                    connectionstyle="arc3,rad=0.08",
+                                    min_source_margin=10, min_target_margin=10)
+            nx.draw_networkx_edges(graph, positions, **draw_options)
+    legend = [
+        Line2D([0], [0], marker="s", color="none", markerfacecolor="#377EB8",
+               markeredgecolor="white", markersize=10, label="Stage2 simulation"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#FF9F1C",
+               markeredgecolor="white", markersize=10, label="Stage3 experiment"),
+        Line2D([0], [0], color="#D62728", linewidth=2, label="Permutation p ≤ 0.05"),
+        Line2D([0], [0], color="#A7ADB5", linewidth=2, label="Not significant / unavailable p"),
+    ]
+    if metric == "spearman":
+        legend.extend([
+            Line2D([0], [0], color="#555555", linestyle="solid", label="Positive correlation"),
+            Line2D([0], [0], color="#555555", linestyle="dashed", label="Negative correlation"),
+        ])
+    axis.legend(handles=legend, loc="upper left", frameon=True, fontsize=8)
+    axis.set_title(metric.replace("_", " ").title())
+    axis.set_axis_off()
+    figure.tight_layout()
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+
+
+def shared_spring_layout(graph, seed):
+    components = sorted(nx.connected_components(graph), key=lambda values: (-len(values), sorted(values)))
+    positions = {}
+    main = graph.subgraph(components[0])
+    main_positions = nx.spring_layout(main, seed=seed, weight=None, iterations=500,
+                                      k=max(.4, 2 / np.sqrt(len(main))))
+    positions.update(nx.rescale_layout_dict(main_positions, scale=1.))
+    for index, component in enumerate(components[1:]):
+        subgraph = graph.subgraph(component)
+        if len(component) == 1:
+            component_positions = {next(iter(component)): np.zeros(2)}
+        else:
+            component_positions = nx.spring_layout(subgraph, seed=stable_seed(seed, "component", index),
+                                                   weight=None, iterations=500, scale=.25)
+        center = np.array([1.35, .8 - .4 * index])
+        positions.update({node: np.asarray(point) + center
+                          for node, point in component_positions.items()})
+    return positions
+
+
+def render_knowledge_graphs(nodes, graph_results, labels, out, seed, dpi):
+    graphs = {metric: build_knowledge_graph(metric, nodes, graph_results, labels)
+              for metric in METRICS}
+    layout_graph = nx.Graph()
+    layout_graph.add_nodes_from(node["node_id"] for node in nodes)
+    for graph in graphs.values():
+        layout_graph.add_edges_from(graph.edges())
+    positions = shared_spring_layout(layout_graph, seed)
+    directory = out / "knowledge_graphs"
+    directory.mkdir()
+    for metric, graph in graphs.items():
+        draw_knowledge_graph(graph, metric, positions, directory / f"{metric}.png", dpi)
+    return graphs, positions
+
+
+def compute_graphs(nodes, signatures, config, out, seed, dpi=300):
     included = [n for n in nodes if not n["excluded_reason"]]
+    labels = dataset_labels(nodes)
     groups = {s: [n for n in included if n["stage"] == s] for s in (2, 3)}
     data = {}
+    graph_results = {}
     for node in included:
         rows = signatures.loc[signatures.node_id == node["node_id"]]
         valid = rows.loc[np.isfinite(rows.signature)].set_index("system")
@@ -594,12 +788,17 @@ def compute_graphs(nodes, signatures, config, out, seed):
                 confidence.extend(dict(source=bid, target=aid, **r) for r in reverse_conf if r["metric"] not in SYMMETRIC)
         for m, matrix in matrices.items():
             matrix.rename_axis("source_node").to_csv(directory / f"{m}.csv", na_rep="NA")
-        write_csv(pd.DataFrame(pairs), directory / "pairs.csv")
-        write_csv(pd.DataFrame(confidence), directory / "confidence.csv")
+        write_overlap_outputs(matrices["n_shared"], labels, directory, dpi)
+        pair_frame = pd.DataFrame(pairs)
+        confidence_frame = pd.DataFrame(confidence)
+        write_csv(pair_frame, directory / "pairs.csv")
+        write_csv(confidence_frame, directory / "confidence.csv")
         write_csv(pd.DataFrame(reasons), directory / "na_reasons.csv")
+        graph_results[name] = {"pairs": pair_frame, "confidence": confidence_frame}
+    render_knowledge_graphs(included, graph_results, labels, out, seed, dpi)
 
 
-def run(command, input_root, output_dir, config_path=DEFAULT_CONFIG, seed=42):
+def run(command, input_root, output_dir, config_path=DEFAULT_CONFIG, seed=42, dpi=300):
     out = Path(output_dir)
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"Output directory is nonempty; refusing overwrite: {out}")
@@ -619,7 +818,9 @@ def run(command, input_root, output_dir, config_path=DEFAULT_CONFIG, seed=42):
                 "input_hashes": inputs, "config": config, "config_sha256": file_hash(config_path),
                 "script_sha256": file_hash(__file__),
                 "versions": {"python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__,
-                             "scipy": scipy.__version__, "sklearn": sklearn.__version__},
+                             "scipy": scipy.__version__, "sklearn": sklearn.__version__,
+                             "matplotlib": matplotlib.__version__, "networkx": nx.__version__},
+                "dpi": dpi,
                 "confidence_scope": "conditional_on_signatures; excludes full signature estimation uncertainty",
                 "cv_interval": "split stability, not parameter confidence interval",
                 "arrow_meaning": "prediction, not causation"}
@@ -627,13 +828,16 @@ def run(command, input_root, output_dir, config_path=DEFAULT_CONFIG, seed=42):
     path.write_text(json.dumps(manifest, indent=2))
     try:
         if command == "compute":
-            compute_graphs(nodes, signatures, config, out, seed)
+            compute_graphs(nodes, signatures, config, out, seed, dpi)
     except BaseException as exc:
         manifest.update(status="failed", error=str(exc))
         path.write_text(json.dumps(manifest, indent=2))
         raise
     manifest["status"] = "complete"
-    manifest["output_hashes"] = {str(p.relative_to(out)): file_hash(p) for p in sorted(out.rglob("*.csv"))}
+    manifest["output_hashes"] = {
+        str(p.relative_to(out)): file_hash(p)
+        for p in sorted(out.rglob("*")) if p.is_file() and p.suffix in {".csv", ".png"}
+    }
     path.write_text(json.dumps(manifest, indent=2))
     return out
 
@@ -647,8 +851,11 @@ def main():
         p.add_argument("--output-dir", type=Path, required=True)
         p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
         p.add_argument("--seed", type=int, default=42)
+        if name == "compute":
+            p.add_argument("--dpi", type=int, default=300)
     args = parser.parse_args()
-    run(args.command, args.input_root, args.output_dir, args.config, args.seed)
+    run(args.command, args.input_root, args.output_dir, args.config, args.seed,
+        getattr(args, "dpi", 300))
 
 
 if __name__ == "__main__":

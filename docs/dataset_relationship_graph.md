@@ -3,7 +3,8 @@
 This independent analysis reads development labels from `data/training_splits`.
 It does not change splits, training, groups, or existing analyses. Arrows describe
 prediction, not causation. No Stage2–Stage2 matrix, chemical matching, clustering,
-plots, or aggregate relationship score is produced.
+or aggregate relationship score is produced. Visualizations report the existing
+overlap and relationship values; they do not define another metric.
 
 From the repository root, using an environment with `requirements.txt` installed:
 
@@ -14,7 +15,7 @@ python scripts/analyze_dataset_relationship_graph.py audit \
 
 python scripts/analyze_dataset_relationship_graph.py compute \
   --input-root data/training_splits \
-  --output-dir data/analysis/relationship_compute_v1 --seed 42
+  --output-dir data/analysis/relationship_compute_v1 --seed 42 --dpi 300
 ```
 
 Each output directory must be new or empty and outside the input tree. `compute`
@@ -83,7 +84,6 @@ experiment only. Continuous z-scores use ddof=0.
 |---|---:|---|
 | Spearman | 3 | Rank correlation; constants are NA |
 | Distance correlation | 5 | Biased doubly centered distance-matrix estimator |
-| Binary MI | 2 | Natural-log MI, high class is strictly above pair median |
 | Binary I/H | 2 | MI divided by target-label entropy; zero entropy is NA |
 | Multiclass MI | 30 | 3 bins at 30, 4 at 80, 5 at 150; pair quantiles |
 | CV-NMAE | 20 | Model OOF absolute error divided by training-median baseline OOF absolute error |
@@ -91,14 +91,11 @@ experiment only. Continuous z-scores use ddof=0.
 `binary_thresholds` is empty in the approved config; optional entries are keyed
 by exact node ID and must use the signature's units. Otherwise each side uses
 its own median on the current shared subset. Degenerate quantile cuts do not
-fall back to fewer bins. MI uses two discrete resolutions (binary and multiclass)
-and directed normalized MI (`I/H`), all with natural logarithms; these do not
-measure complete continuous mutual information.
+fall back to fewer bins. Both MI metrics use natural logarithms and discrete pair-specific labels,
+not complete continuous mutual information.
 
-Continuous KSG MI was intentionally removed because its nearest-neighbor estimator
-and ordinary paired bootstrap were incompatible in the current auditable pipeline.
-Dependency evidence is retained through Spearman, distance correlation, binary MI,
-multiclass MI, directed I/H, and CV-NMAE.
+Continuous KSG MI is excluded: its nearest-neighbor estimator is incompatible
+with ordinary paired bootstrap in this pipeline.
 
 Predictability uses StandardScaler, SplineTransformer(degree=3, n_knots=3), and
 Ridge(alpha=1), all fitted within each of five shuffled training folds. At least
@@ -128,15 +125,27 @@ files, fitted parameters, actual/requested conditions, uncertainty, residual deg
 of freedom and status. Inventory counts expose invalid observations.
 
 `G_EE/` and `G_SE/` contain one CSV per metric, both count matrices, `pairs.csv`,
-`na_reasons.csv`, and `confidence.csv`. Rows are sources and columns are targets.
+`na_reasons.csv`, and `confidence.csv`. Each also contains
+`signature_overlap_matrix.csv`, whose short labels omit `.csv` and disambiguate
+multi-target sources, plus an integer-annotated `signature_overlap_heatmap.png`.
+Rows are sources and columns are targets.
 EE symmetric values and their confidence rows are mirrored exactly. Pair records
 include exact shared systems and flags for mixed signature kinds, reference
 mismatches, heterogeneous actual conditions, extrapolation and pending formulas.
 These flags are not automatic filters: inspect them before interpreting metrics.
 Missing numeric values are serialized as `NA`; statuses explain why.
 
+`knowledge_graphs/` contains one combined EE+SE PNG for each of the five metrics.
+All finite relationships are drawn. Raw permutation p-values at or below 0.05
+are highlighted; other edges remain gray. Symmetric metrics use undirected edges,
+while I/H and CV-NMAE retain their legal directions. All figures use the same
+seeded spring layout. Edge color is descriptive and is not an FDR-adjusted decision.
+Spearman uses solid positive and dashed negative edges. Edge width represents
+absolute Spearman, the raw nonnegative dCor/I/H/multiclass value, or
+`1/(1+CV-NMAE)`, rescaled independently within each figure.
+
 `manifest.json` records input/config/script hashes, dependency versions, seed,
-settings, output CSV hashes and completion/failure status. Treat a running or
+settings, output CSV/PNG hashes and completion/failure status. Treat a running or
 failed manifest as incomplete output. No source data is modified.
 
 Validation:

@@ -3,13 +3,13 @@
 - Status: Accepted
 - Date: 2026-08-17
 
-> The role-oriented multi-target orbital and split clauses are superseded by [ADR 0004](0004-stage2-homo-lumo-scalar-tasks.md). The remaining producer contract stays in force.
+> The role-oriented multi-target orbital and split clauses are superseded by [ADR 0004](0004-stage2-homo-lumo-scalar-tasks.md). Current partition rules are summarized in the [README](../../README.md#identity-and-partitions). Consumer migration statements below describe the decision date, not current downstream status.
 
 ## Context
 
 The split pipeline previously routed only five whitelisted simulation files to Stage2. Other simulation outputs, including single-ion orbitals, total-charge metadata, and heat of vaporization, fell through to the experiment-oriented Stage3 workflow. HOMO and LUMO were also split into independent tasks, and `charge.csv` was treated as a scalar total-charge label even though its associated MOL2 resources contain the intended atom-level supervision.
 
-ILUME-Data must publish one unambiguous producer contract without parsing structure chemistry or defining model atom indices. The current ILUME consumer remains hard-coded to the old five-task contract, so producer and consumer migration cannot be presented as one compatible release.
+ILUME-Data must publish one unambiguous producer contract without parsing structure chemistry or defining model atom indices. At the decision date, the ILUME consumer was hard-coded to the old five-task contract, so producer and consumer migration cannot be presented as one compatible release.
 
 ## Decision
 
@@ -42,7 +42,7 @@ Limitations:
 - Gap mismatches do not block publication.
 - Missing structure references reduce the partial-charge task instead of failing the full build.
 - Each split build duplicates the complete structure resource, increasing publication time and disk usage.
-- The current ILUME Stage2 code cannot consume this contract; its catalog-driven migration is a separate architectural change.
+- At the decision date, ILUME Stage2 could not consume this contract; catalog-driven migration required a separate architectural change.
 
 ## Alternatives considered
 

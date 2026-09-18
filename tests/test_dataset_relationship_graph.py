@@ -4,13 +4,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib import image as mpl_image
 
 from scripts import analyze_dataset_relationship_graph as graph
 
 
 EXPECTED_METRICS = {
-    'spearman', 'distance_correlation', 'binary_mi', 'binary_i_over_h',
-    'multiclass_mi', 'predictability_cv_nmae',
+    'spearman', 'distance_correlation', 'binary_i_over_h', 'multiclass_mi',
+    'predictability_cv_nmae',
 }
 
 
@@ -100,15 +101,16 @@ def test_metrics_symmetry_pair_bins_small_and_ties():
     for m in graph.SYMMETRIC:
         assert a[m]==pytest.approx(b[m])
     small,states=graph.metric_values(np.array([1.,2]),np.array([3.,4]))
-    assert small['binary_mi']==pytest.approx(np.log(2))
+    assert small['binary_i_over_h']==pytest.approx(1)
+    assert 'binary_mi' not in small
     assert states['spearman']=='insufficient_samples'
     vals,states=graph.metric_values(np.ones(30),np.ones(30))
-    assert vals['binary_mi']==0 and states['binary_i_over_h']=='zero_target_entropy'
+    assert np.isnan(vals['binary_i_over_h']) and states['binary_i_over_h']=='zero_target_entropy'
     assert states['multiclass_mi']=='degenerate_quantile_bins'
     _,states=graph.metric_values(np.array([]),np.array([]))
     assert set(states.values())=={'no_shared_signatures'}
     first,_=graph.metric_values(np.arange(30.),np.arange(30.))
-    assert first['binary_mi']==pytest.approx(np.log(2))
+    assert first['binary_i_over_h']==pytest.approx(1)
     assert graph.quantile_labels(np.ones(30),3) is None
 
 
@@ -166,7 +168,7 @@ def test_discovery_and_end_to_end(tmp_path,config):
     assert not set(sig.cation)&{'TEST','REPEAT'}
     assert inv.excluded_reason.eq('excluded_non_il_identity').sum()==2
     out=tmp_path/'results';out.mkdir()
-    graph.compute_graphs(nodes,sig,config,out,42)
+    graph.compute_graphs(nodes,sig,config,out,42,dpi=30)
     ee=pd.read_csv(out/'G_EE/n_shared.csv',index_col=0)
     assert ee.shape==(2,2)
     assert ee.iloc[0,0]==5
@@ -177,36 +179,60 @@ def test_discovery_and_end_to_end(tmp_path,config):
         directory = out/name
         expected_files = {f'{m}.csv' for m in EXPECTED_METRICS} | {
             'n_shared.csv', 'n_observation_shared.csv', 'pairs.csv', 'confidence.csv', 'na_reasons.csv',
+            'signature_overlap_matrix.csv', 'signature_overlap_heatmap.png',
         }
         assert {p.name for p in directory.iterdir()} == expected_files
+        overlap = pd.read_csv(directory/'signature_overlap_matrix.csv', index_col=0)
+        expected_index = ({'experiment/b', 'experiment/c'} if name == 'G_EE'
+                          else {'simulation/a::a', 'simulation/a::b'})
+        assert set(overlap.index) == expected_index
+        assert set(overlap.columns) == {'experiment/b', 'experiment/c'}
+        expected_overlap = ee.to_numpy() if name == 'G_EE' else se.to_numpy()
+        assert np.array_equal(overlap.to_numpy(), expected_overlap)
+        assert mpl_image.imread(directory/'signature_overlap_heatmap.png').size > 0
         pairs = pd.read_csv(directory/'pairs.csv')
         assert {c[:-7] for c in pairs if c.endswith('_status')} == EXPECTED_METRICS
         assert set(pairs.columns) & EXPECTED_METRICS == EXPECTED_METRICS
         assert not any(c.startswith('continuous_mi') for c in pairs)
+        assert not any(c.startswith('binary_mi') for c in pairs)
         assert set(pd.read_csv(directory/'confidence.csv').metric) == EXPECTED_METRICS
         assert set(pd.read_csv(directory/'na_reasons.csv').metric) <= EXPECTED_METRICS
+    knowledge = out/'knowledge_graphs'
+    assert {p.name for p in knowledge.iterdir()} == {f'{metric}.png' for metric in EXPECTED_METRICS}
+    assert all(mpl_image.imread(path).size > 0 for path in knowledge.iterdir())
     assert not (out/'G_SS').exists()
     cp=tmp_path/'config.json';cp.write_text(json.dumps(config))
     audit=tmp_path/'audit';graph.run('audit',root,audit,cp)
     assert json.loads((audit/'manifest.json').read_text())['status']=='complete'
+    assert not (audit/'knowledge_graphs').exists()
+    computed=tmp_path/'computed';graph.run('compute',root,computed,cp,dpi=30)
+    manifest=json.loads((computed/'manifest.json').read_text())
+    assert manifest['dpi']==30
+    assert set(manifest['output_hashes']) == {
+        str(path.relative_to(computed)) for path in computed.rglob('*')
+        if path.is_file() and path.suffix in {'.csv', '.png'}
+    }
     with pytest.raises(ValueError,match='nonempty'):
         graph.run('audit',root,audit,cp)
 
 
 def test_discrete_mi_stability_and_degenerate_reporting(config):
-    x=np.arange(30.);y=np.ones(30)
+    x=np.arange(30.);y=np.arange(30.)
     vals,_=graph.metric_values(x,y)
     settings=dict(config['stability'],bootstrap=3,permutation=2,cv_repeats=2,cv_permutation=2)
     rows=graph.confidence_rows(x,y,vals,(None,None),42,settings)
-    mi=next(r for r in rows if r['metric']=='binary_mi')
-    assert vals['binary_mi'] == 0
+    mi=next(r for r in rows if r['metric']=='binary_i_over_h')
+    assert vals['binary_i_over_h'] == pytest.approx(1)
     assert mi['status']=='insufficient_valid_bootstrap'
     assert mi['bootstrap_valid']==3 and mi['bootstrap_failed']==0
-    assert mi['permutation_valid']==2 and mi['permutation_p']==1
-    for metric in ('binary_i_over_h', 'multiclass_mi'):
-        assert next(r for r in rows if r['metric']==metric)['status']=='metric_unavailable'
+    assert mi['permutation_valid']==2
+    assert next(r for r in rows if r['metric']=='multiclass_mi')['bootstrap_valid']==3
     assert {r['metric'] for r in rows} == EXPECTED_METRICS
     assert rows==graph.confidence_rows(x,y,vals,(None,None),42,settings)
+
+    constant,_=graph.metric_values(x,np.ones(30))
+    unavailable=graph.confidence_rows(x,np.ones(30),constant,(None,None),42,settings)
+    assert next(r for r in unavailable if r['metric']=='binary_i_over_h')['status']=='metric_unavailable'
 
 
 @pytest.mark.parametrize('n,bins,counts', [
@@ -231,12 +257,52 @@ def test_binary_threshold_and_directed_normalization():
     reverse,_=graph.metric_values(y,x)
     expected_mi=.5*np.log(4/3)+.25*np.log(2/3)+.25*np.log(2)
     target_entropy=-.75*np.log(.75)-.25*np.log(.25)
-    assert values['binary_mi']==pytest.approx(expected_mi)
-    assert reverse['binary_mi']==pytest.approx(expected_mi)
     assert values['binary_i_over_h']==pytest.approx(expected_mi/target_entropy)
     assert reverse['binary_i_over_h']==pytest.approx(expected_mi/np.log(2))
     threshold_values,_=graph.metric_values(x,y,(100.,None))
-    assert threshold_values['binary_mi']==0 and threshold_values['binary_i_over_h']==0
+    assert threshold_values['binary_i_over_h']==0
+
+
+def test_knowledge_graph_direction_significance_and_strength():
+    nodes = [
+        {'node_id': 's', 'stage': 2, 'excluded_reason': ''},
+        {'node_id': 'e1', 'stage': 3, 'excluded_reason': ''},
+        {'node_id': 'e2', 'stage': 3, 'excluded_reason': ''},
+    ]
+    labels = {'s': 'simulation/s', 'e1': 'experiment/e1', 'e2': 'experiment/e2'}
+    columns = {
+        'spearman': [-.5, -.5], 'distance_correlation': [.6, .6],
+        'binary_i_over_h': [.2, .3], 'multiclass_mi': [.4, .4],
+        'predictability_cv_nmae': [.25, 2.],
+    }
+    ee_pairs = pd.DataFrame({'source': ['e1', 'e2'], 'target': ['e2', 'e1'], **columns})
+    se_pairs = pd.DataFrame({'source': ['s'], 'target': ['e1'],
+                             **{metric: [values[0]] for metric, values in columns.items()}})
+    confidence = pd.DataFrame([
+        {'source': source, 'target': target, 'metric': metric,
+         'permutation_p': .01 if source == 's' else .2}
+        for source, target in [('e1', 'e2'), ('e2', 'e1'), ('s', 'e1')]
+        for metric in EXPECTED_METRICS
+    ])
+    count = len(EXPECTED_METRICS)
+    results = {
+        'G_EE': {'pairs': ee_pairs, 'confidence': confidence.iloc[:2 * count]},
+        'G_SE': {'pairs': se_pairs, 'confidence': confidence.iloc[2 * count:]},
+    }
+    spearman = graph.build_knowledge_graph('spearman', nodes, results, labels)
+    assert not spearman.is_directed() and set(spearman.edges()) == {('s', 'e1'), ('e1', 'e2')}
+    assert spearman['s']['e1']['significant']
+    assert spearman['e1']['e2']['negative']
+    directed = graph.build_knowledge_graph('binary_i_over_h', nodes, results, labels)
+    assert directed.is_directed()
+    assert set(directed.edges()) == {('s', 'e1'), ('e1', 'e2'), ('e2', 'e1')}
+    positions = graph.shared_spring_layout(spearman, 42)
+    repeated = graph.shared_spring_layout(spearman, 42)
+    assert all(np.array_equal(positions[node], repeated[node]) for node in positions)
+    widths = graph.edge_widths('predictability_cv_nmae', [
+        ('a', 'b', {'value': .25}), ('a', 'c', {'value': 2.}),
+    ])
+    assert widths[0] > widths[1]
 
 
 def test_nmae_is_oof_median_error_ratio(monkeypatch):
@@ -261,7 +327,7 @@ def test_pending_signatures_preserve_observation_overlap(tmp_path, config):
                                                         'temperature_K':[300.,320.], 'y':[1.,2.]})))
     _, _, sig, _ = graph.build_signatures(nodes, config)
     out=tmp_path/'graph';out.mkdir()
-    graph.compute_graphs(nodes, sig, config, out, 42)
+    graph.compute_graphs(nodes, sig, config, out, 42, dpi=30)
     assert pd.read_csv(out/'G_SE/n_shared.csv',index_col=0).iloc[0,0] == 0
     assert pd.read_csv(out/'G_SE/n_observation_shared.csv',index_col=0).iloc[0,0] == 1
     for metric in graph.METRICS:
