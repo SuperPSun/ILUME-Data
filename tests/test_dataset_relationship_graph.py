@@ -66,6 +66,49 @@ def test_inverse_and_cauchy(config):
     assert graph.fit_signature(d, 'cauchy', refs)['signature'] == pytest.approx(1.4)
 
 
+def test_reference_frequency_and_x_co2_formulas(config):
+    refs = config['references']
+    dynamic = pd.DataFrame({
+        '_value': [8., 6., 99.], 'frequency_MHz': [10000., 10000., 9000.],
+        'temperature_K': [298.15, 298.15, 298.15],
+        'pressure_kPa': [101.325, 101.325, 101.325],
+    })
+    fit = graph.fit_signature(dynamic, 'reference_frequency_10ghz', refs)
+    assert fit['signature'] == 7
+    assert fit['fit_method'] == 'reference_frequency_median'
+    missing = graph.fit_signature(dynamic.iloc[[2]], 'reference_frequency_10ghz', refs)
+    assert missing['status'] == 'missing_reference_frequency'
+    assert np.isnan(missing['signature'])
+
+    temperature = np.array([285., 300., 320., 340., 300., 330.])
+    pressure = np.array([100., 250., 140., 400., 500., 220.])
+    a, b, c = 10., 800., .015
+    transformed = a + b * (1 / temperature - 1 / refs['temperature_K']) \
+        + c * (pressure - refs['pressure_kPa']) / temperature
+    x_co2 = pressure * np.exp(-transformed)
+    data = frame(x_co2, temperature, pressure)
+    fit = graph.fit_signature(data, 'x_co2_reference_solubility', refs)
+    assert fit['signature'] == pytest.approx(refs['pressure_kPa'] * np.exp(-a))
+    assert json.loads(fit['parameters']) == pytest.approx({
+        'a': a, 'b_inverse_temperature': b, 'c_pressure_over_temperature': c,
+    })
+    assert json.loads(fit['fit_quality'])['retained_terms'] == [
+        'b_inverse_temperature', 'c_pressure_over_temperature',
+    ]
+    invalid = frame([1.], [298.15], [101.325])
+    assert graph.fit_signature(invalid, 'x_co2_reference_solubility', refs)['status'] == 'invalid_x_co2'
+
+    collinear_temperature = np.array([290., 300., 310., 320.])
+    constant_pressure = np.full(4, 200.)
+    response = 9 + 500 * (1 / collinear_temperature - 1 / refs['temperature_K'])
+    collinear_x = constant_pressure * np.exp(-response)
+    fit = graph.fit_signature(frame(collinear_x, collinear_temperature, constant_pressure),
+                              'x_co2_reference_solubility', refs)
+    quality = json.loads(fit['fit_quality'])
+    assert quality['retained_terms'] == ['b_inverse_temperature']
+    assert quality['dropped_terms'] == ['c_pressure_over_temperature']
+
+
 def test_vft_recovery_and_insufficient(config):
     refs=config['references'];t=np.linspace(280,400,15)
     y=2+400*(1/(t-150)-1/(refs['temperature_K']-150))
@@ -74,6 +117,40 @@ def test_vft_recovery_and_insufficient(config):
     assert fit['signature']==pytest.approx(2,abs=1e-5)
     assert json.loads(fit['parameters'])['T0']==pytest.approx(150,abs=1e-3)
     assert graph.fit_signature(frame(y[:3],t[:3],[100]*3),'vft',refs)['status']=='insufficient_vft_design'
+
+
+def test_arrhenius_temperature_pressure_recovery(config):
+    refs = config['references']
+    temperature = np.array([280., 300., 320., 340., 360.])
+    pressure = np.array([100., 250., 120., 400., 180.])
+    y = 2.5 + 700 * (1 / temperature - 1 / refs['temperature_K']) \
+        + .002 * (pressure - refs['pressure_kPa'])
+    fit = graph.fit_signature(frame(y, temperature, pressure),
+                              'arrhenius_temperature_pressure', refs)
+    assert fit['signature'] == pytest.approx(2.5)
+    assert fit['status'] == 'ok'
+    assert json.loads(fit['parameters']) == pytest.approx({
+        'intercept': 2.5, 'temperature_K': 700., 'pressure_kPa': .002,
+    })
+    two_temperature = np.array([290., 310.])
+    two_y = 2.5 + 700 * (1 / two_temperature - 1 / refs['temperature_K'])
+    two_fit = graph.fit_signature(frame(two_y, two_temperature, [101.325, 101.325]),
+                                  'arrhenius_temperature_pressure', refs)
+    assert two_fit['signature'] == pytest.approx(2.5)
+    assert two_fit['residual_df'] == 0 and np.isnan(two_fit['uncertainty'])
+    ambiguous = graph.fit_signature(frame(two_y, two_temperature, [100., 200.]),
+                                    'arrhenius_temperature_pressure', refs)
+    assert ambiguous['status'] == 'insufficient_condition_design'
+    assert np.isnan(ambiguous['signature'])
+    selected = graph.fit_signature(
+        frame([-0.661544, -0.520857], [298.15, 313.], [100., 101.325]),
+        'arrhenius_temperature_pressure', refs)
+    assert selected['signature'] == pytest.approx(-0.661544)
+    assert selected['signature_kind'] == 'reference_temperature_observation'
+    assert selected['reference_mismatch']
+    for source in ('experiment/viscosity.csv', 'experiment/electrical_conductivity.csv',
+                   'experiment/self_diffusion_coefficient.csv'):
+        assert config['formulas'][source] == 'arrhenius_temperature_pressure'
 
 
 def test_solute_identification_and_components(config):
@@ -303,6 +380,47 @@ def test_knowledge_graph_direction_significance_and_strength():
         ('a', 'b', {'value': .25}), ('a', 'c', {'value': 2.}),
     ])
     assert widths[0] > widths[1]
+
+
+def test_solvation_transfer_uses_il_solute_identity(tmp_path, config):
+    nodes = [
+        {'node_id': 'sim', 'source_dataset': 'simulation/density.csv', 'target_property': 'x',
+         'stage': 2, 'excluded_reason': '', 'formula': 'linear_temperature'},
+        {'node_id': 'solvation', 'source_dataset': 'experiment/solvation.csv', 'target_property': 'x',
+         'stage': 3, 'excluded_reason': '', 'formula': 'solute_linear_temperature'},
+        {'node_id': 'transfer', 'source_dataset': 'experiment/transfer.csv', 'target_property': 'x',
+         'stage': 3, 'excluded_reason': '', 'formula': 'solute_only'},
+    ]
+    provenance = {'signature_kind': 'solute_controlled', 'reference_mismatch': False,
+                  'actual_reference': '{}', 'extrapolated': False}
+    signatures = pd.DataFrame([
+        {'node_id': 'sim', 'system': '["c", "a"]', 'signature': 3., **provenance},
+        {'node_id': 'solvation', 'system': '["c", "a"]', 'signature': 1., **provenance},
+        {'node_id': 'transfer', 'system': '["c", "a"]', 'signature': 2., **provenance},
+    ])
+    unit_provenance = provenance | {'signature_kind': 'single_raw'}
+    units = pd.DataFrame([
+        {'node_id': node, 'cation': 'c', 'anion': 'a', 'solute': solute,
+         'signature': value, **unit_provenance}
+        for node, values in [('solvation', [1., 2.]), ('transfer', [2., 4.])]
+        for solute, value in zip(['s1', 's2'], values)
+    ])
+    local = dict(config)
+    local['stability'] = dict(config['stability'], bootstrap=2, permutation=2,
+                              cv_repeats=2, cv_permutation=2)
+    out = tmp_path/'solute-pair';out.mkdir()
+    graph.compute_graphs(nodes, signatures, local, out, 42, dpi=30, unit_signatures=units)
+    counts = pd.read_csv(out/'G_EE/n_shared.csv', index_col=0)
+    assert counts.loc['solvation', 'solvation'] == 1
+    assert counts.loc['transfer', 'transfer'] == 1
+    assert counts.loc['solvation', 'transfer'] == 2
+    pairs = pd.read_csv(out/'G_EE/pairs.csv')
+    pair = pairs.loc[(pairs.source == 'solvation') & (pairs.target == 'transfer')].iloc[0]
+    assert pair.system_identity == 'cation_anion_solute'
+    assert pair.n_observation_shared == 2
+    assert len(json.loads(pair.shared_systems)) == 2
+    se_pairs = pd.read_csv(out/'G_SE/pairs.csv')
+    assert set(se_pairs.system_identity) == {'cation_anion'}
 
 
 def test_nmae_is_oof_median_error_ratio(monkeypatch):

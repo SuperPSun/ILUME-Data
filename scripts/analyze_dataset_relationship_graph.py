@@ -30,13 +30,16 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import SplineTransformer, StandardScaler
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "configs/dataset_relationship_formulas_v1.json"
+DEFAULT_CONFIG = ROOT / "configs/dataset_relationship_formulas_v2.json"
 METRICS = ("spearman", "distance_correlation", "binary_i_over_h",
            "multiclass_mi", "predictability_cv_nmae")
 SYMMETRIC = set(METRICS) - {"binary_i_over_h", "predictability_cv_nmae"}
 FORMULAS = {"linear_temperature", "linear_temperature_pressure", "log_density",
-            "vft", "cauchy", "inverse_temperature", "solute_linear_temperature",
-            "solute_only", "unconditioned", "pending_formula"}
+            "vft", "arrhenius_temperature_pressure", "cauchy", "inverse_temperature",
+            "solute_linear_temperature",
+            "solute_only", "unconditioned", "pending_formula", "reference_frequency_10ghz",
+            "x_co2_reference_solubility"}
+SOLUTE_PAIR_DATASETS = {"experiment/solvation.csv", "experiment/transfer.csv"}
 
 
 def json_text(value):
@@ -53,7 +56,7 @@ def file_hash(path):
 
 def load_config(path):
     config = json.loads(Path(path).read_text())
-    if config.get("version") != 1 or set(config["formulas"].values()) - FORMULAS:
+    if config.get("version") not in (1, 2) or set(config["formulas"].values()) - FORMULAS:
         raise ValueError("Unsupported formula configuration")
     for key in ("temperature_K", "pressure_kPa", "wavelength_nm"):
         if not np.isfinite(config["references"][key]) or config["references"][key] <= 0:
@@ -137,6 +140,113 @@ def fit_signature(group, formula, refs):
             finite = values[np.isfinite(values)]
             observed[col] = [float(finite.min()), float(finite.max())] if len(finite) else None
     result["condition_ranges"] = json_text(observed)
+    if formula == "reference_frequency_10ghz":
+        if "frequency_MHz" not in group:
+            result["status"] = "missing_condition"
+            return result
+        frequency = pd.to_numeric(group["frequency_MHz"], errors="coerce").to_numpy(float)
+        at_reference = frequency == 10000.
+        if not at_reference.any():
+            result["status"] = "missing_reference_frequency"
+            return result
+        selected = group.loc[at_reference]
+        actual = {"frequency_MHz": 10000.}
+        mismatch = False
+        for col in ("temperature_K", "pressure_kPa"):
+            if col not in selected:
+                continue
+            values = pd.to_numeric(selected[col], errors="coerce").to_numpy(float)
+            if not np.isfinite(values).all() or (values <= 0).any():
+                result["status"] = "invalid_condition"
+                return result
+            actual[col] = float(values[0]) if np.all(values == values[0]) else None
+            mismatch |= not np.all(np.isclose(values, refs[col]))
+        signature = float(np.median(selected["_value"].to_numpy(float)))
+        result.update(signature=signature, fit_method="reference_frequency_median",
+                      signature_kind="reference_frequency_median",
+                      parameters=json_text({"frequency_MHz": 10000.}),
+                      fit_quality=json_text({"n_reference_observations": int(at_reference.sum())}),
+                      actual_reference=json_text(actual), reference_mismatch=mismatch)
+        return result
+    if formula == "x_co2_reference_solubility":
+        for col in ("temperature_K", "pressure_kPa"):
+            if col not in group:
+                result["status"] = "missing_condition"
+                return result
+        temperature = pd.to_numeric(group["temperature_K"], errors="coerce").to_numpy(float)
+        pressure = pd.to_numeric(group["pressure_kPa"], errors="coerce").to_numpy(float)
+        if (not np.isfinite(temperature).all() or not np.isfinite(pressure).all()
+                or (temperature <= 0).any() or (pressure <= 0).any()):
+            result["status"] = "invalid_condition"
+            return result
+        if (y <= 0).any() or (y >= 1).any():
+            result["status"] = "invalid_x_co2"
+            return result
+        if len(y) == 1:
+            result.update(signature=float(y[0]), signature_kind="single_raw",
+                          actual_reference=json_text({"temperature_K": float(temperature[0]),
+                                                      "pressure_kPa": float(pressure[0])}),
+                          reference_mismatch=not (np.isclose(temperature[0], refs["temperature_K"])
+                                                  and np.isclose(pressure[0], refs["pressure_kPa"])))
+            return result
+        response = np.log(pressure / y)
+        candidates = [
+            ("b_inverse_temperature", 1 / temperature - 1 / refs["temperature_K"]),
+            ("c_pressure_over_temperature", (pressure - refs["pressure_kPa"]) / temperature),
+        ]
+        design = np.ones((len(y), 1))
+        names = ["a"]
+        dropped = []
+        for name, values in candidates:
+            proposed = np.column_stack([design, values])
+            if np.ptp(values) > 0 and np.linalg.matrix_rank(proposed) > np.linalg.matrix_rank(design):
+                design = proposed
+                names.append(name)
+            else:
+                dropped.append(name)
+        scales = np.r_[1., np.max(np.abs(design[:, 1:]), axis=0)] if design.shape[1] > 1 else np.ones(1)
+        scaled = design / scales
+        beta = np.linalg.lstsq(scaled, response, rcond=None)[0]
+        predicted = scaled @ beta
+        parameters = dict(zip(names, (beta / scales).tolist()))
+        signature = float(refs["pressure_kPa"] * np.exp(-beta[0]))
+        if not np.isfinite(signature):
+            result["status"] = "nonfinite_signature"
+            return result
+        residual = response - predicted
+        df = len(y) - len(beta)
+        covariance = np.linalg.pinv(scaled.T @ scaled)
+        if df > 0:
+            intercept_se = np.sqrt(max(0, covariance[0, 0] * np.sum(residual ** 2) / df))
+            result["uncertainty"] = float(signature * intercept_se)
+        retained = set(names)
+        temperature_corrected = "b_inverse_temperature" in retained
+        pressure_corrected = "c_pressure_over_temperature" in retained
+        actual = {
+            "temperature_K": refs["temperature_K"] if temperature_corrected else (
+                float(temperature[0]) if np.all(temperature == temperature[0]) else None),
+            "pressure_kPa": refs["pressure_kPa"] if pressure_corrected else (
+                float(pressure[0]) if np.all(pressure == pressure[0]) else None),
+        }
+        distances = {
+            "temperature_K": float(max(temperature.min() - refs["temperature_K"],
+                                       refs["temperature_K"] - temperature.max(), 0)),
+            "pressure_kPa": float(max(pressure.min() - refs["pressure_kPa"],
+                                      refs["pressure_kPa"] - pressure.max(), 0)),
+        }
+        result.update(signature=signature, fit_method="identifiable_least_squares",
+                      residual_df=df, parameters=json_text(parameters),
+                      fit_quality=json_text({"rmse_log_pressure_over_x": float(np.sqrt(np.mean(residual ** 2))),
+                                             "n_parameters": len(beta),
+                                             "retained_terms": names[1:],
+                                             "dropped_terms": dropped,
+                                             "uncertainty_status": "estimated" if df > 0 else "no_residual_df"}),
+                      actual_reference=json_text(actual),
+                      reference_mismatch=any(value is None or not np.isclose(value, refs[col])
+                                             for col, value in actual.items()),
+                      extrapolation_distance=json_text(distances),
+                      extrapolated=any(value > 0 for value in distances.values()))
+        return result
     if len(y) == 1:
         result.update(signature=float(y[0]), signature_kind="single_raw")
         result["actual_reference"] = json_text({c: bounds[0] if bounds else None for c, bounds in observed.items()})
@@ -150,7 +260,8 @@ def fit_signature(group, formula, refs):
         result["status"] = "pending_formula"
         return result
     columns = ["temperature_K"]
-    if formula in {"linear_temperature_pressure", "log_density", "vft", "cauchy"}:
+    if formula in {"linear_temperature_pressure", "log_density", "vft",
+                   "arrhenius_temperature_pressure", "cauchy"}:
         columns.append("pressure_kPa")
     if formula == "cauchy":
         columns.append("wavelength_nm")
@@ -193,7 +304,8 @@ def fit_signature(group, formula, refs):
         values = raw[col]
         if col == "wavelength_nm":
             features.append(values ** -2 - refs[col] ** -2)
-        elif col == "temperature_K" and formula == "inverse_temperature":
+        elif col == "temperature_K" and formula in {
+                "inverse_temperature", "arrhenius_temperature_pressure"}:
             features.append(1 / values - 1 / refs[col])
         else:
             features.append(values - refs[col])
@@ -201,6 +313,25 @@ def fit_signature(group, formula, refs):
     scales = np.r_[1., np.max(np.abs(x[:, 1:]), axis=0)]
     scaled = x / scales
     if np.linalg.matrix_rank(scaled) != scaled.shape[1] or len(y) < scaled.shape[1]:
+        if formula == "arrhenius_temperature_pressure":
+            reference_temperature = np.isclose(raw["temperature_K"], refs["temperature_K"])
+            if reference_temperature.any():
+                candidates = np.flatnonzero(reference_temperature)
+                selected = candidates[np.argmin(np.abs(raw["pressure_kPa"][candidates] - refs["pressure_kPa"]))]
+                result.update(
+                    signature=float(y[selected]), status="ok",
+                    fit_method="reference_temperature_observation",
+                    signature_kind="reference_temperature_observation",
+                    parameters=json_text({"temperature_K": refs["temperature_K"],
+                                          "pressure_kPa": float(raw["pressure_kPa"][selected])}),
+                    fit_quality=json_text({"fallback_reason": "insufficient_condition_design",
+                                           "selection": "exact_reference_temperature_then_nearest_pressure"}),
+                    actual_reference=json_text({"temperature_K": refs["temperature_K"],
+                                                "pressure_kPa": float(raw["pressure_kPa"][selected])}),
+                    reference_mismatch=not np.isclose(raw["pressure_kPa"][selected], refs["pressure_kPa"]),
+                    extrapolation_distance=json_text({"temperature_K": 0., "pressure_kPa": 0.}),
+                    extrapolated=False)
+                return result
         result["status"] = "insufficient_condition_design"
         return result
     nonlinear = formula == "vft" and "temperature_K" in active
@@ -710,7 +841,7 @@ def render_knowledge_graphs(nodes, graph_results, labels, out, seed, dpi):
     return graphs, positions
 
 
-def compute_graphs(nodes, signatures, config, out, seed, dpi=300):
+def compute_graphs(nodes, signatures, config, out, seed, dpi=300, unit_signatures=None):
     included = [n for n in nodes if not n["excluded_reason"]]
     labels = dataset_labels(nodes)
     groups = {s: [n for n in included if n["stage"] == s] for s in (2, 3)}
@@ -720,6 +851,16 @@ def compute_graphs(nodes, signatures, config, out, seed, dpi=300):
         rows = signatures.loc[signatures.node_id == node["node_id"]]
         valid = rows.loc[np.isfinite(rows.signature)].set_index("system")
         data[node["node_id"]] = (rows, valid)
+    unit_data = {}
+    if unit_signatures is not None and not unit_signatures.empty:
+        for node in included:
+            rows = unit_signatures.loc[unit_signatures.node_id == node["node_id"]].copy()
+            if rows.empty:
+                continue
+            rows["system"] = [json_text([row.cation, row.anion, row.solute])
+                              for row in rows.itertuples()]
+            valid = rows.loc[np.isfinite(rows.signature)].set_index("system")
+            unit_data[node["node_id"]] = (rows, valid)
     for name, sources in (("G_EE", groups[3]), ("G_SE", groups[2])):
         directory = out / name; directory.mkdir()
         source_ids = [n["node_id"] for n in sources]; target_ids = [n["node_id"] for n in groups[3]]
@@ -737,7 +878,13 @@ def compute_graphs(nodes, signatures, config, out, seed, dpi=300):
         for number, (a, b) in enumerate(work, 1):
             aid, bid = a["node_id"], b["node_id"]
             print(f"{name} {number}/{len(work)}: {aid} -> {bid}", file=sys.stderr, flush=True)
-            ar, av = data[aid]; br, bv = data[bid]
+            use_solute_identity = {a["source_dataset"], b["source_dataset"]} == SOLUTE_PAIR_DATASETS
+            if use_solute_identity:
+                if aid not in unit_data or bid not in unit_data:
+                    raise ValueError("Solvation-transfer comparison requires unit signatures")
+                ar, av = unit_data[aid]; br, bv = unit_data[bid]
+            else:
+                ar, av = data[aid]; br, bv = data[bid]
             shared = sorted(set(av.index) & set(bv.index))
             nobs = len(set(ar.system) & set(br.system))
             x, y = av.loc[shared].signature.to_numpy(float), bv.loc[shared].signature.to_numpy(float)
@@ -754,6 +901,7 @@ def compute_graphs(nodes, signatures, config, out, seed, dpi=300):
                 mismatch = bool(source_valid.loc[shared].reference_mismatch.any() or target_valid.loc[shared].reference_mismatch.any())
                 actual = set(source_valid.loc[shared].actual_reference) | set(target_valid.loc[shared].actual_reference)
                 pair = {"source": source, "target": target, "n_shared": len(shared), "n_observation_shared": nobs,
+                        "system_identity": "cation_anion_solute" if use_solute_identity else "cation_anion",
                         "shared_systems": json_text(shared), "signature_kinds": json_text(kinds),
                         "mixed_signature_kinds": len(kinds) > 1 or bool(
                             source_valid.loc[shared].get("mixed_unit_signature_kinds", pd.Series(dtype=bool)).fillna(False).any()
@@ -828,7 +976,7 @@ def run(command, input_root, output_dir, config_path=DEFAULT_CONFIG, seed=42, dp
     path.write_text(json.dumps(manifest, indent=2))
     try:
         if command == "compute":
-            compute_graphs(nodes, signatures, config, out, seed, dpi)
+            compute_graphs(nodes, signatures, config, out, seed, dpi, units)
     except BaseException as exc:
         manifest.update(status="failed", error=str(exc))
         path.write_text(json.dumps(manifest, indent=2))

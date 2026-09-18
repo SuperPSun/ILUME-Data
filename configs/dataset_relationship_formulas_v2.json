@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "references": {"temperature_K": 298.15, "pressure_kPa": 101.325, "wavelength_nm": 589.0},
+  "formulas": {
+    "simulation/density.csv": "linear_temperature",
+    "simulation/heat_capacity.csv": "linear_temperature",
+    "simulation/heat_of_vaporization.csv": "linear_temperature",
+    "simulation/thermal_expansion.csv": "linear_temperature",
+    "experiment/density.csv": "log_density",
+    "experiment/heat_capacity.csv": "linear_temperature_pressure",
+    "experiment/isobaric_coefficient_of_volume_expansion.csv": "linear_temperature_pressure",
+    "experiment/speed_of_sound.csv": "linear_temperature_pressure",
+    "experiment/thermal_conductivity.csv": "linear_temperature_pressure",
+    "experiment/static_relative_permittivity.csv": "linear_temperature_pressure",
+    "experiment/surface_tension.csv": "linear_temperature",
+    "experiment/viscosity.csv": "arrhenius_temperature_pressure",
+    "experiment/electrical_conductivity.csv": "arrhenius_temperature_pressure",
+    "experiment/self_diffusion_coefficient.csv": "arrhenius_temperature_pressure",
+    "experiment/refractive_index.csv": "cauchy",
+    "experiment/equilibrium_pressure.csv": "inverse_temperature",
+    "experiment/solvation.csv": "solute_linear_temperature",
+    "experiment/transfer.csv": "solute_only",
+    "experiment/glass_transition_temperature.csv": "unconditioned",
+    "experiment/melting_point.csv": "unconditioned",
+    "experiment/pec50.csv": "unconditioned",
+    "experiment/thermal_decomposition_temperature.csv": "unconditioned",
+    "experiment/dynamic_relative_permittivity.csv": "reference_frequency_10ghz",
+    "experiment/x_co2.csv": "x_co2_reference_solubility"
+  },
+  "binary_thresholds": {},
+  "stability": {"bootstrap": 200, "permutation": 199, "cv_repeats": 20, "cv_permutation": 99, "minimum_bootstrap_valid": 100}
+}

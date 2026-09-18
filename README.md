@@ -181,7 +181,9 @@ signatures and inspect approvals without pairwise metrics. Output directories mu
 be new or empty. Stage3×Stage3 and Stage2→Stage3 outputs include overlap counts,
 provenance, NA/stability tables, annotated heatmaps and five relationship graphs:
 Spearman, distance correlation, directed binary I/H, multiclass MI and CV-NMAE.
-Dynamic permittivity and CO₂ multi-observation formulas remain pending approval.
+Dynamic permittivity and CO₂ use the approved 10 GHz selection and
+reference-solubility formulas. Viscosity, electrical conductivity and self
+diffusion use the approved Arrhenius temperature-pressure formula.
 See the [analysis contract](docs/dataset_relationship_graph.md) for definitions,
 limitations and validation.
 

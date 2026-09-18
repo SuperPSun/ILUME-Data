@@ -21,8 +21,8 @@ python scripts/analyze_dataset_relationship_graph.py compute \
 Each output directory must be new or empty and outside the input tree. `compute`
 includes the audit, signature construction, and all stability computations;
 `audit` still fits signatures but skips pair metrics. Existing outputs are not
-resumed or overwritten. VFT fitting and quadratic-memory dCor calculations can
-be expensive; progress reports identify the active dataset pair.
+resumed or overwritten. Quadratic-memory dCor calculations can be expensive;
+progress reports identify the active dataset pair.
 
 ## Inputs and approvals
 
@@ -34,11 +34,10 @@ identities; this analysis does not recanonicalize or merge chemical equivalents.
 Non-IL and transfer_organic nodes are inventoried but excluded from matrices.
 Invalid target/identity rows do not contribute observation overlap counts.
 
-`configs/dataset_relationship_formulas_v1.json` records the user-approved formulas,
+`configs/dataset_relationship_formulas_v2.json` records the user-approved formulas,
 reference conditions and stability counts. An unknown included dataset is explicitly
-pending, never assigned a default model. Dynamic permittivity and x_CO2 currently
-remain pending. Approval means choosing an approximation, not certifying that it
-is valid over every observed temperature/pressure range.
+pending, never assigned a default model. Approval means choosing an approximation,
+not certifying that it is valid over every observed condition range.
 
 Signatures use 298.15 K and 101.325 kPa, with 589 nm for refractive index. Observed
 constant conditions remain at their actual values with `reference_mismatch`.
@@ -46,18 +45,33 @@ Varying conditions are extrapolated when necessary; coordinate distances and
 ranges are recorded. `extrapolated` refers to departure from individual coordinate
 ranges, not a guarantee that the reference lies inside a multivariate convex hull.
 Rank-deficient designs return NA. Every varying condition in the approved formula
-is retained; pressure is not silently dropped. Two-point linear fits have no
-residual degrees of freedom and cannot estimate uncertainty.
+is retained for the general linear and Arrhenius formulas; pressure is not silently
+dropped there. The x_CO2 exception follows its explicit identifiable-term rule
+below. Two-point linear fits have no residual degrees of freedom and cannot
+estimate uncertainty.
 
 Single observations remain raw, including those in pending datasets. No-condition
 replicates and same-condition replicates use medians; the latter remain at their
 observed conditions. Density is fitted in natural-log space and restored to its
-original units. Existing log10 targets are never logged a second time. VFT uses
-three starting T0 values, 0 <= T0 < min(observed temperatures, 298.15), and rejects
-boundary/nonconverged/unidentifiable solutions. It requires at least four distinct
-temperatures and more observations than the number of fitted parameters. With
-constant temperature it can estimate only the approved pressure term at the
-actual temperature, explicitly marked as a reference mismatch.
+original units. Existing log10 targets are never logged a second time. Viscosity,
+electrical conductivity and self diffusion use
+`y = a + b(1/T - 1/298.15) + c(P - 101.325)` on their existing log10 targets.
+Constant condition terms are not fitted; varying terms must be jointly identifiable.
+The signature is `a`. If this design is underdetermined but an exact 298.15 K
+observation exists, the closest-pressure observation at that temperature is kept
+as `reference_temperature_observation`; its pressure mismatch remains explicit.
+Without an exact reference-temperature observation, the signature remains NA.
+
+Dynamic relative permittivity uses only observations at exactly 10 GHz
+(`frequency_MHz == 10000`); repeated reference-frequency observations use their
+median. A system without that exact frequency is `missing_reference_frequency`.
+No Debye, Cole-Cole, or other frequency extrapolation is used.
+
+For multi-observation x_CO2 systems, the response is
+`ln(P_kPa/x_CO2) = a + b(1/T - 1/298.15) + c(P_kPa - 101.325)/T`.
+Only varying terms that increase the design rank are retained, in formula order.
+The reference signature is `101.325 exp(-a)`. Inputs require positive temperature
+and pressure and `0 < x_CO2 < 1`; single-observation systems retain the raw value.
 
 Solvation temperature fits operate on IL-solute sequences; single-observation
 sequences enter the additive solute model unchanged. Transfer has no temperature
@@ -71,12 +85,19 @@ that mixture propagates to the pair audit flag. The IL effect
 standard error is conditional on those unit signatures and does not propagate
 all temperature-fit errors.
 
+The solvation-transfer pair is the one exception to the main IL identity: it
+intersects valid unit signatures on `(cation, anion, solute)`. Comparisons of
+either dataset with every other property continue to use the solute-controlled
+IL-level `(cation, anion)` effects. Consequently, the solvation-transfer off-diagonal
+`N_shared` counts IL-solute units and may exceed either IL-level diagonal count.
+
 ## Metrics and stability
 
 Every metric uses the current pair's valid-signature intersection. `n_shared`
-counts that intersection; `n_observation_shared` separately counts shared ILs
-with usable target observations, including failed/pending signatures. All pairs
-remain present. EE diagonal relationship values are NA; its count diagonal is
+counts that intersection; `n_observation_shared` separately counts shared
+observation identities with usable targets, including failed/pending signatures.
+The identity is normally an IL and is an IL-solute unit only for the
+solvation-transfer pair. All pairs remain present. EE diagonal relationship values are NA; its count diagonal is
 the number of systems in that node. Directed SE outputs run simulation to
 experiment only. Continuous z-scores use ddof=0.
 
@@ -132,6 +153,8 @@ Rows are sources and columns are targets.
 EE symmetric values and their confidence rows are mirrored exactly. Pair records
 include exact shared systems and flags for mixed signature kinds, reference
 mismatches, heterogeneous actual conditions, extrapolation and pending formulas.
+`system_identity` records whether a pair used `cation_anion` or the special
+`cation_anion_solute` identity.
 These flags are not automatic filters: inspect them before interpreting metrics.
 Missing numeric values are serialized as `NA`; statuses explain why.
 
