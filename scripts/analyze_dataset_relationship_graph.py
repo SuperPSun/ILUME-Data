@@ -19,6 +19,7 @@ import networkx as nx
 import scipy
 import sklearn
 from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
 from scipy.optimize import least_squares
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
@@ -41,6 +42,30 @@ FORMULAS = {"linear_temperature", "linear_temperature_pressure", "log_density",
             "x_co2_reference_solubility", "solute_solvent_additive"}
 TRANSFER_ORGANIC = "experiment/transfer_organic.csv"
 SOLUTE_EFFECT_DATASETS = {"experiment/solvation.csv", "experiment/transfer.csv"}
+STAGE3_KNOWLEDGE_GROUPS = {
+    "transport_dynamics": {
+        "electrical_conductivity", "viscosity", "self_diffusion_coefficient"},
+    "thermophysical_interfacial": {
+        "density", "heat_capacity", "isobaric_coefficient_of_volume_expansion",
+        "speed_of_sound", "surface_tension", "thermal_conductivity", "refractive_index",
+        "dynamic_relative_permittivity", "x_co2"},
+    "phase_stability": {
+        "glass_transition_temperature", "melting_point", "equilibrium_pressure",
+        "thermal_decomposition_temperature"},
+    "solvation_transfer": {"solvation", "transfer", "transfer_organic"},
+    "biological": {"pec50"},
+    "static_dielectric": {"static_relative_permittivity"},
+}
+KNOWLEDGE_GROUP_LAYOUT = {
+    "stage2_simulation": ((-1.55, 0.05), .38, "Stage2 simulation"),
+    "transport_dynamics": ((-.78, .72), .27, "A. Transport / dynamics"),
+    "thermophysical_interfacial": ((.18, .62), .53, "B. Thermophysical / interfacial"),
+    "phase_stability": ((1.02, .02), .33, "C. Phase / stability"),
+    "solvation_transfer": ((.55, -.72), .28, "D. Solvation / transfer"),
+    "biological": ((-.18, -.82), .13, "E. Biological"),
+    "static_dielectric": ((-.72, -.55), .13, "F. Static dielectric"),
+    "other_stage3": ((1.35, -.72), .22, "Other Stage3"),
+}
 
 
 def json_text(value):
@@ -794,6 +819,16 @@ def dataset_labels(nodes):
     return labels
 
 
+def knowledge_graph_labels(nodes):
+    included = [node for node in nodes if not node["excluded_reason"]]
+    source_counts = pd.Series([node["source_dataset"] for node in included]).value_counts()
+    return {
+        node["node_id"]: (Path(node["source_dataset"]).stem if source_counts[node["source_dataset"]] == 1
+                          else f"{Path(node['source_dataset']).stem}::{node['target_property']}")
+        for node in included
+    }
+
+
 def write_overlap_outputs(matrix, labels, directory, dpi):
     display = matrix.rename(index=labels, columns=labels)
     display.rename_axis("source_dataset").to_csv(
@@ -851,10 +886,21 @@ def knowledge_graph_edges(metric, graph_results):
     return edges
 
 
+def knowledge_group(node):
+    if node["stage"] == 2:
+        return "stage2_simulation"
+    property_name = Path(node["source_dataset"]).stem
+    for group, properties in STAGE3_KNOWLEDGE_GROUPS.items():
+        if property_name in properties:
+            return group
+    return "other_stage3"
+
+
 def build_knowledge_graph(metric, nodes, graph_results, labels):
     graph = nx.Graph() if metric in SYMMETRIC else nx.DiGraph()
     for node in nodes:
-        graph.add_node(node["node_id"], stage=node["stage"], label=labels[node["node_id"]])
+        graph.add_node(node["node_id"], stage=node["stage"], label=labels[node["node_id"]],
+                       knowledge_group=knowledge_group(node))
     for edge in knowledge_graph_edges(metric, graph_results):
         graph.add_edge(edge.pop("source"), edge.pop("target"), **edge)
     return graph
@@ -879,6 +925,16 @@ def edge_widths(metric, edges):
 
 def draw_knowledge_graph(graph, metric, positions, path, dpi):
     figure, axis = plt.subplots(figsize=(16, 13))
+    for group, (center, radius, title) in KNOWLEDGE_GROUP_LAYOUT.items():
+        members = [node for node, data in graph.nodes(data=True)
+                   if data["knowledge_group"] == group]
+        if not members:
+            continue
+        axis.add_patch(Ellipse(center, 2.35 * radius, 2.15 * radius,
+                               facecolor="#F5F7FA", edgecolor="#CDD3DA",
+                               linestyle="--", linewidth=1., alpha=.72, zorder=0))
+        axis.text(center[0], center[1] + 1.2 * radius, title, ha="center", va="bottom",
+                  fontsize=9, color="#4B5563", fontweight="bold")
     for stage, marker, color in ((2, "s", "#377EB8"), (3, "o", "#FF9F1C")):
         node_list = [node for node, data in graph.nodes(data=True) if data["stage"] == stage]
         nx.draw_networkx_nodes(graph, positions, nodelist=node_list, node_shape=marker,
@@ -924,40 +980,39 @@ def draw_knowledge_graph(graph, metric, positions, path, dpi):
         ])
     axis.legend(handles=legend, loc="upper left", frameon=True, fontsize=8)
     axis.set_title(metric.replace("_", " ").title())
+    axis.set_xlim(-2.05, 1.55)
+    axis.set_ylim(-1.15, 1.25)
     axis.set_axis_off()
     figure.tight_layout()
     figure.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
 
 
-def shared_spring_layout(graph, seed):
-    components = sorted(nx.connected_components(graph), key=lambda values: (-len(values), sorted(values)))
+def grouped_knowledge_layout(nodes, seed):
+    grouped = {group: [] for group in KNOWLEDGE_GROUP_LAYOUT}
+    for node in nodes:
+        grouped[knowledge_group(node)].append(node["node_id"])
     positions = {}
-    main = graph.subgraph(components[0])
-    main_positions = nx.spring_layout(main, seed=seed, weight=None, iterations=500,
-                                      k=max(.4, 2 / np.sqrt(len(main))))
-    positions.update(nx.rescale_layout_dict(main_positions, scale=1.))
-    for index, component in enumerate(components[1:]):
-        subgraph = graph.subgraph(component)
-        if len(component) == 1:
-            component_positions = {next(iter(component)): np.zeros(2)}
-        else:
-            component_positions = nx.spring_layout(subgraph, seed=stable_seed(seed, "component", index),
-                                                   weight=None, iterations=500, scale=.25)
-        center = np.array([1.35, .8 - .4 * index])
-        positions.update({node: np.asarray(point) + center
-                          for node, point in component_positions.items()})
+    for group, members in grouped.items():
+        if not members:
+            continue
+        center, radius, _ = KNOWLEDGE_GROUP_LAYOUT[group]
+        members = sorted(members)
+        if len(members) == 1:
+            positions[members[0]] = np.asarray(center, float)
+            continue
+        phase = 2 * np.pi * (stable_seed(seed, "knowledge_group", group) % 360) / 360
+        angles = phase + 2 * np.pi * np.arange(len(members)) / len(members)
+        for node_id, angle in zip(members, angles):
+            positions[node_id] = np.asarray(center) + radius * np.array([np.cos(angle), np.sin(angle)])
     return positions
 
 
 def render_knowledge_graphs(nodes, graph_results, labels, out, seed, dpi):
+    labels = knowledge_graph_labels(nodes)
     graphs = {metric: build_knowledge_graph(metric, nodes, graph_results, labels)
               for metric in METRICS}
-    layout_graph = nx.Graph()
-    layout_graph.add_nodes_from(node["node_id"] for node in nodes)
-    for graph in graphs.values():
-        layout_graph.add_edges_from(graph.edges())
-    positions = shared_spring_layout(layout_graph, seed)
+    positions = grouped_knowledge_layout(nodes, seed)
     directory = out / "knowledge_graphs"
     directory.mkdir()
     for metric, graph in graphs.items():

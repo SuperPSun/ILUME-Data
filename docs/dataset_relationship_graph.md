@@ -177,7 +177,11 @@ Missing numeric values are serialized as `NA`; statuses explain why.
 All finite relationships are drawn. Raw permutation p-values at or below 0.05
 are highlighted; other edges remain gray. Symmetric metrics use undirected edges,
 while I/H and CV-NMAE retain their legal directions. All figures use the same
-seeded spring layout. Edge color is descriptive and is not an FDR-adjusted decision.
+seeded, fixed grouped layout. Stage2 simulation nodes occupy a separate region;
+Stage3 nodes are grouped as transport/dynamics, thermophysical/interfacial,
+phase/stability, solvation/transfer, biological, and static dielectric. Edge color
+is descriptive and is not an FDR-adjusted decision. Graph labels use property
+short names; CSV matrices retain full node IDs.
 Spearman uses solid positive and dashed negative edges. Edge width represents
 absolute Spearman, the raw nonnegative dCor/I/H/multiclass value, or
 `1/(1+CV-NMAE)`, rescaled independently within each figure.

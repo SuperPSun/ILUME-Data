@@ -395,9 +395,12 @@ def test_binary_threshold_and_directed_normalization():
 
 def test_knowledge_graph_direction_significance_and_strength():
     nodes = [
-        {'node_id': 's', 'stage': 2, 'excluded_reason': ''},
-        {'node_id': 'e1', 'stage': 3, 'excluded_reason': ''},
-        {'node_id': 'e2', 'stage': 3, 'excluded_reason': ''},
+        {'node_id': 's', 'stage': 2, 'source_dataset': 'simulation/density.csv',
+         'excluded_reason': ''},
+        {'node_id': 'e1', 'stage': 3, 'source_dataset': 'experiment/density.csv',
+         'excluded_reason': ''},
+        {'node_id': 'e2', 'stage': 3, 'source_dataset': 'experiment/viscosity.csv',
+         'excluded_reason': ''},
     ]
     labels = {'s': 'simulation/s', 'e1': 'experiment/e1', 'e2': 'experiment/e2'}
     columns = {
@@ -426,13 +429,43 @@ def test_knowledge_graph_direction_significance_and_strength():
     directed = graph.build_knowledge_graph('binary_i_over_h', nodes, results, labels)
     assert directed.is_directed()
     assert set(directed.edges()) == {('s', 'e1'), ('e1', 'e2'), ('e2', 'e1')}
-    positions = graph.shared_spring_layout(spearman, 42)
-    repeated = graph.shared_spring_layout(spearman, 42)
+    positions = graph.grouped_knowledge_layout(nodes, 42)
+    repeated = graph.grouped_knowledge_layout(nodes, 42)
     assert all(np.array_equal(positions[node], repeated[node]) for node in positions)
     widths = graph.edge_widths('predictability_cv_nmae', [
         ('a', 'b', {'value': .25}), ('a', 'c', {'value': 2.}),
     ])
     assert widths[0] > widths[1]
+
+
+def test_stage3_knowledge_groups_and_clustered_layout():
+    groups = {
+        'transport_dynamics': ['electrical_conductivity', 'viscosity', 'self_diffusion_coefficient'],
+        'thermophysical_interfacial': [
+            'density', 'heat_capacity', 'isobaric_coefficient_of_volume_expansion',
+            'speed_of_sound', 'surface_tension', 'thermal_conductivity', 'refractive_index',
+            'dynamic_relative_permittivity', 'x_co2'],
+        'phase_stability': [
+            'glass_transition_temperature', 'melting_point', 'equilibrium_pressure',
+            'thermal_decomposition_temperature'],
+        'solvation_transfer': ['solvation', 'transfer', 'transfer_organic'],
+        'biological': ['pec50'],
+        'static_dielectric': ['static_relative_permittivity'],
+    }
+    nodes = [
+        {'node_id': name, 'stage': 3, 'source_dataset': f'experiment/{name}.csv'}
+        for names in groups.values() for name in names
+    ] + [{'node_id': 'simulation', 'stage': 2, 'source_dataset': 'simulation/density.csv'}]
+    assert {node['node_id']: graph.knowledge_group(node) for node in nodes} == {
+        **{name: group for group, names in groups.items() for name in names},
+        'simulation': 'stage2_simulation',
+    }
+    positions = graph.grouped_knowledge_layout(nodes, 42)
+    for group, names in groups.items():
+        center = np.asarray(graph.KNOWLEDGE_GROUP_LAYOUT[group][0])
+        radius = graph.KNOWLEDGE_GROUP_LAYOUT[group][1]
+        assert all(np.linalg.norm(positions[name] - center) <= radius + 1e-12 for name in names)
+    assert set(positions) == {node['node_id'] for node in nodes}
 
 
 def test_solvation_transfer_uses_il_level_identity(tmp_path, config):
