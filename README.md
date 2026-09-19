@@ -183,7 +183,9 @@ provenance, NA/stability tables, annotated heatmaps and five relationship graphs
 Spearman, distance correlation, directed binary I/H, multiclass MI and CV-NMAE.
 Dynamic permittivity and CO₂ use the approved 10 GHz selection and
 reference-solubility formulas. Viscosity, electrical conductivity and self
-diffusion use the approved Arrhenius temperature-pressure formula.
+diffusion use the approved Arrhenius temperature-pressure formula. Experimental
+transfer-organic is included only for shared-solute comparisons with solvation
+and transfer; its other Stage3 matrix cells are marked `incompatible_topology`.
 See the [analysis contract](docs/dataset_relationship_graph.md) for definitions,
 limitations and validation.
 

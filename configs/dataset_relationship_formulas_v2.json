@@ -20,6 +20,7 @@
     "experiment/equilibrium_pressure.csv": "inverse_temperature",
     "experiment/solvation.csv": "solute_linear_temperature",
     "experiment/transfer.csv": "solute_only",
+    "experiment/transfer_organic.csv": "solute_solvent_additive",
     "experiment/glass_transition_temperature.csv": "unconditioned",
     "experiment/melting_point.csv": "unconditioned",
     "experiment/pec50.csv": "unconditioned",

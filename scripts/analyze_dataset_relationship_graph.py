@@ -38,8 +38,9 @@ FORMULAS = {"linear_temperature", "linear_temperature_pressure", "log_density",
             "vft", "arrhenius_temperature_pressure", "cauchy", "inverse_temperature",
             "solute_linear_temperature",
             "solute_only", "unconditioned", "pending_formula", "reference_frequency_10ghz",
-            "x_co2_reference_solubility"}
-SOLUTE_PAIR_DATASETS = {"experiment/solvation.csv", "experiment/transfer.csv"}
+            "x_co2_reference_solubility", "solute_solvent_additive"}
+TRANSFER_ORGANIC = "experiment/transfer_organic.csv"
+SOLUTE_EFFECT_DATASETS = {"experiment/solvation.csv", "experiment/transfer.csv"}
 
 
 def json_text(value):
@@ -77,15 +78,18 @@ def discover(input_root, config):
         stage = int(entry.stage)
         if stage not in (2, 3):
             continue
-        excluded = ("excluded_transfer_organic" if "transfer_organic" in entry.source_file
-                    else "excluded_non_il_identity" if entry.system_type not in ("il", "il_solute")
-                    else "")
+        transfer_organic = entry.source_file == TRANSFER_ORGANIC and stage == 3
+        excluded = ("excluded_non_il_identity"
+                    if entry.system_type not in ("il", "il_solute") and not transfer_organic else "")
         directory = root / entry.materialized_path
         files = []
         frame = None
         if not excluded:
             if stage == 2:
                 files = [directory / "train.csv", directory / "valid.csv"]
+            elif transfer_organic:
+                directory = directory / "random"
+                files = [directory / f"fold{i}.csv" for i in range(1, 6)]
             else:
                 directory = directory / "IL"
                 if int(entry.repeats) > 1:
@@ -94,7 +98,8 @@ def discover(input_root, config):
             frame = pd.concat([pd.read_csv(p) for p in files], ignore_index=True)
             for p in files:
                 inputs[str(p)] = file_hash(p)
-            required = ["cation", "anion"] + (["solute"] if entry.system_type == "il_solute" else [])
+            required = (["solute", "solvent"] if transfer_organic else
+                        ["cation", "anion"] + (["solute"] if entry.system_type == "il_solute" else []))
             missing = set(required) - set(frame)
             if missing:
                 raise ValueError(f"{entry.task_id}: missing identity columns {missing}")
@@ -117,7 +122,8 @@ def discover(input_root, config):
 def valid_frame(node):
     frame = node["frame"].copy()
     frame["_value"] = pd.to_numeric(frame[node["target_property"]], errors="coerce")
-    roles = ["cation", "anion"] + (["solute"] if node["system_type"] == "il_solute" else [])
+    roles = (["solute", "solvent"] if node["source_dataset"] == TRANSFER_ORGANIC else
+             ["cation", "anion"] + (["solute"] if node["system_type"] == "il_solute" else []))
     mask = np.isfinite(frame._value)
     for role in roles:
         mask &= frame[role].notna() & frame[role].astype(str).str.strip().ne("")
@@ -478,6 +484,107 @@ def solute_signatures(frame, node, refs):
     return output, units
 
 
+def organic_solute_signatures(frame, node, refs):
+    """Fit solute effects after controlling the organic-solvent effect."""
+    units = []
+    for (solute, solvent), group in frame.groupby(["solute", "solvent"], sort=True):
+        temperatures = pd.to_numeric(group["temperature_K"], errors="coerce")
+        base = {"solute": solute, "solvent": solvent, "n_observations": len(group),
+                "signature": np.nan, "status": "ok", "fit_formula": node["formula"],
+                "fit_method": "constant_temperature_median", "signature_kind": "solute_solvent_unit",
+                "parameters": "{}", "fit_quality": "{}", "requested_reference": json_text(refs),
+                "actual_reference": "{}", "reference_mismatch": False, "extrapolated": False,
+                "extrapolation_distance": "{}", "uncertainty": np.nan, "residual_df": 0}
+        if not np.isfinite(temperatures).all() or (temperatures <= 0).any():
+            base["status"] = "invalid_condition"
+        elif temperatures.nunique() != 1:
+            base["status"] = "unexpected_transfer_temperature_variation"
+        else:
+            temperature = float(temperatures.iloc[0])
+            base.update(signature=float(np.median(group._value)),
+                        actual_reference=json_text({"temperature_K": temperature}),
+                        reference_mismatch=not np.isclose(temperature, refs["temperature_K"]))
+        units.append(base)
+    units = pd.DataFrame(units)
+    if units.empty:
+        return units
+    good = units.loc[np.isfinite(units.signature)].copy()
+    if good.empty:
+        return units
+    solute, solute_keys = pd.factorize(good.solute, sort=True)
+    solvent, solvent_keys = pd.factorize(good.solvent, sort=True)
+    ns, nv = len(solute_keys), len(solvent_keys)
+    adjacency = coo_matrix((np.ones(len(good)), (solute, solvent + ns)), shape=(ns + nv, ns + nv))
+    count, labels = connected_components(adjacency, directed=False)
+    eligible = [i for i in range(count) if np.sum(labels[:ns] == i) >= 2]
+    if not eligible:
+        return units
+    component = max(eligible, key=lambda i: (np.sum(labels[:ns] == i), -i))
+    selected = good.loc[labels[solute] == component]
+    solute2, solute_keys2 = pd.factorize(selected.solute, sort=True)
+    solvent2, solvent_keys2 = pd.factorize(selected.solvent, sort=True)
+    design = np.zeros((len(selected), len(solute_keys2) + len(solvent_keys2)))
+    design[np.arange(len(selected)), solute2] = 1
+    design[np.arange(len(selected)), len(solute_keys2) + solvent2] = 1
+    beta = np.linalg.lstsq(design, selected.signature.to_numpy(float), rcond=None)[0]
+    shift = beta[:len(solute_keys2)].mean()
+    solute_effects = beta[:len(solute_keys2)] - shift
+    solvent_effects = beta[len(solute_keys2):] + shift
+    residual = selected.signature.to_numpy(float) - solute_effects[solute2] - solvent_effects[solvent2]
+    units.loc[selected.index, "solute_effect"] = solute_effects[solute2]
+    units.loc[selected.index, "solvent_effect"] = solvent_effects[solvent2]
+    units.loc[selected.index, "additive_residual"] = residual
+    units.loc[selected.index, "retained_component"] = component
+    units.loc[selected.index, "fit_quality"] = json_text({
+        "additive_model_rmse": float(np.sqrt(np.mean(residual ** 2))),
+        "n_components": count, "component": component,
+    })
+    return units
+
+
+def comparison_signatures(nodes, unit_signatures):
+    """Create auditable, dataset-level solute effects for shared-solute pairs."""
+    columns = ["node_id", "dataset", "solute", "signature", "signature_type", "n_units",
+               "additive_model_component", "status", "fit_formula", "fit_method", "fit_quality",
+               "source_files", "system", "signature_kind", "reference_mismatch",
+               "actual_reference", "extrapolated"]
+    if unit_signatures.empty:
+        return pd.DataFrame(columns=columns)
+    records = []
+    by_id = {node["node_id"]: node for node in nodes}
+    for node_id, frame in unit_signatures.groupby("node_id", sort=True):
+        node = by_id[node_id]
+        if node["source_dataset"] not in SOLUTE_EFFECT_DATASETS | {TRANSFER_ORGANIC}:
+            continue
+        for solute, group in frame.groupby("solute", sort=True):
+            effects = (group["solute_effect"] if "solute_effect" in group
+                       else pd.Series(np.nan, index=group.index))
+            selected = group.loc[np.isfinite(effects)]
+            valid = not selected.empty
+            residual = (pd.to_numeric(selected.get("additive_residual"), errors="coerce").dropna()
+                        if valid and "additive_residual" in selected else pd.Series(dtype=float))
+            quality = ({"additive_model_rmse": float(np.sqrt(np.mean(residual.to_numpy(float) ** 2))),
+                        "n_component_units": len(selected)} if not residual.empty else
+                       {"n_component_units": len(selected)} if valid else {})
+            records.append({
+                "node_id": node_id, "dataset": node["source_dataset"], "solute": solute,
+                "signature": float(selected.solute_effect.iloc[0]) if valid else np.nan,
+                "signature_type": "solute_effect", "n_units": len(group),
+                "additive_model_component": (int(selected.retained_component.iloc[0]) if valid else np.nan),
+                "status": "ok" if valid else "unidentifiable_additive_component",
+                "fit_formula": node["formula"],
+                "fit_method": ("equal_weight_solute_solvent_additive" if node["source_dataset"] == TRANSFER_ORGANIC
+                               else "equal_weight_il_solute_additive"),
+                "fit_quality": json_text(quality),
+                "source_files": json_text([str(path) for path in node["files"]]),
+                "system": str(solute), "signature_kind": "solute_effect",
+                "reference_mismatch": bool(selected.reference_mismatch.any()) if valid else False,
+                "actual_reference": json_text(sorted(set(selected.actual_reference))) if valid else "{}",
+                "extrapolated": bool(selected.extrapolated.any()) if valid else False,
+            })
+    return pd.DataFrame(records, columns=columns)
+
+
 def build_signatures(nodes, config):
     inventory, review, signatures, units = [], [], [], []
     for node in nodes:
@@ -488,8 +595,10 @@ def build_signatures(nodes, config):
         record.update(n_rows=0, n_valid_observations=0, n_observation_systems=0, n_valid_signatures=0)
         if not node["excluded_reason"]:
             frame = valid_frame(node)
+            identity = (["solute", "solvent"] if node["source_dataset"] == TRANSFER_ORGANIC
+                        else ["cation", "anion"])
             record.update(n_rows=len(node["frame"]), n_valid_observations=len(frame),
-                          n_observation_systems=frame.groupby(["cation", "anion"]).ngroups)
+                          n_observation_systems=frame.groupby(identity).ngroups)
             coverage = {}
             for col in filter(None, node["condition_columns"].split(";")):
                 if col not in frame:
@@ -499,8 +608,15 @@ def build_signatures(nodes, config):
                 coverage[col] = {"n_missing": int((~np.isfinite(v)).sum()),
                                  "min": float(v.min()) if np.isfinite(v.min()) else None,
                                  "max": float(v.max()) if np.isfinite(v.max()) else None,
-                                 "n_varied_systems": int((frame.groupby(["cation", "anion"])[col].nunique() > 1).sum())}
-            if node["system_type"] == "il_solute" and node["formula"].startswith("solute_"):
+                                 "n_varied_systems": int((frame.groupby(identity)[col].nunique() > 1).sum())}
+            organic = node["source_dataset"] == TRANSFER_ORGANIC
+            if organic:
+                unit_frame = organic_solute_signatures(frame, node, config["references"])
+                rows = []
+                if not unit_frame.empty:
+                    unit_frame["node_id"] = node["node_id"]
+                    units.extend(unit_frame.to_dict("records"))
+            elif node["system_type"] == "il_solute" and node["formula"].startswith("solute_"):
                 rows, unit_frame = solute_signatures(frame, node, config["references"])
                 if not unit_frame.empty:
                     unit_frame["node_id"] = node["node_id"]
@@ -514,12 +630,19 @@ def build_signatures(nodes, config):
                            formula_version=config["version"], source_files=record["source_files"])
                 row["system"] = json_text([row["cation"], row["anion"]])
                 signatures.append(row)
-            record["n_valid_signatures"] = sum(np.isfinite(r["signature"]) for r in rows)
-            statuses = pd.Series([r["status"] for r in rows], dtype=str).value_counts().to_dict()
+            if organic:
+                effects = (unit_frame["solute_effect"] if "solute_effect" in unit_frame
+                           else pd.Series(np.nan, index=unit_frame.index))
+                record["n_valid_signatures"] = int(unit_frame.loc[np.isfinite(effects), "solute"].nunique())
+                statuses = {"ok": record["n_valid_signatures"],
+                            "unidentifiable_additive_component": int(frame.solute.nunique() - record["n_valid_signatures"])}
+            else:
+                record["n_valid_signatures"] = sum(np.isfinite(r["signature"]) for r in rows)
+                statuses = pd.Series([r["status"] for r in rows], dtype=str).value_counts().to_dict()
             review.append({"node_id": node["node_id"], "formula": node["formula"],
                            "approval_status": "pending_formula" if node["formula"] == "pending_formula" else "approved",
                            "condition_coverage": json_text(coverage), "signature_status_counts": json_text(statuses),
-                           "n_single_observation_systems": int((frame.groupby(["cation", "anion"]).size() == 1).sum())})
+                           "n_single_observation_systems": int((frame.groupby(identity).size() == 1).sum())})
         inventory.append(record)
     signature_frame = pd.DataFrame(signatures)
     if signature_frame.empty:
@@ -538,7 +661,8 @@ def quantile_labels(values, bins):
     if len(np.unique(cuts)) != bins + 1:
         return None
     labels = np.searchsorted(cuts[1:-1], values, side="right")
-    return labels if len(np.unique(labels)) == bins else None
+    counts = np.bincount(labels, minlength=bins)
+    return labels if len(np.unique(labels)) == bins and np.all(counts >= 5) else None
 
 
 def distance_correlation(x, y):
@@ -574,7 +698,7 @@ def metric_values(x, y, thresholds=(None, None)):
                 else:
                     zx, zy = (x - x.mean()) / x.std(), (y - y.mean()) / y.std()
                     values[metric] = distance_correlation(zx, zy)
-    if n >= 30:
+    if n >= 20:
         bins = 5 if n >= 150 else 4 if n >= 80 else 3
         lx, ly = quantile_labels(x, bins), quantile_labels(y, bins)
         if lx is None or ly is None:
@@ -841,50 +965,95 @@ def render_knowledge_graphs(nodes, graph_results, labels, out, seed, dpi):
     return graphs, positions
 
 
-def compute_graphs(nodes, signatures, config, out, seed, dpi=300, unit_signatures=None):
+def compute_graphs(nodes, signatures, config, out, seed, dpi=300,
+                   comparison_signature_frame=None):
     included = [n for n in nodes if not n["excluded_reason"]]
     labels = dataset_labels(nodes)
     groups = {s: [n for n in included if n["stage"] == s] for s in (2, 3)}
+    se_targets = [node for node in groups[3] if node["source_dataset"] != TRANSFER_ORGANIC]
     data = {}
     graph_results = {}
     for node in included:
         rows = signatures.loc[signatures.node_id == node["node_id"]]
         valid = rows.loc[np.isfinite(rows.signature)].set_index("system")
         data[node["node_id"]] = (rows, valid)
-    unit_data = {}
-    if unit_signatures is not None and not unit_signatures.empty:
+    comparison_data = {}
+    if comparison_signature_frame is not None and not comparison_signature_frame.empty:
         for node in included:
-            rows = unit_signatures.loc[unit_signatures.node_id == node["node_id"]].copy()
+            rows = comparison_signature_frame.loc[
+                comparison_signature_frame.node_id == node["node_id"]].copy()
             if rows.empty:
                 continue
-            rows["system"] = [json_text([row.cation, row.anion, row.solute])
-                              for row in rows.itertuples()]
             valid = rows.loc[np.isfinite(rows.signature)].set_index("system")
-            unit_data[node["node_id"]] = (rows, valid)
+            comparison_data[node["node_id"]] = (rows, valid)
     for name, sources in (("G_EE", groups[3]), ("G_SE", groups[2])):
         directory = out / name; directory.mkdir()
-        source_ids = [n["node_id"] for n in sources]; target_ids = [n["node_id"] for n in groups[3]]
+        targets = groups[3] if name == "G_EE" else se_targets
+        source_ids = [n["node_id"] for n in sources]; target_ids = [n["node_id"] for n in targets]
         matrices = {m: pd.DataFrame(np.nan, index=source_ids, columns=target_ids)
                     for m in ("n_shared", "n_observation_shared", *METRICS)}
         pairs, confidence, reasons = [], [], []
-        work = [(a, b) for i, a in enumerate(sources) for j, b in enumerate(groups[3]) if name != "G_EE" or i < j]
+        work = [(a, b) for i, a in enumerate(sources) for j, b in enumerate(targets)
+                if name != "G_EE" or i < j]
         if name == "G_EE":
             for node in sources:
-                rows, valid = data[node["node_id"]]
+                if node["source_dataset"] == TRANSFER_ORGANIC:
+                    rows, valid = comparison_data[node["node_id"]]
+                else:
+                    rows, valid = data[node["node_id"]]
                 matrices["n_shared"].loc[node["node_id"], node["node_id"]] = len(valid)
                 matrices["n_observation_shared"].loc[node["node_id"], node["node_id"]] = len(rows)
                 reasons.extend({"source": node["node_id"], "target": node["node_id"], "metric": m,
-                                "reason": "diagonal_not_computed"} for m in METRICS)
+                                "reason": "diagonal_not_computed", "comparison_space": (
+                                    "shared_solute" if node["source_dataset"] == TRANSFER_ORGANIC else "il_system")}
+                               for m in METRICS)
         for number, (a, b) in enumerate(work, 1):
             aid, bid = a["node_id"], b["node_id"]
             print(f"{name} {number}/{len(work)}: {aid} -> {bid}", file=sys.stderr, flush=True)
-            use_solute_identity = {a["source_dataset"], b["source_dataset"]} == SOLUTE_PAIR_DATASETS
-            if use_solute_identity:
-                if aid not in unit_data or bid not in unit_data:
-                    raise ValueError("Solvation-transfer comparison requires unit signatures")
-                ar, av = unit_data[aid]; br, bv = unit_data[bid]
+            datasets = {a["source_dataset"], b["source_dataset"]}
+            has_organic = TRANSFER_ORGANIC in datasets
+            shared_solute = has_organic and bool(datasets & SOLUTE_EFFECT_DATASETS)
+            incompatible = has_organic and not shared_solute
+            if incompatible:
+                metadata = {"comparison_space": "incompatible_topology", "signature_type": "not_applicable",
+                            "source_signature_type": "not_applicable", "target_signature_type": "not_applicable"}
+                for source, target in ((aid, bid), (bid, aid)):
+                    pair = {"source": source, "target": target, "n_shared": np.nan,
+                            "n_observation_shared": np.nan, "system_identity": "incompatible_topology",
+                            "shared_systems": "[]", "signature_kinds": "[]", "mixed_signature_kinds": False,
+                            "reference_mismatch": False, "heterogeneous_actual_references": False,
+                            "extrapolated": False, "source_pending_formula": False,
+                            "target_pending_formula": False, **metadata}
+                    for metric in METRICS:
+                        pair[metric] = np.nan
+                        pair[metric + "_status"] = "incompatible_topology"
+                        reasons.append({"source": source, "target": target, "metric": metric,
+                                        "reason": "incompatible_topology", **metadata})
+                        confidence.append({"source": source, "target": target, "metric": metric,
+                                           "status": "incompatible_topology", "lower": np.nan,
+                                           "upper": np.nan, **metadata})
+                    pairs.append(pair)
+                continue
+            if shared_solute:
+                if aid not in comparison_data or bid not in comparison_data:
+                    raise ValueError("Shared-solute comparison requires comparison signatures")
+                ar, av = comparison_data[aid]; br, bv = comparison_data[bid]
+                comparison_space = "shared_solute"
+                edge_signature_type = source_signature_type = target_signature_type = "solute_effect"
+                system_identity = "solute"
             else:
                 ar, av = data[aid]; br, bv = data[bid]
+                comparison_space = "il_system"
+                edge_signature_type = ("solute_controlled_il_effect" if datasets & SOLUTE_EFFECT_DATASETS
+                                       else "system_signature")
+                source_signature_type = ("solute_controlled_il_effect"
+                                         if a["source_dataset"] in SOLUTE_EFFECT_DATASETS else "system_signature")
+                target_signature_type = ("solute_controlled_il_effect"
+                                         if b["source_dataset"] in SOLUTE_EFFECT_DATASETS else "system_signature")
+                system_identity = "cation_anion"
+            metadata = {"comparison_space": comparison_space, "signature_type": edge_signature_type,
+                        "source_signature_type": source_signature_type,
+                        "target_signature_type": target_signature_type}
             shared = sorted(set(av.index) & set(bv.index))
             nobs = len(set(ar.system) & set(br.system))
             x, y = av.loc[shared].signature.to_numpy(float), bv.loc[shared].signature.to_numpy(float)
@@ -895,13 +1064,16 @@ def compute_graphs(nodes, signatures, config, out, seed, dpi=300, unit_signature
             if not shared:
                 statuses["predictability_cv_nmae"] = "no_shared_signatures"
             def store(source, target, vals, states, source_valid, target_valid):
+                pair_metadata = (metadata if source == aid else
+                                 dict(metadata, source_signature_type=metadata["target_signature_type"],
+                                      target_signature_type=metadata["source_signature_type"]))
                 matrices["n_shared"].loc[source, target] = len(shared)
                 matrices["n_observation_shared"].loc[source, target] = nobs
                 kinds = sorted(set(source_valid.loc[shared].signature_kind) | set(target_valid.loc[shared].signature_kind))
                 mismatch = bool(source_valid.loc[shared].reference_mismatch.any() or target_valid.loc[shared].reference_mismatch.any())
                 actual = set(source_valid.loc[shared].actual_reference) | set(target_valid.loc[shared].actual_reference)
                 pair = {"source": source, "target": target, "n_shared": len(shared), "n_observation_shared": nobs,
-                        "system_identity": "cation_anion_solute" if use_solute_identity else "cation_anion",
+                        "system_identity": system_identity,
                         "shared_systems": json_text(shared), "signature_kinds": json_text(kinds),
                         "mixed_signature_kinds": len(kinds) > 1 or bool(
                             source_valid.loc[shared].get("mixed_unit_signature_kinds", pd.Series(dtype=bool)).fillna(False).any()
@@ -910,16 +1082,18 @@ def compute_graphs(nodes, signatures, config, out, seed, dpi=300, unit_signature
                         "heterogeneous_actual_references": len(actual) > 1,
                         "extrapolated": bool(source_valid.loc[shared].extrapolated.any() or target_valid.loc[shared].extrapolated.any()),
                         "source_pending_formula": a["formula"] == "pending_formula" if source == aid else b["formula"] == "pending_formula",
-                        "target_pending_formula": b["formula"] == "pending_formula" if target == bid else a["formula"] == "pending_formula"}
+                        "target_pending_formula": b["formula"] == "pending_formula" if target == bid else a["formula"] == "pending_formula",
+                        **pair_metadata}
                 for m in METRICS:
                     matrices[m].loc[source, target] = vals[m]
                     pair[m] = vals[m]; pair[m + "_status"] = states[m]
                     if not np.isfinite(vals[m]):
-                        reasons.append({"source": source, "target": target, "metric": m, "reason": states[m]})
+                        reasons.append({"source": source, "target": target, "metric": m,
+                                        "reason": states[m], **pair_metadata})
                 pairs.append(pair)
             store(aid, bid, values, statuses, av, bv)
             conf = confidence_rows(x, y, values, thresholds, pair_seed, config["stability"])
-            confidence.extend(dict(source=aid, target=bid, **r) for r in conf)
+            confidence.extend(dict(source=aid, target=bid, **metadata, **r) for r in conf)
             if name == "G_EE":
                 reverse = dict(values); reverse_states = dict(statuses)
                 reverse_binary, rs = metric_values(y, x, thresholds[::-1])
@@ -932,8 +1106,12 @@ def compute_graphs(nodes, signatures, config, out, seed, dpi=300, unit_signature
                 # Symmetric estimates and uncertainty are mirrored exactly.
                 reverse_conf = confidence_rows(y, x, {m: reverse[m] if m not in SYMMETRIC else np.nan for m in METRICS},
                                                thresholds[::-1], pair_seed, config["stability"])
-                confidence.extend(dict(source=bid, target=aid, **r) for r in conf if r["metric"] in SYMMETRIC)
-                confidence.extend(dict(source=bid, target=aid, **r) for r in reverse_conf if r["metric"] not in SYMMETRIC)
+                reverse_metadata = dict(metadata, source_signature_type=metadata["target_signature_type"],
+                                        target_signature_type=metadata["source_signature_type"])
+                confidence.extend(dict(source=bid, target=aid, **reverse_metadata, **r)
+                                  for r in conf if r["metric"] in SYMMETRIC)
+                confidence.extend(dict(source=bid, target=aid, **reverse_metadata, **r)
+                                  for r in reverse_conf if r["metric"] not in SYMMETRIC)
         for m, matrix in matrices.items():
             matrix.rename_axis("source_node").to_csv(directory / f"{m}.csv", na_rep="NA")
         write_overlap_outputs(matrices["n_shared"], labels, directory, dpi)
@@ -957,11 +1135,13 @@ def run(command, input_root, output_dir, config_path=DEFAULT_CONFIG, seed=42, dp
     config = load_config(config_path)
     nodes, inputs = discover(input_root, config)
     inventory, review, signatures, units = build_signatures(nodes, config)
+    comparisons = comparison_signatures(nodes, units)
     out.mkdir(parents=True, exist_ok=True)
     write_csv(inventory, out / "dataset_inventory.csv")
     write_csv(review, out / "formula_review.csv")
     write_csv(signatures, out / "system_signatures.csv")
     write_csv(units, out / "solute_unit_signatures.csv")
+    write_csv(comparisons, out / "comparison_signatures.csv")
     manifest = {"status": "running", "command": command, "seed": seed, "input_root": str(input_root),
                 "input_hashes": inputs, "config": config, "config_sha256": file_hash(config_path),
                 "script_sha256": file_hash(__file__),
@@ -976,7 +1156,7 @@ def run(command, input_root, output_dir, config_path=DEFAULT_CONFIG, seed=42, dp
     path.write_text(json.dumps(manifest, indent=2))
     try:
         if command == "compute":
-            compute_graphs(nodes, signatures, config, out, seed, dpi, units)
+            compute_graphs(nodes, signatures, config, out, seed, dpi, comparisons)
     except BaseException as exc:
         manifest.update(status="failed", error=str(exc))
         path.write_text(json.dumps(manifest, indent=2))

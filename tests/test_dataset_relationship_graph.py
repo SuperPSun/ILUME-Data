@@ -172,6 +172,27 @@ def test_solute_identification_and_components(config):
     assert np.isnan(rows[-1]['signature'])
 
 
+def test_organic_solute_effects_and_components(config):
+    rows = [
+        {'solute': solute, 'solvent': solvent, 'temperature_K': 298., '_value': se + ve}
+        for solute, se in [('s1', -2.), ('s2', 2.)]
+        for solvent, ve in [('v1', 10.), ('v2', 20.)]
+    ]
+    rows.append({'solute': 'isolated', 'solvent': 'only', 'temperature_K': 298., '_value': 99.})
+    node = {'formula': 'solute_solvent_additive'}
+    units = graph.organic_solute_signatures(pd.DataFrame(rows), node, config['references'])
+    effects = units.dropna(subset=['solute_effect']).groupby('solute').solute_effect.first()
+    assert effects.to_dict() == pytest.approx({'s1': -2., 's2': 2.})
+    assert effects.mean() == pytest.approx(0)
+    assert units.loc[units.solute == 'isolated', 'solute_effect'].isna().all()
+    varying = pd.DataFrame([
+        {'solute': 's', 'solvent': 'v', 'temperature_K': 298., '_value': 1.},
+        {'solute': 's', 'solvent': 'v', 'temperature_K': 310., '_value': 2.},
+    ])
+    rejected = graph.organic_solute_signatures(varying, node, config['references'])
+    assert rejected.iloc[0].status == 'unexpected_transfer_temperature_variation'
+
+
 def test_metrics_symmetry_pair_bins_small_and_ties():
     rng=np.random.default_rng(2);x=rng.normal(size=100);y=x*x+.1*rng.normal(size=100)
     a,_=graph.metric_values(x,y);b,_=graph.metric_values(y,x)
@@ -230,6 +251,30 @@ def fixture_root(tmp_path):
             pd.DataFrame({'cation':['REPEAT'],'anion':['a'],'b':[999]}).to_csv(extra,index=False)
     pd.DataFrame(entries).to_csv(root/'task_catalog.csv',index=False)
     return root
+
+
+def test_transfer_organic_discovery_uses_random_development_only(tmp_path, config):
+    root = tmp_path/'splits'; root.mkdir()
+    materialized = 'stage3/experiment/transfer_organic'
+    pd.DataFrame([{
+        'stage': 3, 'task_id': 'experiment/transfer_organic',
+        'source_file': graph.TRANSFER_ORGANIC,
+        'target_columns': 'transfer_organic_kcal/mol', 'system_type': 'solute_solvent',
+        'materialized_path': materialized, 'repeats': 1,
+        'condition_columns': 'temperature_K',
+    }]).to_csv(root/'task_catalog.csv', index=False)
+    directory = root/materialized
+    for strategy in ['random', 'solute', 'solvent', 'solute-solvent']:
+        for fold in range(1, 6):
+            path = directory/strategy/f'fold{fold}.csv'; path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({'solute': [f'{strategy}-{fold}'], 'solvent': ['v'],
+                          'temperature_K': [298.], 'transfer_organic_kcal/mol': [fold]}).to_csv(path, index=False)
+    pd.DataFrame({'solute': ['TEST'], 'solvent': ['v'], 'temperature_K': [298.],
+                  'transfer_organic_kcal/mol': [99]}).to_csv(directory/'test.csv', index=False)
+    nodes, inputs = graph.discover(root, config)
+    assert len(nodes) == 1 and not nodes[0]['excluded_reason']
+    assert set(nodes[0]['frame'].solute) == {f'random-{fold}' for fold in range(1, 6)}
+    assert all('/random/fold' in path for path in inputs if path.endswith('.csv') and 'task_catalog' not in path)
 
 
 def test_discovery_and_end_to_end(tmp_path,config):
@@ -313,7 +358,7 @@ def test_discrete_mi_stability_and_degenerate_reporting(config):
 
 
 @pytest.mark.parametrize('n,bins,counts', [
-    (29,None,None),(30,3,[10]*3),(79,3,[26,26,27]),
+    (19,None,None),(20,3,[7,6,7]),(79,3,[26,26,27]),
     (80,4,[20]*4),(149,4,[37,37,37,38]),(150,5,[30]*5),
 ])
 def test_multiclass_sample_boundaries(n,bins,counts):
@@ -326,6 +371,14 @@ def test_multiclass_sample_boundaries(n,bins,counts):
         assert np.bincount(graph.quantile_labels(x,bins)).tolist()==counts
         probabilities=np.array(counts)/n
         assert values['multiclass_mi']==pytest.approx(-np.sum(probabilities*np.log(probabilities)))
+
+
+def test_multiclass_requires_five_samples_per_marginal_bin():
+    x = np.repeat(np.arange(4.), [1, 1, 11, 7])
+    assert graph.quantile_labels(x, 3) is None
+    values, states = graph.metric_values(x, np.arange(20.))
+    assert np.isnan(values['multiclass_mi'])
+    assert states['multiclass_mi'] == 'degenerate_quantile_bins'
 
 
 def test_binary_threshold_and_directed_normalization():
@@ -382,7 +435,7 @@ def test_knowledge_graph_direction_significance_and_strength():
     assert widths[0] > widths[1]
 
 
-def test_solvation_transfer_uses_il_solute_identity(tmp_path, config):
+def test_solvation_transfer_uses_il_level_identity(tmp_path, config):
     nodes = [
         {'node_id': 'sim', 'source_dataset': 'simulation/density.csv', 'target_property': 'x',
          'stage': 2, 'excluded_reason': '', 'formula': 'linear_temperature'},
@@ -409,18 +462,80 @@ def test_solvation_transfer_uses_il_solute_identity(tmp_path, config):
     local['stability'] = dict(config['stability'], bootstrap=2, permutation=2,
                               cv_repeats=2, cv_permutation=2)
     out = tmp_path/'solute-pair';out.mkdir()
-    graph.compute_graphs(nodes, signatures, local, out, 42, dpi=30, unit_signatures=units)
+    graph.compute_graphs(nodes, signatures, local, out, 42, dpi=30)
     counts = pd.read_csv(out/'G_EE/n_shared.csv', index_col=0)
     assert counts.loc['solvation', 'solvation'] == 1
     assert counts.loc['transfer', 'transfer'] == 1
-    assert counts.loc['solvation', 'transfer'] == 2
+    assert counts.loc['solvation', 'transfer'] == 1
     pairs = pd.read_csv(out/'G_EE/pairs.csv')
     pair = pairs.loc[(pairs.source == 'solvation') & (pairs.target == 'transfer')].iloc[0]
-    assert pair.system_identity == 'cation_anion_solute'
-    assert pair.n_observation_shared == 2
-    assert len(json.loads(pair.shared_systems)) == 2
+    assert pair.system_identity == 'cation_anion'
+    assert pair.comparison_space == 'il_system'
+    assert pair.signature_type == 'solute_controlled_il_effect'
+    assert pair.n_observation_shared == 1
+    assert len(json.loads(pair.shared_systems)) == 1
     se_pairs = pd.read_csv(out/'G_SE/pairs.csv')
     assert set(se_pairs.system_identity) == {'cation_anion'}
+
+
+def test_transfer_organic_shared_solute_topology(tmp_path, config):
+    nodes = [
+        {'node_id': 'sim', 'source_dataset': 'simulation/density.csv', 'target_property': 'x',
+         'stage': 2, 'excluded_reason': '', 'formula': 'linear_temperature'},
+        {'node_id': 'ordinary', 'source_dataset': 'experiment/density.csv', 'target_property': 'x',
+         'stage': 3, 'excluded_reason': '', 'formula': 'log_density'},
+        {'node_id': 'solvation', 'source_dataset': 'experiment/solvation.csv', 'target_property': 'x',
+         'stage': 3, 'excluded_reason': '', 'formula': 'solute_linear_temperature'},
+        {'node_id': 'transfer', 'source_dataset': 'experiment/transfer.csv', 'target_property': 'x',
+         'stage': 3, 'excluded_reason': '', 'formula': 'solute_only'},
+        {'node_id': 'organic', 'source_dataset': graph.TRANSFER_ORGANIC, 'target_property': 'x',
+         'stage': 3, 'excluded_reason': '', 'formula': 'solute_solvent_additive'},
+    ]
+    provenance = {'signature_kind': 'condition_corrected', 'reference_mismatch': False,
+                  'actual_reference': '{}', 'extrapolated': False}
+    signatures = pd.DataFrame([
+        {'node_id': node, 'system': json.dumps([f'c{i}', 'a']), 'signature': float(i), **provenance}
+        for node in ['sim', 'ordinary', 'solvation', 'transfer'] for i in range(30)
+    ])
+    comparisons = pd.DataFrame([
+        {'node_id': node, 'system': f's{i}', 'solute': f's{i}', 'signature': float(i) * scale,
+         'signature_kind': 'solute_effect', 'reference_mismatch': False,
+         'actual_reference': '{}', 'extrapolated': False}
+        for node, scale in [('solvation', 1.), ('transfer', 2.), ('organic', 3.)]
+        for i in range(30)
+    ] + [
+        {'node_id': 'organic', 'system': 'isolated', 'solute': 'isolated', 'signature': np.nan,
+         'signature_kind': 'solute_effect', 'reference_mismatch': False,
+         'actual_reference': '{}', 'extrapolated': False}
+    ])
+    local = dict(config)
+    local['stability'] = dict(config['stability'], bootstrap=2, permutation=2,
+                              cv_repeats=2, cv_permutation=2)
+    out = tmp_path/'organic-graph'; out.mkdir()
+    graph.compute_graphs(nodes, signatures, local, out, 42, dpi=30,
+                         comparison_signature_frame=comparisons)
+    ee = pd.read_csv(out/'G_EE/n_shared.csv', index_col=0)
+    assert ee.shape == (4, 4)
+    assert ee.loc['organic', 'organic'] == 30
+    assert ee.loc['organic', 'solvation'] == 30
+    assert ee.loc['organic', 'transfer'] == 30
+    assert np.isnan(ee.loc['organic', 'ordinary'])
+    se = pd.read_csv(out/'G_SE/n_shared.csv', index_col=0)
+    assert se.shape == (1, 3) and 'organic' not in se.columns
+    pairs = pd.read_csv(out/'G_EE/pairs.csv')
+    allowed = pairs[(pairs.source == 'organic') & pairs.target.isin(['solvation', 'transfer'])]
+    assert set(allowed.comparison_space) == {'shared_solute'}
+    assert set(allowed.signature_type) == {'solute_effect'}
+    assert set(allowed.n_observation_shared) == {30}
+    blocked = pairs[(pairs.source == 'organic') & (pairs.target == 'ordinary')].iloc[0]
+    assert blocked.comparison_space == 'incompatible_topology'
+    assert blocked.spearman_status == 'incompatible_topology'
+    assert np.isnan(blocked.n_shared)
+    confidence = pd.read_csv(out/'G_EE/confidence.csv')
+    blocked_confidence = confidence[(confidence.source == 'organic') &
+                                    (confidence.target == 'ordinary')]
+    assert set(blocked_confidence.status) == {'incompatible_topology'}
+    assert len(blocked_confidence) == len(EXPECTED_METRICS)
 
 
 def test_nmae_is_oof_median_error_ratio(monkeypatch):

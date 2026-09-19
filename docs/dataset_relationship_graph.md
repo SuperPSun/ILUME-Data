@@ -31,7 +31,8 @@ valid only. Stage3 uses all five IL folds of cv1 for repeated tasks, otherwise
 all five IL folds directly. Other strategies, repeats, test, summary and resource
 files are not concatenated. Existing materialized cation/anion strings define
 identities; this analysis does not recanonicalize or merge chemical equivalents.
-Non-IL and transfer_organic nodes are inventoried but excluded from matrices.
+Non-IL nodes are inventoried but excluded from matrices, except the experimental
+`transfer_organic` node described below.
 Invalid target/identity rows do not contribute observation overlap counts.
 
 `configs/dataset_relationship_formulas_v2.json` records the user-approved formulas,
@@ -85,19 +86,28 @@ that mixture propagates to the pair audit flag. The IL effect
 standard error is conditional on those unit signatures and does not propagate
 all temperature-fit errors.
 
-The solvation-transfer pair is the one exception to the main IL identity: it
-intersects valid unit signatures on `(cation, anion, solute)`. Comparisons of
-either dataset with every other property continue to use the solute-controlled
-IL-level `(cation, anion)` effects. Consequently, the solvation-transfer off-diagonal
-`N_shared` counts IL-solute units and may exceed either IL-level diagonal count.
+Solvation-transfer and comparisons of either dataset with ordinary IL properties
+use the solute-controlled IL-level `(cation, anion)` effects.
+
+Experimental `transfer_organic` is read only from `random/fold1..5.csv`; test,
+summary and alternate development strategies are not concatenated. Replicates
+are aggregated by `(solute, solvent)` at constant temperature. An equal-weight
+`solute + organic-solvent` additive model controls the solvent effect and extracts
+solute effects constrained to mean zero. Only the largest connected component
+containing at least two solutes is retained. The node is compared only with
+solvation and transfer by exact shared solute strings. Those two datasets use
+their solute effects from the existing `IL + solute` additive fits. Models are fit
+once per dataset before intersection. Every other transfer-organic pair is kept
+as `incompatible_topology` with NA counts and metrics. The solvation-transfer
+edge remains an IL-level comparison.
 
 ## Metrics and stability
 
 Every metric uses the current pair's valid-signature intersection. `n_shared`
 counts that intersection; `n_observation_shared` separately counts shared
 observation identities with usable targets, including failed/pending signatures.
-The identity is normally an IL and is an IL-solute unit only for the
-solvation-transfer pair. All pairs remain present. EE diagonal relationship values are NA; its count diagonal is
+The identity is normally an IL and is a solute only for the two allowed
+transfer-organic pairs. All pairs remain present. EE diagonal relationship values are NA; its count diagonal is
 the number of systems in that node. Directed SE outputs run simulation to
 experiment only. Continuous z-scores use ddof=0.
 
@@ -106,13 +116,15 @@ experiment only. Continuous z-scores use ddof=0.
 | Spearman | 3 | Rank correlation; constants are NA |
 | Distance correlation | 5 | Biased doubly centered distance-matrix estimator |
 | Binary I/H | 2 | MI divided by target-label entropy; zero entropy is NA |
-| Multiclass MI | 30 | 3 bins at 30, 4 at 80, 5 at 150; pair quantiles |
+| Multiclass MI | 20 | 3 bins at 20, 4 at 80, 5 at 150; pair quantiles |
 | CV-NMAE | 20 | Model OOF absolute error divided by training-median baseline OOF absolute error |
 
 `binary_thresholds` is empty in the approved config; optional entries are keyed
 by exact node ID and must use the signature's units. Otherwise each side uses
-its own median on the current shared subset. Degenerate quantile cuts do not
-fall back to fewer bins. Both MI metrics use natural logarithms and discrete pair-specific labels,
+its own median on the current shared subset. Quantile boundaries must be distinct,
+all requested classes must exist, and every marginal bin must contain at least
+five systems. A failure is `degenerate_quantile_bins` and does not fall back to
+fewer bins. Both MI metrics use natural logarithms and discrete pair-specific labels,
 not complete continuous mutual information.
 
 Continuous KSG MI is excluded: its nearest-neighbor estimator is incompatible
@@ -141,7 +153,8 @@ stability and are not parameter confidence intervals. The manifest records this.
 ## Outputs and inspection
 
 Top-level CSVs inventory nodes, formula approval/condition coverage, IL signatures,
-and IL-solute unit signatures. Signature rows include formula version, source
+IL-solute or solute-solvent unit signatures, and `comparison_signatures.csv` with
+the three auditable solute-effect pools. Signature rows include formula version, source
 files, fitted parameters, actual/requested conditions, uncertainty, residual degrees
 of freedom and status. Inventory counts expose invalid observations.
 
@@ -153,8 +166,10 @@ Rows are sources and columns are targets.
 EE symmetric values and their confidence rows are mirrored exactly. Pair records
 include exact shared systems and flags for mixed signature kinds, reference
 mismatches, heterogeneous actual conditions, extrapolation and pending formulas.
-`system_identity` records whether a pair used `cation_anion` or the special
-`cation_anion_solute` identity.
+`comparison_space`, `signature_type`, `source_signature_type`, and
+`target_signature_type` record whether an edge uses IL-system signatures,
+solute-controlled IL effects, shared-solute effects, or an incompatible topology.
+`system_identity` is `cation_anion`, `solute`, or `incompatible_topology`.
 These flags are not automatic filters: inspect them before interpreting metrics.
 Missing numeric values are serialized as `NA`; statuses explain why.
 
