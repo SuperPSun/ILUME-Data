@@ -105,6 +105,11 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
         final_root / "_audit" / "orbital_gap_consistency_summary.csv"
     ).read_bytes() == gap_audit.read_bytes()
     first_manifest = manifest_path.read_bytes()
+    (
+        merged_root
+        / "experiment"
+        / "isobaric_coefficient_of_volume_expansion.csv"
+    ).unlink()
     build_final_data(merged_root, final_root, charge_data_root)
     assert manifest_path.read_bytes() == first_manifest
     assert not stale_file.exists()

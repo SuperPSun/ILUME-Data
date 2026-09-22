@@ -95,7 +95,7 @@ def build_final_data(
             staged_root / "simulation" / charge_data_root.name,
         )
         for filename in EXCLUDED_EXPERIMENT_FILES:
-            (staged_root / "experiment" / filename).unlink()
+            (staged_root / "experiment" / filename).unlink(missing_ok=True)
         for filename in EXCLUDED_SIMULATION_FILES:
             (staged_root / "simulation" / filename).unlink(missing_ok=True)
         remove_charge_mapping(staged_root)
