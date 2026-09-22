@@ -13,7 +13,7 @@ ILUME-Data must publish one unambiguous producer contract without parsing struct
 
 ## Decision
 
-All currently supported simulation supervision is registered explicitly as one of nine Stage2 tasks: PBE/TZVP cation orbitals, PBE/TZVP anion orbitals, partial atomic charge, HF molecular QM properties, density, heat capacity, thermal expansion, heat of vaporization, and organic transfer. Experiment CSVs remain Stage3 tasks except `isobaric_coefficient_of_volume_expansion`, which is excluded from training while retained as the thermal-expansion overlap reference. Unknown top-level simulation CSVs fail discovery; dynamic task metadata and automatic future-property discovery are deferred.
+All currently supported simulation supervision is registered explicitly as one of nine Stage2 tasks: PBE/TZVP cation orbitals, PBE/TZVP anion orbitals, partial atomic charge, HF molecular QM properties, density, heat capacity, thermal expansion, heat of vaporization, and organic transfer. `isobaric_coefficient_of_volume_expansion` is excluded during merged-data publication, so it is unavailable to final-data, training and analysis workflows; the remaining experiment CSVs remain Stage3 tasks. Unknown top-level simulation CSVs fail discovery; dynamic task metadata and automatic future-property discovery are deferred.
 
 Stage2 uses deterministic task-local system hashing with approximately 90% train and 10% validation systems. Conditions never define identity. The split units are cation, anion, canonical molecule SMILES, complete ordered `(cation, anion)`, or ordered `(solute, solvent)` according to the task. Cross-task quarantine is not applied.
 
@@ -23,7 +23,7 @@ PBE/TZVP HOMO and LUMO are one multi-target task per ion role. The source gap is
 
 `build-splits` recursively copies the complete final-data `charge_20260514/` directory into `stage2/partial_atomic_charge/charge_20260514/` during staged publication. The catalog advertises the copied `structure_manifest.csv`, making the materialized Stage2 partial-charge dataset self-contained rather than dependent on the final-data directory.
 
-Property-local experiment exclusion remains limited to density, heat capacity, thermal expansion versus isobaric volume expansion, and organic transfer. Heat of vaporization and unrelated simulation objectives are not filtered against other experimental properties.
+Property-local experiment exclusion remains limited to density, heat capacity and organic transfer. Thermal expansion, heat of vaporization and unrelated simulation objectives are not filtered against experimental properties.
 
 The root `task_catalog.csv` is the producer interface. Task IDs remain globally qualified (`simulation/...` or `experiment/...`) and map to explicit materialized paths. `target_columns` is intentionally conditional: it contains physical CSV columns for object properties and the logical label name for atom properties. Consumers must use `task_kind`, `target_level`, and `label_source` to distinguish those cases. The catalog also records condition and identity columns, split and sample units, simulation method, experiment reference, optional resource manifest, and materialized statistics.
 

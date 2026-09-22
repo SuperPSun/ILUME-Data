@@ -109,6 +109,33 @@ def test_simulation_properties_do_not_receive_default_pressure(
     assert "pressure_kPa" not in out.columns
 
 
+def test_merge_excludes_isobaric_volume_expansion_from_experiment_output(
+    tmp_path: Path,
+):
+    input_root = tmp_path / "cleaned"
+    output_root = tmp_path / "merged"
+    write_csv(
+        input_root / "ILThermo" / "isobaric_coefficient_of_volume_expansion.csv",
+        [
+            {
+                "cation": "CC[n+]1ccn(C)c1",
+                "anion": "F[B-](F)(F)F",
+                "temperature_K": 298.15,
+                "isobaric_coefficient_of_volume_expansion_K^-1": 0.001,
+            }
+        ],
+    )
+
+    merge_data(input_root, output_root)
+
+    assert not (
+        output_root
+        / "experiment"
+        / "isobaric_coefficient_of_volume_expansion.csv"
+    ).exists()
+    assert pd.read_csv(output_root / "merged_manifest.csv").empty
+
+
 def test_property_slug_uses_stable_filename_rules():
     assert property_slug("density_g/cm^3") == "density"
     assert property_slug("viscosity_mPa*s_log10") == "viscosity"

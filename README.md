@@ -97,11 +97,10 @@ with links to source terms.
 Simulation supervision is explicitly registered as nine Stage2 tasks: pooled
 PBE/TZVP HOMO and LUMO, partial atomic charge, HF molecular QM properties, density,
 heat capacity, thermal expansion, heat of vaporization and organic transfer.
-Experiment tasks enter Stage3 except
-`isobaric_coefficient_of_volume_expansion`, which remains final data only and
-is retained as the thermal-expansion overlap reference. Unknown top-level
-simulation CSVs fail; adding a simulation task requires a registry entry and
-tests.
+`isobaric_coefficient_of_volume_expansion` is excluded during merged-data
+publication, so it is unavailable to final-data, training and analysis
+workflows. Other experiment tasks enter Stage3. Unknown top-level simulation
+CSVs fail; adding a simulation task requires a registry entry and tests.
 
 ### Identity and partitions
 
@@ -121,9 +120,9 @@ not applied. Test labels are for final evaluation, never tuning or early stoppin
 these tests do not measure catastrophic forgetting because Stage3 does not modify
 the Stage2 model.
 
-Before splitting, density, heat capacity, thermal expansion and organic transfer
-exclude systems in their respective experiment references (thermal expansion uses
-isobaric volume expansion). Exclusion is property-local; missing references abort.
+Before splitting, density, heat capacity and organic transfer exclude systems in
+their respective experiment references. Exclusion is property-local; missing
+references abort.
 `_audit/stage2_overlap_exclusions.csv` records identities and excluded/matching row counts.
 
 ### Orbital and partial-charge resources

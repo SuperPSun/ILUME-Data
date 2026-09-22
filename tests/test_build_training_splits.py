@@ -2861,8 +2861,8 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         },
         "simulation/thermal_expansion": {
             "raw_rows": 101,
-            "rows": 100,
-            "unique_systems": 99,
+            "rows": 101,
+            "unique_systems": 100,
         },
         "simulation/transfer_organic": {
             "raw_rows": 101,
@@ -3095,7 +3095,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     }
     assert canonical_ion_pair(2) not in heat_capacity_assignments
     assert canonical_ion_pair(51) in heat_capacity_assignments
-    assert canonical_ion_pair(3) not in thermal_expansion_assignments
+    assert canonical_ion_pair(3) in thermal_expansion_assignments
     assert canonical_ion_pair(2) in thermal_expansion_assignments
     assert canonical_ion_pair(51) in thermal_expansion_assignments
     assert set(transfer_assignments) == {
@@ -3192,7 +3192,6 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert overlap_audit.groupby("stage2_task_id").size().to_dict() == {
         "simulation/density": 50,
         "simulation/heat_capacity": 1,
-        "simulation/thermal_expansion": 1,
         "simulation/transfer_organic": 50,
     }
     assert overlap_audit.groupby("stage2_task_id")[
@@ -3200,7 +3199,6 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     ].sum().to_dict() == {
         "simulation/density": 50,
         "simulation/heat_capacity": 1,
-        "simulation/thermal_expansion": 1,
         "simulation/transfer_organic": 51,
     }
     assert overlap_audit["matching_stage3_rows"].eq(1).all()
@@ -3218,14 +3216,6 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         overlap_audit["stage2_task_id"].eq("simulation/heat_capacity"),
         "stage3_task_id",
     ].tolist() == ["experiment/heat_capacity"]
-    assert overlap_audit.loc[
-        overlap_audit["stage2_task_id"].eq(
-            "simulation/thermal_expansion"
-        ),
-        "stage3_task_id",
-    ].tolist() == [
-        "experiment/isobaric_coefficient_of_volume_expansion"
-    ]
     il_overlap = overlap_audit.loc[
         overlap_audit["stage2_task_id"].ne(
             "simulation/transfer_organic"

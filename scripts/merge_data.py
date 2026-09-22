@@ -59,6 +59,9 @@ PROPERTY_LABEL_ALIASES = {
     ("after_AIonopedia", "partition_log10"): "transfer_kcal/mol",
     ("simulation", "solvation_kcal/mol"): "transfer_organic_kcal/mol",
 }
+EXCLUDED_EXPERIMENT_OUTPUT_FILES = frozenset(
+    {"isobaric_coefficient_of_volume_expansion.csv"}
+)
 SOURCE_COLUMNS = {"source", "source_file"}
 MISSING_TOKEN = "__ILUME_MISSING_CONDITION__"
 DEFAULT_REFRACTIVE_INDEX_WAVELENGTH_NM = 589.0
@@ -709,6 +712,12 @@ def collect_bucket(
                 if property_df.empty:
                     continue
                 target_label = output_label(source, label)
+                if (
+                    source in EXPERIMENT_SOURCES
+                    and f"{output_slug(target_label)}.csv"
+                    in EXCLUDED_EXPERIMENT_OUTPUT_FILES
+                ):
+                    continue
                 if target_label != label:
                     property_df = property_df.rename(columns={label: target_label})
                 if target_label in default_pressure_labels:
