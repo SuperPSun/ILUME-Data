@@ -404,9 +404,9 @@ def test_knowledge_graph_direction_significance_and_strength():
     ]
     labels = {'s': 'simulation/s', 'e1': 'experiment/e1', 'e2': 'experiment/e2'}
     columns = {
-        'spearman': [-.5, -.5], 'distance_correlation': [.6, .6],
-        'binary_i_over_h': [.2, .3], 'multiclass_mi': [.4, .4],
-        'predictability_cv_nmae': [.25, 2.],
+        'spearman': [-.7, -.7], 'distance_correlation': [.7, .7],
+        'binary_i_over_h': [.3, .4], 'multiclass_mi': [.4, .4],
+        'predictability_cv_nmae': [.7, 2.],
     }
     ee_pairs = pd.DataFrame({'source': ['e1', 'e2'], 'target': ['e2', 'e1'], **columns})
     se_pairs = pd.DataFrame({'source': ['s'], 'target': ['e1'],
@@ -436,6 +436,37 @@ def test_knowledge_graph_direction_significance_and_strength():
         ('a', 'b', {'value': .25}), ('a', 'c', {'value': 2.}),
     ])
     assert widths[0] > widths[1]
+
+
+@pytest.mark.parametrize('metric,kept,rejected', [
+    ('spearman', -.60, .599),
+    ('distance_correlation', .60, .599),
+    ('binary_i_over_h', .25, .249),
+    ('multiclass_mi', .20, .199),
+    ('predictability_cv_nmae', .80, .801),
+])
+def test_knowledge_graph_visual_thresholds(metric, kept, rejected):
+    pairs = pd.DataFrame({
+        'source': ['a', 'a'], 'target': ['b', 'c'], metric: [kept, rejected],
+    })
+    confidence = pd.DataFrame({
+        'source': ['a', 'a'], 'target': ['b', 'c'], 'metric': [metric, metric],
+        'permutation_p': [.01, .01],
+    })
+    results = {'G_SE': {'pairs': pairs, 'confidence': confidence}}
+    edges = graph.knowledge_graph_edges(metric, results)
+    assert [(edge['source'], edge['target']) for edge in edges] == [('a', 'b')]
+
+
+def test_knowledge_graph_edge_style_uses_strength_and_significance():
+    edges = [
+        ('a', 'b', {'value': .6, 'significant': False}),
+        ('a', 'c', {'value': .9, 'significant': True}),
+    ]
+    widths = graph.edge_widths('distance_correlation', edges)
+    colors = graph.edge_colors('distance_correlation', edges)
+    assert widths[1] > widths[0]
+    assert colors[1][3] > colors[0][3]
 
 
 def test_stage3_knowledge_groups_and_clustered_layout():

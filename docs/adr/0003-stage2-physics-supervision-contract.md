@@ -13,7 +13,7 @@ ILUME-Data must publish one unambiguous producer contract without parsing struct
 
 ## Decision
 
-All currently supported simulation supervision is registered explicitly as one of nine Stage2 tasks: PBE/TZVP cation orbitals, PBE/TZVP anion orbitals, partial atomic charge, HF molecular QM properties, density, heat capacity, thermal expansion, heat of vaporization, and organic transfer. Experiment CSVs remain Stage3 tasks. Unknown top-level simulation CSVs fail discovery; dynamic task metadata and automatic future-property discovery are deferred.
+All currently supported simulation supervision is registered explicitly as one of nine Stage2 tasks: PBE/TZVP cation orbitals, PBE/TZVP anion orbitals, partial atomic charge, HF molecular QM properties, density, heat capacity, thermal expansion, heat of vaporization, and organic transfer. Experiment CSVs remain Stage3 tasks except `isobaric_coefficient_of_volume_expansion`, which is excluded from training while retained as the thermal-expansion overlap reference. Unknown top-level simulation CSVs fail discovery; dynamic task metadata and automatic future-property discovery are deferred.
 
 Stage2 uses deterministic task-local system hashing with approximately 90% train and 10% validation systems. Conditions never define identity. The split units are cation, anion, canonical molecule SMILES, complete ordered `(cation, anion)`, or ordered `(solute, solvent)` according to the task. Cross-task quarantine is not applied.
 

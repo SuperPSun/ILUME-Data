@@ -137,6 +137,9 @@ STAGE2_EXPERIMENT_REFERENCES = {
     ),
     "simulation/transfer_organic.csv": "experiment/transfer_organic.csv",
 }
+EXCLUDED_EXPERIMENT_TRAINING_DATASETS = {
+    "experiment/isobaric_coefficient_of_volume_expansion.csv",
+}
 STAGE2_OVERLAP_AUDIT_COLUMNS = [
     "stage2_task_id",
     "stage3_task_id",
@@ -4765,7 +4768,11 @@ def system_type_for_columns(identity_columns: Sequence[str]) -> str:
     )
 
 
-def discover_tasks(final_root: Path) -> list[TaskSpec]:
+def discover_tasks(
+    final_root: Path,
+    *,
+    include_excluded_experiment_datasets: bool = False,
+) -> list[TaskSpec]:
     final_root = Path(final_root)
     paths = final_csv_paths(final_root)
     relative_paths = {
@@ -4885,6 +4892,11 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
                     has_test=bool(definition.get("has_test", False)),
                 )
             )
+            continue
+        if (
+            relative in EXCLUDED_EXPERIMENT_TRAINING_DATASETS
+            and not include_excluded_experiment_datasets
+        ):
             continue
         identity_columns = tuple(
             column for column in IDENTITY_COLUMNS if column in columns
@@ -5580,6 +5592,13 @@ def build_training_splits(
     validate_final_identity_consistency(final_root)
 
     tasks = discover_tasks(final_root)
+    tasks_by_source = {
+        task.source_file: task
+        for task in discover_tasks(
+            final_root,
+            include_excluded_experiment_datasets=True,
+        )
+    }
     paths = final_csv_paths(final_root)
     checksums = {
         path.relative_to(final_root).as_posix(): file_sha256(path)
@@ -5587,7 +5606,6 @@ def build_training_splits(
     }
     stage2_tasks = [task for task in tasks if task.stage == 2]
     stage3_tasks = [task for task in tasks if task.stage == 3]
-    tasks_by_source = {task.source_file: task for task in tasks}
 
     stage3_profiles: dict[str, TaskProfile] = {}
     systems_by_task: dict[str, pd.DataFrame] = {}
@@ -5662,11 +5680,19 @@ def build_training_splits(
             )
             if reference_source is not None:
                 reference_task = tasks_by_source[reference_source]
+                reference_systems = systems_by_task.get(reference_task.task_id)
+                if reference_systems is None:
+                    reference_frame, _ = prepare_task_frame(
+                        final_root,
+                        reference_task,
+                        checksums[reference_task.source_file],
+                    )
+                    reference_systems = _system_table(reference_frame)
                 frame, overlap_audit = exclude_stage2_experiment_overlap(
                     frame,
                     task,
                     reference_task,
-                    systems_by_task[reference_task.task_id],
+                    reference_systems,
                 )
                 stage2_overlap_audits.append(overlap_audit)
             profile = _profile_task(frame, raw_rows)

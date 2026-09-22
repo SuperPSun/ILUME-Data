@@ -66,6 +66,20 @@ KNOWLEDGE_GROUP_LAYOUT = {
     "static_dielectric": ((-.72, -.55), .13, "F. Static dielectric"),
     "other_stage3": ((1.35, -.72), .22, "Other Stage3"),
 }
+KNOWLEDGE_EDGE_THRESHOLDS = {
+    "spearman": .60,
+    "distance_correlation": .60,
+    "binary_i_over_h": .25,
+    "multiclass_mi": .20,
+    "predictability_cv_nmae": .80,
+}
+KNOWLEDGE_EDGE_THRESHOLD_LABELS = {
+    "spearman": "|value| ≥ 0.60",
+    "distance_correlation": "value ≥ 0.60",
+    "binary_i_over_h": "value ≥ 0.25",
+    "multiclass_mi": "value ≥ 0.20 nat",
+    "predictability_cv_nmae": "value ≤ 0.80",
+}
 
 
 def json_text(value):
@@ -875,6 +889,12 @@ def knowledge_graph_edges(metric, graph_results):
             value = getattr(row, metric)
             if not np.isfinite(value):
                 continue
+            threshold = KNOWLEDGE_EDGE_THRESHOLDS[metric]
+            passes_threshold = (value <= threshold if metric == "predictability_cv_nmae"
+                                else abs(value) >= threshold if metric == "spearman"
+                                else value >= threshold)
+            if not passes_threshold:
+                continue
             if symmetric and group_name == "G_EE" and row.source > row.target:
                 continue
             p_value = p_values.get((row.source, row.target, metric), np.nan)
@@ -919,8 +939,25 @@ def edge_widths(metric, edges):
     if not len(strengths):
         return []
     if np.ptp(strengths) == 0:
-        return [2.] * len(strengths)
-    return (0.6 + 3.4 * (strengths - strengths.min()) / np.ptp(strengths)).tolist()
+        return [2.6] * len(strengths)
+    return (1.0 + 3.8 * (strengths - strengths.min()) / np.ptp(strengths)).tolist()
+
+
+def edge_colors(metric, edges):
+    strengths = np.asarray([edge_strength(metric, data["value"]) for _, _, data in edges], float)
+    if not len(strengths):
+        return []
+    normalized = (np.full(len(strengths), .5) if np.ptp(strengths) == 0 else
+                  (strengths - strengths.min()) / np.ptp(strengths))
+    colors = []
+    for (_, _, data), strength in zip(edges, normalized):
+        if metric == "spearman":
+            color = plt.get_cmap("coolwarm")(.08 + .84 * ((data["value"] + 1) / 2))
+        else:
+            color = plt.get_cmap("Blues")(.38 + .57 * strength)
+        alpha = (.72 + .23 * strength) if data["significant"] else (.20 + .28 * strength)
+        colors.append((*color[:3], alpha))
+    return colors
 
 
 def draw_knowledge_graph(graph, metric, positions, path, dpi):
@@ -945,33 +982,34 @@ def draw_knowledge_graph(graph, metric, positions, path, dpi):
 
     all_edges = list(graph.edges(data=True))
     widths = edge_widths(metric, all_edges)
-    for significant in (False, True):
-        for negative in ((False, True) if metric == "spearman" else (False,)):
-            selected = [(edge, width) for edge, width in zip(all_edges, widths)
-                        if edge[2]["significant"] == significant
-                        and edge[2]["negative"] == negative]
-            if not selected:
-                continue
-            edge_list = [(source, target) for (source, target, _), _ in selected]
-            edge_width = [width for _, width in selected]
-            draw_options = {
-                "edgelist": edge_list, "width": edge_width,
-                "edge_color": "#D62728" if significant else "#A7ADB5",
-                "alpha": .88 if significant else .28,
-                "style": "dashed" if negative else "solid", "ax": axis,
-            }
-            if graph.is_directed():
-                draw_options.update(arrows=True, arrowstyle="-|>", arrowsize=12,
-                                    connectionstyle="arc3,rad=0.08",
-                                    min_source_margin=10, min_target_margin=10)
-            nx.draw_networkx_edges(graph, positions, **draw_options)
+    colors = edge_colors(metric, all_edges)
+    for negative in ((False, True) if metric == "spearman" else (False,)):
+        selected = [(edge, width, color) for edge, width, color in zip(all_edges, widths, colors)
+                    if edge[2]["negative"] == negative]
+        if not selected:
+            continue
+        edge_list = [(source, target) for (source, target, _), _, _ in selected]
+        edge_width = [width for _, width, _ in selected]
+        edge_color = [color for _, _, color in selected]
+        draw_options = {
+            "edgelist": edge_list, "width": edge_width,
+            "edge_color": edge_color,
+            "style": "dashed" if negative else "solid", "ax": axis,
+        }
+        if graph.is_directed():
+            draw_options.update(arrows=True, arrowstyle="-|>", arrowsize=12,
+                                connectionstyle="arc3,rad=0.08",
+                                min_source_margin=10, min_target_margin=10)
+        nx.draw_networkx_edges(graph, positions, **draw_options)
     legend = [
         Line2D([0], [0], marker="s", color="none", markerfacecolor="#377EB8",
                markeredgecolor="white", markersize=10, label="Stage2 simulation"),
         Line2D([0], [0], marker="o", color="none", markerfacecolor="#FF9F1C",
                markeredgecolor="white", markersize=10, label="Stage3 experiment"),
-        Line2D([0], [0], color="#D62728", linewidth=2, label="Permutation p ≤ 0.05"),
-        Line2D([0], [0], color="#A7ADB5", linewidth=2, label="Not significant / unavailable p"),
+        Line2D([0], [0], color="#555555", alpha=.9, linewidth=3,
+               label="Higher opacity: permutation p ≤ 0.05"),
+        Line2D([0], [0], color="#555555", alpha=.3, linewidth=1.5,
+               label="Lower opacity: p > 0.05 / unavailable"),
     ]
     if metric == "spearman":
         legend.extend([
@@ -979,9 +1017,10 @@ def draw_knowledge_graph(graph, metric, positions, path, dpi):
             Line2D([0], [0], color="#555555", linestyle="dashed", label="Negative correlation"),
         ])
     axis.legend(handles=legend, loc="upper left", frameon=True, fontsize=8)
-    axis.set_title(metric.replace("_", " ").title())
+    axis.set_title(f"{metric.replace('_', ' ').title()}\n"
+                   f"Displayed edges: {KNOWLEDGE_EDGE_THRESHOLD_LABELS[metric]}", pad=20)
     axis.set_xlim(-2.05, 1.55)
-    axis.set_ylim(-1.15, 1.25)
+    axis.set_ylim(-1.15, 1.42)
     axis.set_axis_off()
     figure.tight_layout()
     figure.savefig(path, dpi=dpi, bbox_inches="tight")

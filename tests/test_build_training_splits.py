@@ -2871,6 +2871,13 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         },
     }
     stage3 = catalog[catalog["stage"].eq(3)].set_index("task_id")
+    assert "experiment/isobaric_coefficient_of_volume_expansion" not in stage3
+    assert not (
+        output_root
+        / "stage3"
+        / "experiment"
+        / "isobaric_coefficient_of_volume_expansion"
+    ).exists()
     assert stage3.loc["experiment/density", "tier"] == "large"
     assert stage3.loc["experiment/solvation", "tier"] == "medium"
     assert stage3.loc[

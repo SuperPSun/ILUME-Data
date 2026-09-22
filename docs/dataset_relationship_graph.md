@@ -174,17 +174,22 @@ These flags are not automatic filters: inspect them before interpreting metrics.
 Missing numeric values are serialized as `NA`; statuses explain why.
 
 `knowledge_graphs/` contains one combined EE+SE PNG for each of the five metrics.
-All finite relationships are drawn. Raw permutation p-values at or below 0.05
-are highlighted; other edges remain gray. Symmetric metrics use undirected edges,
-while I/H and CV-NMAE retain their legal directions. All figures use the same
-seeded, fixed grouped layout. Stage2 simulation nodes occupy a separate region;
+The graph display is deliberately sparser than the CSV matrices: edges require
+`|Spearman| >= 0.60`, distance correlation `>= 0.60`, binary I/H `>= 0.25`,
+multiclass MI `>= 0.20` nat, or CV-NMAE `<= 0.80`. These are visualization-only
+thresholds; all valid estimates remain in the matrices, pair table, and confidence
+table. Edge width and sequential color intensity increase with relation strength.
+Permutation `p <= 0.05` increases opacity; unavailable or larger p-values remain
+faint. No edge styling depends on the task category. Symmetric metrics use
+undirected edges, while I/H and CV-NMAE retain their legal directions. All figures
+use the same seeded, fixed grouped layout. Stage2 simulation nodes occupy a separate region;
 Stage3 nodes are grouped as transport/dynamics, thermophysical/interfacial,
 phase/stability, solvation/transfer, biological, and static dielectric. Edge color
 is descriptive and is not an FDR-adjusted decision. Graph labels use property
 short names; CSV matrices retain full node IDs.
-Spearman uses solid positive and dashed negative edges. Edge width represents
-absolute Spearman, the raw nonnegative dCor/I/H/multiclass value, or
-`1/(1+CV-NMAE)`, rescaled independently within each figure.
+Spearman uses a signed diverging color scale plus solid positive and dashed negative
+edges. Strength is absolute Spearman, the raw nonnegative dCor/I/H/multiclass value,
+or `1/(1+CV-NMAE)`, rescaled independently within each figure.
 
 `manifest.json` records input/config/script hashes, dependency versions, seed,
 settings, output CSV/PNG hashes and completion/failure status. Treat a running or
