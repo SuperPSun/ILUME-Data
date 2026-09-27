@@ -111,7 +111,7 @@ for one system stay together within that task.
 
 | Stage2 tasks | Partition rule (default seed 42) |
 |---|---|
-| Heat of vaporization, partial atomic charge | Sorted groups, task-local seeded shuffle, grouped 80/10/10 train/validation/test |
+| Thermal expansion, heat of vaporization, partial atomic charge | Sorted groups, task-local seeded shuffle, grouped 80/10/10 train/validation/test |
 | HOMO, LUMO | Shared inherited legacy role-specific 80/10/10 mapping; [ADR 0004](docs/adr/0004-stage2-homo-lumo-scalar-tasks.md) |
 | Remaining tasks | Stable-hash assignment, approximately 90/10 train/validation |
 

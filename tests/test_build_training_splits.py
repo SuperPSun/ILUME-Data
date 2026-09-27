@@ -1,5 +1,6 @@
 import gzip
 import json
+from collections import Counter
 from http.client import IncompleteRead
 from pathlib import Path
 import subprocess
@@ -3045,6 +3046,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         "homo",
         "lumo",
         "partial_atomic_charge",
+        "thermal_expansion",
     }
     assert {
         path.parent.name
@@ -3062,6 +3064,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     thermal_expansion_assignments = stage2_assignments(
         "thermal_expansion",
         ["cation", "anion"],
+        has_test=True,
     )
     stage2_assignments("simulated_qm_elec_hf", ["SMILES"])
     homo_assignments = stage2_assignments(
@@ -3098,6 +3101,14 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert canonical_ion_pair(3) in thermal_expansion_assignments
     assert canonical_ion_pair(2) in thermal_expansion_assignments
     assert canonical_ion_pair(51) in thermal_expansion_assignments
+    assert set(thermal_expansion_assignments) == {
+        canonical_ion_pair(index) for index in range(1, 101)
+    }
+    assert Counter(thermal_expansion_assignments.values()) == {
+        "train": 80,
+        "valid": 10,
+        "test": 10,
+    }
     assert set(transfer_assignments) == {
         canonical_transfer_system(index) for index in range(51, 101)
     }

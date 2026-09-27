@@ -251,6 +251,7 @@ SIMULATION_TASK_REGISTRY = {
         "identity_columns": ("cation", "anion"),
         "system_type": "il",
         "target_columns": ("thermal_expansion_K^-1",),
+        "has_test": True,
     },
     "simulation/heat_of_vaporization.csv": {
         "task_id": "simulation/heat_of_vaporization",
