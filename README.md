@@ -239,3 +239,46 @@ two entries of each size. Its report remains `incomplete` by design. Rerunning
 without `--max-per-mixture` resumes the same snapshot; it does not refresh Search.
 The separate `verify` command is offline and exits nonzero until all manifest
 entries and Silver tables pass validation.
+
+### Offline mixture structuring
+
+From the repository root, structure the existing complete Bronze snapshot:
+
+```bash
+python scripts/structure_ilthermo_mixtures.py \
+  --input-root data/ilthermo_mixtures \
+  --output-root data/structured/ILThermo_mixtures
+python -m pytest tests/test_structure_ilthermo_mixtures.py -q
+```
+
+This command makes no network requests and leaves Bronze/Silver unchanged. It
+requires checksum-valid Bronze for every manifest entry; an invalid input aborts
+before publishing outputs. Output files are staged and individually atomically
+replaced after processing completes. Rerun the command to rebuild them.
+
+- `all/{entries,components,observations}.parquet` covers every property. Entries
+  retain original header definitions and constraints. Observations preserve each
+  actual cell (including null), raw values, uncertainties, phases and units;
+  short rows remain short. Compound names containing commas are matched against
+  complete component names before separating units.
+- `properties/*.csv` provides scalar labels using existing property conversion
+  functions and column names. `sample_id` is `entry_id:data_point_index:variable_index`.
+  Component order is unchanged. SMILES come only from the pinned ilthermopy local
+  mapping, by ID then full name, with RDKit validation; ions are not split.
+- Reported mole fractions, mass fractions and molalities are separate fields;
+  no composition complement or default pressure is invented. Conditions and
+  compositions are assigned only to matching phases or phase-neutral context.
+  Constraints are retained in `constraints_json` and flagged, rather than
+  interpreted as standardized conditions. Raw context stays in `context_json`.
+- Raw uncertainty and its unit remain separate from transformed labels, including
+  log10 labels. Unsupported units, kinematic viscosity, volumetric heat capacity,
+  missing structures, ambiguous context and source irregularities keep their raw
+  records and quality flags; failed standardized fields are empty.
+- `audit/coverage_by_property.csv`, `issues.csv`, `unmatched_structures.csv` and
+  `complex_properties.csv` describe coverage and problems. `summary.json` records
+  input hashes, manifest metadata, library/code versions and conversion/mapping
+  hashes; `inputs.csv` records each Bronze checksum and retrieval timestamp.
+
+These independent mixture outputs are not consumed by merge, final-data or split
+commands. Training-shaped CSV rows can have missing labels or quality flags;
+inspect the audit files before choosing a downstream filtering policy.
