@@ -195,3 +195,46 @@ limitations and validation.
 
 Older structuring scripts are in `trash/`; crawlers and plotting utilities remain
 in `scripts/`.
+
+## ILThermo binary and ternary snapshot
+
+Install `requirements.txt`, then run the independent Bronze/Silver crawler:
+
+```bash
+python scripts/crawl_ilthermo_mixtures.py crawl --output-root data/ilthermo_mixtures
+python scripts/crawl_ilthermo_mixtures.py verify --output-root data/ilthermo_mixtures
+```
+
+The first command searches all binary and ternary entries once, without property
+filters. It freezes both Search manifests in `bronze/manifests/` and resumes missing
+entries on later runs. Use a **new output directory** for a new database snapshot.
+`bronze/entries/<entry_id>.json` contains the complete `GetEntry(...).response`
+without added fields. Separate `bronze/metadata/` files record retrieval time and
+SHA-256. A valid JSON and matching metadata checksum prevent another download.
+Requests run serially with a one-second interval, timeouts, and five attempts with
+exponential backoff. `bronze/failures/` records exhausted requests.
+
+`silver/{entries,components,observations}.parquet` is rebuilt from Bronze on each
+crawl. Component indices are the ILThermo component order (1, 2, 3), with no
+assumed chemical roles. Each observation is one original variable within one
+ILThermo data point; raw header, name, unit, phase, value and uncertainty are
+retained. Data-point totals count original data rows, **not** long-format
+observation rows. No unit conversion, ion decomposition or training preparation is
+performed. `reports/summary.json`, `failures.jsonl`, and
+`coverage_by_property.csv` distinguish pending entries, failures, and count
+mismatches. A mismatch keeps its Bronze response for audit and is reported as a
+failure. `silver/build_info.json` records the code hash and manifest hashes used
+to materialize the tables; offline verification checks their values against Bronze.
+
+For a small live check, use an otherwise empty temporary output directory:
+
+```bash
+python scripts/crawl_ilthermo_mixtures.py crawl \
+  --output-root /tmp/ilthermo_mixtures_smoke --max-per-mixture 2
+```
+
+This still freezes the **complete** two Search manifests, but downloads at most
+two entries of each size. Its report remains `incomplete` by design. Rerunning
+without `--max-per-mixture` resumes the same snapshot; it does not refresh Search.
+The separate `verify` command is offline and exits nonzero until all manifest
+entries and Silver tables pass validation.
