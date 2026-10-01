@@ -144,6 +144,35 @@ def test_failed_download_is_logged_and_resumed(tmp_path, monkeypatch):
     assert entry_calls.count("b2") == 2
 
 
+def test_sparse_source_row_is_retained_and_reported_as_warning(tmp_path, monkeypatch):
+    details = {"b1": response(2, 2), "b2": response(2, 1), "t1": response(3, 1)}
+    details["t1"]["data"][0] = details["t1"]["data"][0][:1]
+    install_fakes(monkeypatch, details)
+    assert crawler.crawl(tmp_path, max_per_mixture=None, attempts=1, pause_seconds=0)
+    report = crawler.load_json(tmp_path / "reports" / "summary.json")
+    assert report["status"] == "complete"
+    assert report["warning_count"] == 1
+    assert (tmp_path / "reports" / "failures.jsonl").read_text() == ""
+    warning = json.loads((tmp_path / "reports" / "warnings.jsonl").read_text())
+    assert warning["entry_id"] == "t1"
+    entries = pd.read_parquet(tmp_path / "silver" / "entries.parquet")
+    assert entries.loc[entries.entry_id == "t1", "validation_status"].iloc[0] == "source_irregular"
+    observations = pd.read_parquet(tmp_path / "silver" / "observations.parquet")
+    assert len(observations.loc[observations.entry_id == "t1"]) == 1
+
+
+def test_getentry_preserves_values_rejected_by_table_parser(monkeypatch):
+    raw = response(2, 1)
+    raw["data"][0][0] = None
+
+    def fake_get_entry(_entry_id):
+        return crawler.ilt_data_structs.ResponseToEntry("b1", raw)
+
+    monkeypatch.setattr(crawler.ilt, "GetEntry", fake_get_entry)
+    entry = crawler.fetch_entry("b1")
+    assert entry.response["data"][0][0] is None
+
+
 def test_verify_detects_silver_value_change(tmp_path, monkeypatch):
     details = {"b1": response(2, 2), "b2": response(2, 1), "t1": response(3, 1)}
     install_fakes(monkeypatch, details)

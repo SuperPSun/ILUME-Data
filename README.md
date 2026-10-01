@@ -225,6 +225,7 @@ performed. `reports/summary.json`, `failures.jsonl`, and
 mismatches. A mismatch keeps its Bronze response for audit and is reported as a
 failure. `silver/build_info.json` records the code hash and manifest hashes used
 to materialize the tables; offline verification checks their values against Bronze.
+Sparse source rows are retained in Silver and described in `reports/warnings.jsonl`.
 
 For a small live check, use an otherwise empty temporary output directory:
 

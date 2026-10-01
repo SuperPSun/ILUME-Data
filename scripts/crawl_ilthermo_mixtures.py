@@ -21,17 +21,19 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import ilthermopy as ilt
 import ilthermopy.requests as ilt_requests
+import ilthermopy.data_structs as ilt_data_structs
 import pandas as pd
 import requests
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ROOT = PROJECT_ROOT / "data" / "ilthermo_mixtures"
-PIPELINE_VERSION = "1.0.0"
+PIPELINE_VERSION = "1.0.1"
 ILTHERMOPY_VERSION = "1.1.2"
 ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 UPDATE_RE = re.compile(r"Updated on ([a-zA-Z]+ +\d+, +\d+)")
@@ -166,6 +168,20 @@ def retry(call: Callable[[], Any], label: str, attempts: int, sleep: Callable[[f
     raise AssertionError("attempts must be positive")
 
 
+def fetch_entry(entry_id: str) -> Any:
+    """Use GetEntry's request while preserving responses its table parser rejects."""
+    original = ilt_data_structs.ResponseToEntry
+
+    def response_to_entry(_code: str, response: dict[str, Any]) -> Any:
+        return SimpleNamespace(response=response)
+
+    ilt_data_structs.ResponseToEntry = response_to_entry
+    try:
+        return ilt.GetEntry(entry_id)
+    finally:
+        ilt_data_structs.ResponseToEntry = original
+
+
 def manifest_path(root: Path, size: int) -> Path:
     return root / "bronze" / "manifests" / ("binary.json" if size == 2 else "ternary.json")
 
@@ -292,13 +308,14 @@ def raw_text(value: Any) -> str | None:
 def parse_entry(
     entry_id: str, size: int, search_row: dict[str, Any],
     response: dict[str, Any], meta: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[str], list[str]]:
     components = response["components"]
     data = response["data"]
     headers = response["dhead"]
     if not isinstance(components, list) or not isinstance(data, list) or not isinstance(headers, list):
         raise ValueError("components, data and dhead must be lists")
     issues = []
+    warnings = []
     if len(components) != int(search_row["num_components"]):
         issues.append(f"component count: Search={search_row['num_components']} detail={len(components)}")
     if len(data) != int(search_row["num_data_points"]):
@@ -344,12 +361,19 @@ def parse_entry(
 
     observation_rows = []
     for point_index, cells in enumerate(data, start=1):
-        if not isinstance(cells, list) or len(cells) != len(headers):
-            raise ValueError(f"data point {point_index} does not match dhead")
+        if not isinstance(cells, list) or len(cells) > len(headers):
+            raise ValueError(f"data point {point_index} has more cells than dhead")
+        if len(cells) < len(headers):
+            warnings.append(f"data point {point_index} has {len(cells)} of {len(headers)} variables")
         for variable_index, (header, cell) in enumerate(zip(headers, cells), start=1):
             if not isinstance(header, list) or not header or not isinstance(header[0], str):
                 raise ValueError(f"invalid dhead variable {variable_index}")
-            if not isinstance(cell, list) or len(cell) not in (1, 2):
+            if cell is None:
+                warnings.append(f"data point {point_index} variable {variable_index} is null")
+                cell_values = (None, None)
+            elif isinstance(cell, list) and len(cell) in (1, 2):
+                cell_values = (raw_text(cell[0]), raw_text(cell[1]) if len(cell) == 2 else None)
+            else:
                 raise ValueError(f"invalid cell at point {point_index}, variable {variable_index}")
             raw_header = header[0]
             name, separator, unit = raw_header.rpartition(",")
@@ -361,15 +385,18 @@ def parse_entry(
                 "variable_name": name.strip() if separator else raw_header,
                 "unit": unit.strip() if separator else None,
                 "phase": raw_text(header[1]) if len(header) > 1 else None,
-                "value_raw": raw_text(cell[0]),
-                "uncertainty_raw": raw_text(cell[1]) if len(cell) == 2 else None,
+                "value_raw": cell_values[0],
+                "uncertainty_raw": cell_values[1],
             })
-    return entry, component_rows, observation_rows, issues
+    if warnings and not issues:
+        entry["validation_status"] = "source_irregular"
+    return entry, component_rows, observation_rows, issues, warnings
 
 
-def collect(root: Path, manifests: dict[int, dict[str, Any]]) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], dict[str, Any]]:
+def collect(root: Path, manifests: dict[int, dict[str, Any]]) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     tables: dict[str, list[dict[str, Any]]] = {"entries": [], "components": [], "observations": []}
     failures = []
+    warnings = []
     summary = {
         "binary": {"manifest_entries": 0, "downloaded_entries": 0, "data_points": 0, "pending_entries": 0, "failed_entries": 0},
         "ternary": {"manifest_entries": 0, "downloaded_entries": 0, "data_points": 0, "pending_entries": 0, "failed_entries": 0},
@@ -410,20 +437,28 @@ def collect(root: Path, manifests: dict[int, dict[str, Any]]) -> tuple[dict[str,
             group["data_points"] += len(raw_points)
             item["data_points"] += len(raw_points)
         try:
-            entry, components, observations, issues = parse_entry(entry_id, size, search_row, raw, meta)
+            entry, components, observations, issues, entry_warnings = parse_entry(entry_id, size, search_row, raw, meta)
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             issues = [f"parse error: {exc}"]
+            entry_warnings = []
         else:
             tables["entries"].append(entry)
             tables["components"].extend(components)
             tables["observations"].extend(observations)
+            warnings.extend({
+                "entry_id": entry_id,
+                "mixture_size": size,
+                "property": search_row["property"],
+                "warning": warning,
+            } for warning in entry_warnings)
         if issues:
             failures.append({"entry_id": entry_id, "mixture_size": size, "property": search_row["property"], "error": "; ".join(issues)})
             group["failed_entries"] += 1
             item["failed_entries"] += 1
     summary["coverage"] = [coverage[key] for key in sorted(coverage)]
+    summary["warning_count"] = len(warnings)
     summary["status"] = "complete" if not failures and not any(summary[name]["pending_entries"] for name in ("binary", "ternary")) else "incomplete"
-    return tables, failures, summary
+    return tables, failures, warnings, summary
 
 
 def write_silver(root: Path, tables: dict[str, list[dict[str, Any]]]) -> None:
@@ -485,7 +520,7 @@ def silver_issues(root: Path, expected: dict[str, list[dict[str, Any]]]) -> list
     return issues
 
 
-def write_reports(root: Path, summary: dict[str, Any], failures: list[dict[str, Any]], issues: list[str]) -> None:
+def write_reports(root: Path, summary: dict[str, Any], failures: list[dict[str, Any]], warnings: list[dict[str, Any]], issues: list[str]) -> None:
     report = root / "reports"
     run_info = load_json(root / "run_info.json")
     build_info_path = root / "silver" / "build_info.json"
@@ -502,6 +537,7 @@ def write_reports(root: Path, summary: dict[str, Any], failures: list[dict[str, 
         "status": "complete" if summary["status"] == "complete" and not issues else "incomplete",
         "binary": summary["binary"],
         "ternary": summary["ternary"],
+        "warning_count": summary["warning_count"],
         "silver_issues": issues,
         "manifest_sha256": {
             "binary": sha256(manifest_path(root, 2).read_bytes()),
@@ -511,6 +547,8 @@ def write_reports(root: Path, summary: dict[str, Any], failures: list[dict[str, 
     atomic_json(report / "summary.json", output)
     text = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in failures)
     atomic_bytes(report / "failures.jsonl", text.encode("utf-8"))
+    warning_text = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in warnings)
+    atomic_bytes(report / "warnings.jsonl", warning_text.encode("utf-8"))
     buffer = io.StringIO()
     columns = ["mixture_size", "property", "manifest_entries", "manifest_data_points", "downloaded_entries", "data_points", "pending_entries", "failed_entries"]
     writer = csv.DictWriter(buffer, fieldnames=columns)
@@ -524,9 +562,9 @@ def verify(root: Path, manifests: dict[int, dict[str, Any]] | None = None) -> tu
         manifests = {size: load_json(manifest_path(root, size)) for size in (2, 3)}
         for size, manifest in manifests.items():
             validate_manifest(manifest, size)
-    tables, failures, summary = collect(root, manifests)
+    tables, failures, warnings, summary = collect(root, manifests)
     issues = silver_issues(root, tables)
-    write_reports(root, summary, failures, issues)
+    write_reports(root, summary, failures, warnings, issues)
     pending = summary["binary"]["pending_entries"] + summary["ternary"]["pending_entries"]
     print(json.dumps({"status": "complete" if not failures and not issues and not pending else "incomplete", "binary": summary["binary"], "ternary": summary["ternary"], "silver_issues": issues}, ensure_ascii=False))
     return failures, issues, pending
@@ -549,12 +587,12 @@ def crawl(root: Path, max_per_mixture: int | None, attempts: int, pause_seconds:
             if index:
                 time.sleep(pause_seconds)
             try:
-                entry = retry(lambda: ilt.GetEntry(entry_id), f"GetEntry({entry_id})", attempts)
+                entry = retry(lambda: fetch_entry(entry_id), f"GetEntry({entry_id})", attempts)
                 save_entry(root, entry_id, entry.response)
             except Exception as exc:
                 _, _, failure_path = entry_paths(root, entry_id)
                 atomic_json(failure_path, {"entry_id": entry_id, "failed_at_utc": utc_now(), "error": str(exc)})
-    tables, _, _ = collect(root, manifests)
+    tables, _, _, _ = collect(root, manifests)
     write_silver(root, tables)
     failures, issues, _ = verify(root, manifests)
     return not issues and not any(failure["entry_id"] in selected_ids for failure in failures) and all(
