@@ -1,9 +1,10 @@
-"""Copy merged experiment/simulation CSVs into final, excluding selected experiments."""
+"""Publish merged data into final, deriving hydration and excluding selected files."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 import shutil
 import tempfile
 from pathlib import Path
@@ -35,6 +36,78 @@ STRUCTURE_MANIFEST_COLUMNS = (
     "sha256",
     "referenced_by_charge",
 )
+
+
+def build_hydration(staged_root: Path) -> None:
+    experiment = staged_root / "experiment"
+    solvation_path = experiment / "solvation.csv"
+    transfer_path = experiment / "transfer.csv"
+    if not solvation_path.exists() and not transfer_path.exists():
+        return
+    if not solvation_path.exists() or not transfer_path.exists():
+        raise ValueError("Hydration requires both solvation.csv and transfer.csv")
+
+    keys = ["cation", "anion", "solute", "temperature_K"]
+    frames = []
+    for path, label in (
+        (solvation_path, "solvation_kcal/mol"),
+        (transfer_path, "transfer_kcal/mol"),
+    ):
+        frame = pd.read_csv(path)
+        required = [*keys, label, "source_list"]
+        missing = set(required) - set(frame.columns)
+        if missing:
+            raise ValueError(f"{path.name}: missing columns {sorted(missing)}")
+        frame = frame[required].copy()
+        for column in keys[:3]:
+            if frame[column].isna().any() or frame[column].astype(str).str.strip().eq("").any():
+                raise ValueError(f"{path.name}: invalid {column}")
+        for column in ("temperature_K", label):
+            frame[column] = pd.to_numeric(frame[column], errors="raise")
+            if not frame[column].map(math.isfinite).all():
+                raise ValueError(f"{path.name}: non-finite {column}")
+        frames.append(frame)
+
+    solvation, transfer = frames
+    candidates = transfer.merge(
+        solvation, on=keys, how="left", suffixes=("_transfer", "_solvation"), indicator=True
+    )
+    # The merge suffixes source_list; restore the original transfer schema for auditing.
+    unmatched = candidates.loc[
+        candidates["_merge"].eq("left_only"),
+        [*keys, "transfer_kcal/mol", "source_list_transfer"],
+    ].rename(columns={"source_list_transfer": "source_list"})
+    paired = candidates.loc[candidates["_merge"].eq("both")].drop(columns="_merge").copy()
+    # Existing transfer labels use the sign convention hydration = solvation + transfer.
+    paired["hydration_kcal/mol"] = paired["solvation_kcal/mol"] + paired["transfer_kcal/mol"]
+    if not paired["hydration_kcal/mol"].map(math.isfinite).all():
+        raise ValueError("Non-finite derived hydration")
+
+    def combine_sources(values: pd.Series) -> str:
+        return "; ".join(sorted({
+            token.strip()
+            for value in values.dropna()
+            for token in str(value).split(";")
+            if token.strip()
+        }))
+
+    paired["source_list"] = (
+        paired["source_list_solvation"].fillna("") + "; "
+        + paired["source_list_transfer"].fillna("")
+    )
+    grouped = paired.groupby(["solute", "temperature_K"], sort=True)
+    summary = grouped["hydration_kcal/mol"].agg(
+        candidate_count="count", minimum_kcal_mol="min",
+        maximum_kcal_mol="max", median_kcal_mol="median",
+    ).reset_index()
+    hydration = grouped.agg({"hydration_kcal/mol": "median", "source_list": combine_sources}).reset_index()
+    hydration.to_csv(experiment / "hydration.csv", index=False)
+    audit = staged_root / "_audit"
+    audit.mkdir(exist_ok=True)
+    paired.drop(columns="source_list").to_csv(audit / "hydration_pairs.csv", index=False)
+    summary.to_csv(audit / "hydration_summary.csv", index=False)
+    unmatched.to_csv(audit / "hydration_unmatched_transfer.csv", index=False)
+    transfer_path.unlink()
 
 
 def remove_charge_mapping(staged_root: Path) -> None:
@@ -102,6 +175,7 @@ def build_final_data(
         merged_audit = input_root / "_audit"
         if merged_audit.exists():
             shutil.copytree(merged_audit, staged_root / "_audit")
+        build_hydration(staged_root)
         write_structure_manifest(staged_root)
 
         if output_root.exists():

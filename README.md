@@ -30,6 +30,20 @@ python scripts/build_final_data.py
 python scripts/build_training_splits.py build-splits --seed 42
 ```
 
+Final publication replaces experimental `transfer.csv` with `hydration.csv`.
+It pairs solvation and transfer on `(cation, anion, solute, temperature_K)` and
+uses the existing labels' sign convention: hydration = solvation + transfer.
+Each `(solute, temperature_K)` receives the median of all matched candidate
+values, including multiple solvation values for the same pairing key; contributing
+sources are combined in `source_list`. The output has no ionic-liquid identity.
+`_audit/hydration_pairs.csv`, `hydration_summary.csv` and
+`hydration_unmatched_transfer.csv` retain paired values and sources, per-group
+counts/minima/maxima/medians, and excluded unmatched transfer rows respectively.
+Merged inputs, final solvation and organic transfer are preserved. Missing one
+input, missing required fields or invalid numbers stop publication.
+The hydration migration rebuilds final only; existing training splits and analysis
+outputs retain the previous transfer contract until separately regenerated.
+
 This migration is required for legacy final data with role-separated orbital files
 or no `charge_20260514/structure_manifest.csv`; mixed contracts fail discovery.
 For code-only validation, use temporary output roots (`build-splits --output-root ...`).

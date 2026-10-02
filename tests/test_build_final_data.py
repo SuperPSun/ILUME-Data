@@ -2,6 +2,7 @@ from pathlib import Path
 import hashlib
 
 import pandas as pd
+import pytest
 
 from scripts.build_final_data import build_final_data
 
@@ -124,3 +125,101 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
         "isobaric_coefficient_of_volume_expansion.csv",
     ):
         assert not (final_root / "experiment" / filename).exists()
+
+
+@pytest.fixture
+def hydration_inputs(tmp_path):
+    merged = tmp_path / "merged"
+    experiment = merged / "experiment"
+    experiment.mkdir(parents=True)
+    simulation = merged / "simulation"
+    simulation.mkdir()
+    pd.DataFrame({"mol_id": []}).to_csv(simulation / "charge.csv", index=False)
+    charge = tmp_path / "charge_20260514"
+    charge.mkdir()
+    columns = ["cation", "anion", "solute", "temperature_K", "solvation_kcal/mol", "source_list"]
+    pd.DataFrame([
+        ["A", "X", "CC", 298.15, -5, "alpha; shared"],
+        ["A", "X", "CC", 298.15, -3, "beta"],
+        ["B", "Y", "CC", 298.15, -1, "gamma"],
+        ["A", "X", "CC", 310, -9, "hot"],
+        ["A", "X", "CO", 298.15, -7, "other"],
+    ], columns=columns).to_csv(experiment / "solvation.csv", index=False)
+    columns[4] = "transfer_kcal/mol"
+    pd.DataFrame([
+        ["A", "X", "CC", 298.15, 2, "shared; delta"],
+        ["B", "Y", "CC", 298.15, 9, "epsilon"],
+        ["A", "X", "CC", 310, 1, "hot"],
+        ["A", "X", "CO", 298.15, 3, "other"],
+        ["A", "X", "CO", 310, 3, "unmatched"],
+    ], columns=columns).to_csv(experiment / "transfer.csv", index=False)
+    (experiment / "transfer_organic.csv").write_text("preserved\n")
+    return merged, tmp_path / "final", charge
+
+
+def test_hydration_pairing_median_and_audit(hydration_inputs):
+    merged, final, charge = hydration_inputs
+    original = (merged / "experiment" / "solvation.csv").read_bytes()
+    build_final_data(merged, final, charge)
+    hydration = pd.read_csv(final / "experiment" / "hydration.csv")
+    assert hydration.columns.tolist() == ["solute", "temperature_K", "hydration_kcal/mol", "source_list"]
+    assert not hydration.duplicated(["solute", "temperature_K"]).any()
+    assert hydration["hydration_kcal/mol"].tolist() == [-1, -8, -4]
+    assert hydration.iloc[0]["source_list"] == "alpha; beta; delta; epsilon; gamma; shared"
+    pairs = pd.read_csv(final / "_audit" / "hydration_pairs.csv")
+    assert len(pairs) == 5
+    assert pairs["hydration_kcal/mol"].tolist() == [-3, -1, 8, -8, -4]
+    summary = pd.read_csv(final / "_audit" / "hydration_summary.csv")
+    assert summary.iloc[0]["candidate_count"] == 3
+    assert summary.iloc[0]["minimum_kcal_mol"] == -3
+    assert summary.iloc[0]["maximum_kcal_mol"] == 8
+    assert summary.iloc[0]["median_kcal_mol"] == -1
+    unmatched = pd.read_csv(final / "_audit" / "hydration_unmatched_transfer.csv")
+    assert unmatched[["solute", "temperature_K", "source_list"]].values.tolist() == [["CO", 310, "unmatched"]]
+    assert not (final / "experiment" / "transfer.csv").exists()
+    assert (merged / "experiment" / "transfer.csv").exists()
+    assert (final / "experiment" / "solvation.csv").read_bytes() == original
+    assert (final / "experiment" / "transfer_organic.csv").read_text() == "preserved\n"
+    first = (final / "experiment" / "hydration.csv").read_bytes()
+    build_final_data(merged, final, charge)
+    assert (final / "experiment" / "hydration.csv").read_bytes() == first
+
+
+@pytest.mark.parametrize("invalid", ["missing_transfer", "missing_solvation", "missing_field", "text", "nan", "infinite", "temperature", "identity"])
+def test_invalid_hydration_preserves_existing_final(hydration_inputs, invalid):
+    merged, final, charge = hydration_inputs
+    experiment = merged / "experiment"
+    if invalid.startswith("missing_") and invalid != "missing_field":
+        (experiment / (invalid.removeprefix("missing_") + ".csv")).unlink()
+    else:
+        path = experiment / "solvation.csv"
+        frame = pd.read_csv(path)
+        if invalid == "missing_field":
+            frame = frame.drop(columns="solute")
+        elif invalid == "identity":
+            frame.loc[0, "solute"] = " "
+        elif invalid == "temperature":
+            frame.loc[0, "temperature_K"] = float("inf")
+        else:
+            frame["solvation_kcal/mol"] = frame["solvation_kcal/mol"].astype(object)
+            frame.loc[0, "solvation_kcal/mol"] = {"text": "invalid", "nan": float("nan"), "infinite": float("inf")}[invalid]
+        frame.to_csv(path, index=False)
+    final.mkdir()
+    marker = final / "existing.csv"
+    marker.write_bytes(b"original output")
+    with pytest.raises(ValueError):
+        build_final_data(merged, final, charge)
+    assert list(final.iterdir()) == [marker]
+    assert marker.read_bytes() == b"original output"
+
+
+def test_hydration_without_matches_has_empty_output(hydration_inputs):
+    merged, final, charge = hydration_inputs
+    path = merged / "experiment" / "transfer.csv"
+    frame = pd.read_csv(path)
+    frame["temperature_K"] = 400.0
+    frame.to_csv(path, index=False)
+    build_final_data(merged, final, charge)
+    assert pd.read_csv(final / "experiment" / "hydration.csv").empty
+    assert pd.read_csv(final / "_audit" / "hydration_summary.csv").empty
+    assert len(pd.read_csv(final / "_audit" / "hydration_unmatched_transfer.csv")) == 5
