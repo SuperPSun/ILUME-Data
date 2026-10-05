@@ -664,6 +664,10 @@ def build_signatures(nodes, config):
                 rows = [dict(zip(["cation", "anion"], keys)) | fit_signature(group, node["formula"], config["references"])
                         for keys, group in frame.groupby(["cation", "anion"], sort=True)]
             for row in rows:
+                if (node["formula"] == "pending_formula" and node["source_dataset"] in {
+                        "experiment/gas_solubility.csv", "experiment/water_activity_coefficient.csv"}):
+                    # A single raw point also lacks an approved gas/concentration reference.
+                    row.update(signature=np.nan, status="pending_formula", signature_kind="pending_formula")
                 row.update(node_id=node["node_id"], dataset=node["source_dataset"],
                            target_property=node["target_property"], stage=node["stage"],
                            formula_version=config["version"], source_files=record["source_files"])

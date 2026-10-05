@@ -39,6 +39,35 @@ def test_raw_pending_and_zero_df(config):
     assert fit['residual_df'] == 0 and np.isnan(fit['uncertainty'])
 
 
+def test_expanded_tasks_require_new_formula_approval(config):
+    assert config['formulas']['experiment/gas_solubility.csv'] == 'pending_formula'
+    assert config['formulas']['experiment/water_activity_coefficient.csv'] == 'pending_formula'
+    assert 'experiment/x_co2.csv' not in config['formulas']
+    assert config['formulas']['experiment/enthalpy_of_vaporization_or_sublimation.csv'] == 'linear_temperature'
+
+
+@pytest.mark.parametrize(('dataset', 'target', 'condition'), (
+    ('gas_solubility', 'x_gas_unitless', 'solute'),
+    ('water_activity_coefficient', 'water_activity_coefficient_unitless', 'x_water_unitless'),
+))
+def test_pending_public_tasks_do_not_use_single_raw_signatures(config, dataset, target, condition):
+    data = pd.DataFrame({'cation': ['cat'], 'anion': ['an'], target: [.1],
+                         'temperature_K': [298.15], 'pressure_kPa': [100.],
+                         condition: ['O=C=O'] if condition == 'solute' else [.2]})
+    source = f'experiment/{dataset}.csv'
+    node = {'node_id': f'{source}::{target}', 'source_dataset': source, 'target_property': target,
+            'stage': 3, 'system_type': 'il_solute' if condition == 'solute' else 'il',
+            'excluded_reason': '', 'formula': 'pending_formula', 'files': [], 'frame': data,
+            'condition_columns': 'temperature_K;pressure_kPa' + (';x_water_unitless' if condition != 'solute' else '')}
+    inventory, review, signatures, _ = graph.build_signatures([node], config)
+    assert signatures.signature.isna().all()
+    assert signatures.status.eq('pending_formula').all()
+    assert inventory.n_valid_signatures.tolist() == [0]
+    assert review.approval_status.tolist() == ['pending_formula']
+    if condition == 'x_water_unitless':
+        assert 'x_water_unitless' in json.loads(review.condition_coverage.item())
+
+
 def test_formula_recovery_and_rank(config):
     refs = config['references']
     t = np.array([300, 310, 320, 330.])

@@ -91,7 +91,20 @@ def canonical_transfer_system(index: int) -> tuple[str, str]:
     )
 
 
+def simulation_task_root(output_root: Path, task_name: str) -> Path:
+    if task_name in {"homo", "lumo", "partial_atomic_charge", "simulated_qm_elec_hf"}:
+        return output_root / "stage1" / "properties" / task_name
+    return output_root / "stage2" / task_name
+
+
 def write_stage2_files(final_root: Path, count: int = 100) -> None:
+    write_csv(
+        final_root / "experiment" / "enthalpy_of_vaporization_or_sublimation.csv",
+        [{"cation": f"{'C' * index}[P+](C)(C)C", "anion": ion_pair(index)[1],
+          "temperature_K": 298.15, "phase": "Liquid | Gas",
+          "enthalpy_of_vaporization_or_sublimation_kJ/mol": 100.0,
+          "source_list": "ILThermo"} for index in range(1, 11)],
+    )
     pairs = [ion_pair(index) for index in range(1, count + 1)]
     for filename, target in (
         ("density.csv", "density_g/cm^3"),
@@ -2820,9 +2833,17 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     extract_pretraining_entities(final_root, output_root)
     catalog = build_training_splits(final_root, output_root, seed=42)
 
-    assert int(catalog["stage"].eq(2).sum()) == 9
+    assert int(catalog["stage"].eq(2).sum()) == 5
+    assert set(catalog.loc[catalog["stage"].eq(1), "task_id"]) == {
+        "simulation/homo", "simulation/lumo", "simulation/partial_atomic_charge",
+        "simulation/simulated_qm_elec_hf",
+    }
+    assert set((output_root / "stage1" / "properties").iterdir()) == {
+        simulation_task_root(output_root, task) for task in
+        ("homo", "lumo", "partial_atomic_charge", "simulated_qm_elec_hf")
+    }
     assert set(
-        catalog.loc[catalog["stage"].eq(2), "task_id"]
+        catalog.loc[catalog["stage"].isin((1, 2)), "task_id"]
     ) == {
         "simulation/homo",
         "simulation/lumo",
@@ -2834,7 +2855,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         "simulation/thermal_expansion",
         "simulation/transfer_organic",
     }
-    stage2 = catalog[catalog["stage"].eq(2)].set_index("task_id")
+    stage2 = catalog[catalog["stage"].isin((1, 2))].set_index("task_id")
     assert not set(stage2.index) & set(
         catalog.loc[catalog["stage"].eq(3), "task_id"]
     )
@@ -3027,7 +3048,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         has_test: bool = False,
     ) -> dict[tuple[str, ...], str]:
         assignments: dict[tuple[str, ...], str] = {}
-        task_root = output_root / "stage2" / task_name
+        task_root = simulation_task_root(output_root, task_name)
         partition_files = [
             ("train", "train.csv"),
             ("valid", "valid.csv"),
@@ -3050,7 +3071,8 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     }
     assert {
         path.parent.name
-        for path in (output_root / "stage2").glob("*/test.csv")
+        for path in [*(output_root / "stage2").glob("*/test.csv"),
+                     *(output_root / "stage1" / "properties").glob("*/test.csv")]
     } == stage2_test_tasks
 
     density_assignments = stage2_assignments(
@@ -3153,7 +3175,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         for filename in ("train.csv", "valid.csv", "test.csv"):
             columns = list(
                 pd.read_csv(
-                    output_root / "stage2" / task_name / filename, nrows=0
+                    simulation_task_root(output_root, task_name) / filename, nrows=0
                 ).columns
             )
             assert columns == [
@@ -3297,7 +3319,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert required_catalog_columns <= set(written_catalog.columns)
     assert written_catalog["catalog_schema_version"].eq(2).all()
     stage2_written = written_catalog.loc[
-        written_catalog["stage"].eq(2)
+        written_catalog["stage"].isin((1, 2))
     ].set_index("task_id")
     for task_id, row in stage2_written.iterrows():
         task_root = output_root / row["materialized_path"]
@@ -3348,13 +3370,13 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     assert partial_catalog["sample_unit"] == "mol_id"
     assert partial_catalog["split_unit"] == "SMILES"
     assert partial_catalog["label_source"] == "structure_resource"
-    assert partial_catalog["materialized_path"] == "stage2/partial_atomic_charge"
+    assert partial_catalog["materialized_path"] == "stage1/properties/partial_atomic_charge"
     assert partial_catalog["resource_manifest"] == (
-        "stage2/partial_atomic_charge/charge_20260514/structure_manifest.csv"
+        "stage1/properties/partial_atomic_charge/charge_20260514/structure_manifest.csv"
     )
     partial_rows = pd.concat(
         [
-            pd.read_csv(output_root / "stage2" / "partial_atomic_charge" / name)
+            pd.read_csv(simulation_task_root(output_root, "partial_atomic_charge") / name)
             for name in ("train.csv", "valid.csv", "test.csv")
         ],
         ignore_index=True,
@@ -3371,7 +3393,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     partitions = {}
     for partition in ("train", "valid", "test"):
         for mol_id in pd.read_csv(
-            output_root / "stage2" / "partial_atomic_charge" / f"{partition}.csv"
+            simulation_task_root(output_root, "partial_atomic_charge") / f"{partition}.csv"
         )["mol_id"]:
             partitions[mol_id] = partition
     assert partitions["mol_0000001"] == partitions["mol_duplicate"]
@@ -3388,7 +3410,8 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
     source_resource_root = final_root / "simulation" / "charge_20260514"
     copied_resource_root = (
         output_root
-        / "stage2"
+        / "stage1"
+        / "properties"
         / "partial_atomic_charge"
         / "charge_20260514"
     )
@@ -3422,7 +3445,8 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         output_root / "stage1" / "IL.csv",
         output_root / "stage2" / "density" / "train.csv",
         output_root
-        / "stage2"
+        / "stage1"
+        / "properties"
         / "partial_atomic_charge"
         / "charge_20260514"
         / "structure_manifest.csv",
@@ -3431,7 +3455,7 @@ def test_build_training_splits_end_to_end_is_disjoint_and_deterministic(
         small_root / "random" / "cv3" / "fold4.csv",
     ]
     checksummed_paths.extend(
-        output_root / "stage2" / task_name / filename
+        simulation_task_root(output_root, task_name) / filename
         for task_name in sorted(stage2_test_tasks)
         for filename in ("train.csv", "valid.csv", "test.csv")
     )
@@ -3550,6 +3574,85 @@ def test_discover_tasks_rejects_unclassified_simulation_dataset(tmp_path: Path):
         match="Unclassified simulation datasets: simulation/unknown_property.csv",
     ):
         discover_tasks(final_root)
+
+
+def test_stage1_property_migration_preserves_legacy_partitions_and_entities(tmp_path, monkeypatch):
+    final_root = tmp_path / "final"
+    write_stage2_files(final_root)
+    for filename, target in (
+        ("density.csv", "density_g/cm^3"),
+        ("heat_capacity.csv", "heat_capacity_J/mol/K"),
+        ("transfer_organic.csv", "transfer_organic_kcal/mol"),
+    ):
+        frame = pd.read_csv(final_root / "simulation" / filename).iloc[50:60].copy()
+        frame[target] = 1.0
+        write_csv(final_root / "experiment" / filename, frame.to_dict("records"))
+    gas_rows = [{"cation": ion_pair(index)[0], "anion": ion_pair(index)[1],
+                 "solute": gas, "temperature_K": 298.15, "pressure_kPa": 100.,
+                 "x_gas_unitless": .1, "source_list": "IL4GAS"}
+                for index in range(1, 11) for gas in
+                ("C", "CC", "N", "O=O", "N#N", "O=C=O", "S", "[H][H]", "N#[N+][O-]", "O=S=O")]
+    water_rows = [{"cation": ion_pair(index)[0], "anion": ion_pair(index)[1],
+                   "x_water_unitless": x, "temperature_K": 298.15, "pressure_kPa": 100.,
+                   "water_activity_coefficient_unitless": 2., "source_list": "WaterActivity"}
+                  for index in range(1, 11) for x in (0., .5, 1.)]
+    write_csv(final_root / "experiment/gas_solubility.csv", gas_rows)
+    write_csv(final_root / "experiment/water_activity_coefficient.csv", water_rows)
+    legacy_registry = {key: {**value, "stage": 2} for key, value in training_splits.SIMULATION_TASK_REGISTRY.items()}
+    legacy_registry["simulation/charge.csv"]["resource_manifest"] = (
+        "stage2/partial_atomic_charge/charge_20260514/structure_manifest.csv"
+    )
+    with monkeypatch.context() as context:
+        context.setattr(training_splits, "SIMULATION_TASK_REGISTRY", legacy_registry)
+        build_training_splits(final_root, tmp_path / "legacy")
+    output_root = tmp_path / "migrated"
+    extract_pretraining_entities(final_root, output_root)
+    entity_snapshot = {path.name: path.read_bytes() for path in (output_root / "stage1").glob("*.csv")}
+    catalog = build_training_splits(final_root, output_root)
+    for task in ("homo", "lumo", "partial_atomic_charge", "simulated_qm_elec_hf"):
+        old_root = tmp_path / "legacy/stage2" / task
+        new_root = output_root / "stage1/properties" / task
+        old_files = {path.relative_to(old_root): path.read_bytes() for path in old_root.rglob("*") if path.is_file()}
+        new_files = {path.relative_to(new_root): path.read_bytes() for path in new_root.rglob("*") if path.is_file()}
+        assert old_files == new_files
+        assert not (output_root / "stage2" / task).exists()
+    assert entity_snapshot == {path.name: path.read_bytes() for path in (output_root / "stage1").glob("*.csv")}
+    properties_snapshot = {path.relative_to(output_root): path.read_bytes()
+                           for path in (output_root / "stage1/properties").rglob("*") if path.is_file()}
+    extract_pretraining_entities(final_root, output_root)
+    assert properties_snapshot == {path.relative_to(output_root): path.read_bytes()
+                                   for path in (output_root / "stage1/properties").rglob("*") if path.is_file()}
+    tasks = catalog.set_index("task_id")
+    assert tasks.loc["experiment/gas_solubility", "stage"] == 3
+    assert tasks.loc["experiment/water_activity_coefficient", "stage"] == 3
+    assert "x_water_unitless" in tasks.loc["experiment/water_activity_coefficient", "condition_columns"]
+    assert tasks.loc["experiment/water_activity_coefficient", "target_columns"] == "water_activity_coefficient_unitless"
+    assert tasks.loc["simulation/heat_of_vaporization", "experiment_reference"] == "experiment/enthalpy_of_vaporization_or_sublimation"
+
+
+def test_vaporization_overlap_excludes_all_temperatures_and_is_audited(tmp_path):
+    cation, anion = canonical_ion_pair(1)
+    other_cation, other_anion = canonical_ion_pair(2)
+    task = TaskSpec("simulation/heat_of_vaporization", 2, "simulation/heat_of_vaporization.csv",
+                    ("heat_of_vaporization_kJ/mol",), ("cation", "anion"), "il")
+    reference = TaskSpec("experiment/enthalpy_of_vaporization_or_sublimation", 3,
+                         "experiment/enthalpy_of_vaporization_or_sublimation.csv",
+                         ("enthalpy_of_vaporization_or_sublimation_kJ/mol",), ("cation", "anion"), "il")
+    write_csv(tmp_path / task.source_file, [
+        {"cation": cation, "anion": anion, "temperature_K": 300., "heat_of_vaporization_kJ/mol": 100.},
+        {"cation": cation, "anion": anion, "temperature_K": 400., "heat_of_vaporization_kJ/mol": 110.},
+        {"cation": other_cation, "anion": other_anion, "temperature_K": 300., "heat_of_vaporization_kJ/mol": 90.},
+    ])
+    write_csv(tmp_path / reference.source_file, [{"cation": cation, "anion": anion,
+              "temperature_K": 298.15, "enthalpy_of_vaporization_or_sublimation_kJ/mol": 100.}])
+    frame = prepare_task_frame(tmp_path, task, "checksum")[0]
+    reference_frame = prepare_task_frame(tmp_path, reference, "checksum")[0]
+    result, audit = training_splits.exclude_stage2_experiment_overlap(
+        frame, task, reference, training_splits._system_table(reference_frame))
+    assert result["cation"].tolist() == [other_cation]
+    assert audit["excluded_stage2_rows"].tolist() == [2]
+    assert audit["matching_stage3_rows"].tolist() == [1]
+    assert audit["stage3_task_id"].tolist() == [reference.task_id]
 
 
 def test_overlap_exclusion_rejects_mismatched_system_types():

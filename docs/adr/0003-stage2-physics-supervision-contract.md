@@ -5,6 +5,8 @@
 
 > The role-oriented multi-target orbital and split clauses are superseded by [ADR 0004](0004-stage2-homo-lumo-scalar-tasks.md). Current partition rules are summarized in the [README](../../README.md#identity-and-partitions). Consumer migration statements below describe the decision date, not current downstream status.
 
+> The current [Stage1 property contract](../../README.md#orbital-and-partial-charge-resources) supersedes the stage/path assignment below for HOMO, LUMO, partial charge and HF QM. Heat of vaporization now also uses property-local experimental overlap exclusion. Partition algorithms and task IDs are preserved.
+
 ## Context
 
 The split pipeline previously routed only five whitelisted simulation files to Stage2. Other simulation outputs, including single-ion orbitals, total-charge metadata, and heat of vaporization, fell through to the experiment-oriented Stage3 workflow. HOMO and LUMO were also split into independent tasks, and `charge.csv` was treated as a scalar total-charge label even though its associated MOL2 resources contain the intended atom-level supervision.

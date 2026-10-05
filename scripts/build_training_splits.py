@@ -68,6 +68,7 @@ STAGE1_SOURCE_ROLE_BY_COLUMN = {
 STAGE1_NEUTRAL_SOURCE_ROLES = ("simulation_mol", "solute", "solvent")
 STAGE1_SOURCE_ROLES = ("anion", "cation", *STAGE1_NEUTRAL_SOURCE_ROLES)
 CONDITION_COLUMN_ORDER = (
+    "x_water_unitless",
     "temperature_K",
     "pressure_kPa",
     "frequency_MHz",
@@ -133,6 +134,7 @@ STAGE2_EXPERIMENT_REFERENCES = {
     "simulation/density.csv": "experiment/density.csv",
     "simulation/heat_capacity.csv": "experiment/heat_capacity.csv",
     "simulation/transfer_organic.csv": "experiment/transfer_organic.csv",
+    "simulation/heat_of_vaporization.csv": "experiment/enthalpy_of_vaporization_or_sublimation.csv",
 }
 EXCLUDED_EXPERIMENT_TRAINING_DATASETS = {
     "experiment/isobaric_coefficient_of_volume_expansion.csv",
@@ -166,7 +168,7 @@ PARTIAL_CHARGE_SOURCE_RESOURCE_MANIFEST = (
     "simulation/charge_20260514/structure_manifest.csv"
 )
 PARTIAL_CHARGE_MATERIALIZED_RESOURCE_DIR = (
-    "stage2/partial_atomic_charge/charge_20260514"
+    "stage1/properties/partial_atomic_charge/charge_20260514"
 )
 PARTIAL_CHARGE_MATERIALIZED_RESOURCE_MANIFEST = (
     f"{PARTIAL_CHARGE_MATERIALIZED_RESOURCE_DIR}/structure_manifest.csv"
@@ -199,6 +201,7 @@ ORBITAL_SPLIT_AUDIT_COLUMNS = (
 
 SIMULATION_TASK_REGISTRY = {
     "simulation/homo.csv": {
+        "stage": 1,
         "task_id": "simulation/homo",
         "identity_columns": ("SMILES",),
         "system_type": "molecule",
@@ -207,6 +210,7 @@ SIMULATION_TASK_REGISTRY = {
         "has_test": True,
     },
     "simulation/lumo.csv": {
+        "stage": 1,
         "task_id": "simulation/lumo",
         "identity_columns": ("SMILES",),
         "system_type": "molecule",
@@ -215,6 +219,7 @@ SIMULATION_TASK_REGISTRY = {
         "has_test": True,
     },
     "simulation/charge.csv": {
+        "stage": 1,
         "task_id": "simulation/partial_atomic_charge",
         "identity_columns": ("SMILES",),
         "system_type": "molecule",
@@ -228,6 +233,7 @@ SIMULATION_TASK_REGISTRY = {
         "has_test": True,
     },
     "simulation/simulated_qm_elec_hf.csv": {
+        "stage": 1,
         "task_id": "simulation/simulated_qm_elec_hf",
         "identity_columns": ("SMILES",),
         "system_type": "molecule",
@@ -1172,6 +1178,9 @@ def extract_pretraining_entities(
             lineterminator="\n",
         )
         entity_frame = pd.concat(combined_rows, ignore_index=True)
+        properties = output_root / "stage1" / "properties"
+        if properties.is_dir():
+            shutil.copytree(properties, staged_stage1 / "properties")
         replace_directory(staged_stage1, output_root / "stage1")
 
     (output_root / "manifest.json").unlink(missing_ok=True)
@@ -4858,7 +4867,7 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
             tasks.append(
                 TaskSpec(
                     task_id=task_id,
-                    stage=2,
+                    stage=int(definition.get("stage", 2)),
                     source_file=relative,
                     target_columns=logical_targets,
                     identity_columns=identity_columns,
@@ -4874,9 +4883,9 @@ def discover_tasks(final_root: Path) -> list[TaskSpec]:
                         .removesuffix(".csv")
                     ),
                     materialized_path=(
-                        "stage2/partial_atomic_charge"
-                        if relative == "simulation/charge.csv"
-                        else f"stage2/{path.stem}"
+                        f"stage1/properties/{task_id.removeprefix('simulation/')}"
+                        if definition.get("stage") == 1
+                        else f"stage2/{task_id.removeprefix('simulation/')}"
                     ),
                     label_source=str(definition.get("label_source", "materialized_csv")),
                     source_resource_manifest=str(
@@ -5575,7 +5584,7 @@ def build_training_splits(
     *,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """Build readable Stage-2 and Stage-3 task datasets."""
+    """Build supervised Stage-1, Stage-2 and Stage-3 task datasets."""
     final_root = Path(final_root)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -5588,7 +5597,7 @@ def build_training_splits(
         path.relative_to(final_root).as_posix(): file_sha256(path)
         for path in paths
     }
-    stage2_tasks = [task for task in tasks if task.stage == 2]
+    simulation_tasks = [task for task in tasks if task.stage in (1, 2)]
     stage3_tasks = [task for task in tasks if task.stage == 3]
     tasks_by_source = {task.source_file: task for task in tasks}
 
@@ -5618,7 +5627,7 @@ def build_training_splits(
     )
     orbital_tasks = {
         task.task_id: task
-        for task in stage2_tasks
+        for task in simulation_tasks
         if task.task_id in ORBITAL_TASK_IDS
     }
     orbital_frames = {
@@ -5635,14 +5644,16 @@ def build_training_splits(
     )
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:
         staged_root = Path(temporary_dir) / "training_splits"
+        stage1_properties_root = staged_root / "stage1" / "properties"
         stage2_root = staged_root / "stage2"
         stage3_root = staged_root / "stage3"
         audit_root = staged_root / "_audit"
         stage2_root.mkdir(parents=True)
+        stage1_properties_root.mkdir(parents=True)
         stage3_root.mkdir()
         audit_root.mkdir()
 
-        for task in stage2_tasks:
+        for task in simulation_tasks:
             if task.task_id in orbital_frames:
                 frame = orbital_frames[task.task_id]
                 raw_rows = len(frame)
@@ -5689,7 +5700,7 @@ def build_training_splits(
                 required_partitions.add("test")
             if not required_partitions.issubset(set(partitions)):
                 raise TrainingSplitError(
-                    f"Stage-2 split is empty for {task.task_id}: "
+                    f"Stage-{task.stage} split is empty for {task.task_id}: "
                     f"{sorted(set(partitions))}"
                 )
             assignments = pd.DataFrame(
@@ -5704,7 +5715,7 @@ def build_training_splits(
             )["partition"].nunique()
             if partition_counts.gt(1).any():
                 raise TrainingSplitError(
-                    f"Stage-2 system crosses partitions for {task.task_id}"
+                    f"Stage-{task.stage} system crosses partitions for {task.task_id}"
                 )
 
             task_root = staged_root / task.materialized_path
@@ -5748,7 +5759,7 @@ def build_training_splits(
             task_catalog_rows.append(
                 {
                     "catalog_schema_version": CATALOG_SCHEMA_VERSION,
-                    "stage": 2,
+                    "stage": task.stage,
                     "task_id": task.task_id,
                     "task_kind": task.task_kind,
                     "target_level": task.target_level,
@@ -6022,6 +6033,7 @@ def build_training_splits(
             kind="stable",
         ).reset_index(drop=True)
         write_dataframe(staged_root / "task_catalog.csv", task_catalog)
+        replace_directory(stage1_properties_root, output_root / "stage1" / "properties")
         replace_directory(stage2_root, output_root / "stage2")
         replace_directory(stage3_root, output_root / "stage3")
         replace_directory(audit_root, output_root / "_audit")
@@ -6190,10 +6202,12 @@ def main() -> None:
             args.output_root,
             seed=args.seed,
         )
+        stage1_count = int(catalog["stage"].eq(1).sum())
         stage2_count = int(catalog["stage"].eq(2).sum())
         stage3_count = int(catalog["stage"].eq(3).sum())
         print(
-            f"Built readable datasets for {stage2_count} stage-2 tasks and "
+            f"Built readable datasets for {stage1_count} supervised stage-1 tasks, "
+            f"{stage2_count} stage-2 tasks and "
             f"{stage3_count} stage-3 tasks"
         )
 

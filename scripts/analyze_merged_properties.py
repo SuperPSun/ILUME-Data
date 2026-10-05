@@ -222,11 +222,23 @@ def analyze_property_manifest(
     output_dir = Path(output_dir)
 
     rows: list[dict[str, object]] = []
+    gas_rows: list[dict[str, object]] = []
+    gas_source_rows: list[dict[str, object]] = []
     for manifest_row in manifest.itertuples(index=False):
         output_file = str(manifest_row.output_file)
         property_label = str(manifest_row.property_label)
         path = input_root / output_file
         df = pd.read_csv(path)
+        if property_label == "x_gas_unitless":
+            for solute, gas_frame in df.groupby("solute", sort=True):
+                gas_rows.append({"solute": solute, **analyze_value_column(
+                    bucket=str(manifest_row.bucket), output_file=output_file,
+                    df=gas_frame, value_column=property_label,
+                    min_holdout_systems=min_holdout_systems, test_fraction=test_fraction,
+                )})
+                sources = gas_frame["source_list"].fillna("").str.split(r";\s*").explode()
+                for source, count in sources.value_counts().items():
+                    gas_source_rows.append({"solute": solute, "source": source, "rows": int(count)})
         for value_column in value_columns_for_row(df, property_label):
             if value_column not in df.columns:
                 continue
@@ -244,6 +256,10 @@ def analyze_property_manifest(
     summary = pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
     output_dir.mkdir(parents=True, exist_ok=True)
     summary.to_csv(output_dir / "property_analysis_summary.csv", index=False)
+    pd.DataFrame(gas_rows, columns=["solute", *SUMMARY_COLUMNS]).to_csv(
+        output_dir / "gas_solubility_by_gas.csv", index=False)
+    pd.DataFrame(gas_source_rows, columns=["solute", "source", "rows"]).to_csv(
+        output_dir / "gas_solubility_by_gas_source.csv", index=False)
     property_system_overlap = analyze_experiment_property_system_overlap(input_root, manifest)
     property_system_overlap.to_csv(output_dir / "property_system_overlap.csv", index=False)
     if skip_plots:

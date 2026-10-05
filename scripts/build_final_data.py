@@ -22,7 +22,6 @@ EXCLUDED_EXPERIMENT_FILES = (
     "enthalpy.csv",
     "entropy.csv",
     "heat_capacity_at_vapor_saturation_pressure.csv",
-    "enthalpy_of_vaporization_or_sublimation.csv",
     "enthalpy_of_transition_or_fusion.csv",
     "equilibrium_temperature.csv",
     "isobaric_coefficient_of_volume_expansion.csv",

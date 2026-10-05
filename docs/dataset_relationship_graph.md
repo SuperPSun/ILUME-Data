@@ -40,6 +40,13 @@ reference conditions and stability counts. An unknown included dataset is explic
 pending, never assigned a default model. Approval means choosing an approximation,
 not certifying that it is valid over every observed condition range.
 
+Unified gas solubility and water activity coefficient are explicitly pending.
+Their observations and condition coverage are inventoried, including water mole
+fraction, but they publish no scalar signatures until a gas/concentration reference
+formula is approved. This also applies to their single observations: raw points at
+different gas identities or water concentrations are not comparable IL signatures.
+Stage1 supervised property tasks are outside this Stage2/Stage3 graph.
+
 Signatures use 298.15 K and 101.325 kPa, with 589 nm for refractive index. Observed
 constant conditions remain at their actual values with `reference_mismatch`.
 Varying conditions are extrapolated when necessary; coordinate distances and

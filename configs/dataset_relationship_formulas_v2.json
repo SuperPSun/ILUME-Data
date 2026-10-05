@@ -8,6 +8,7 @@
     "simulation/thermal_expansion.csv": "linear_temperature",
     "experiment/density.csv": "log_density",
     "experiment/heat_capacity.csv": "linear_temperature_pressure",
+    "experiment/enthalpy_of_vaporization_or_sublimation.csv": "linear_temperature",
     "experiment/isobaric_coefficient_of_volume_expansion.csv": "linear_temperature_pressure",
     "experiment/speed_of_sound.csv": "linear_temperature_pressure",
     "experiment/thermal_conductivity.csv": "linear_temperature_pressure",
@@ -26,7 +27,8 @@
     "experiment/pec50.csv": "unconditioned",
     "experiment/thermal_decomposition_temperature.csv": "unconditioned",
     "experiment/dynamic_relative_permittivity.csv": "reference_frequency_10ghz",
-    "experiment/x_co2.csv": "x_co2_reference_solubility"
+    "experiment/gas_solubility.csv": "pending_formula",
+    "experiment/water_activity_coefficient.csv": "pending_formula"
   },
   "binary_thresholds": {},
   "stability": {"bootstrap": 200, "permutation": 199, "cv_repeats": 20, "cv_permutation": 99, "minimum_bootstrap_valid": 100}

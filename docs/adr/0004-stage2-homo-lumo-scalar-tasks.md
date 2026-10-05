@@ -4,6 +4,8 @@
 - Date: 2026-08-25
 - Supersedes: ADR 0003's role-oriented multi-target orbital task and split clauses
 
+> The current [Stage1 property contract](../../README.md#orbital-and-partial-charge-resources) supersedes the Stage2 stage/path assignment below. HOMO/LUMO now publish under `stage1/properties/`; scalar labels, task IDs and inherited partitions remain unchanged.
+
 ## Context
 
 The previous catalog represented PBE/TZVP cation and anion orbitals as two tasks, each with HOMO and LUMO targets. That couples two physical properties inside one head while preventing the same property from sharing supervision across ion roles. Renaming the tasks would also change the task-seeded three-way split unless the old assignment is reproduced explicitly.

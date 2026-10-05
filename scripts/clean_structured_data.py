@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import shutil
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -19,11 +20,12 @@ if str(SRC_ROOT) not in sys.path:
 
 from raw_prep import net_formal_charge, reconcile_smiles_charge  # noqa: E402
 
-DEFAULT_SOURCES = ("AIonopedia", "ILBERT", "after_AIonopedia", "simulation")
+PUBLIC_PROPERTY_SOURCES = ("IL4GAS", "WaterActivity")
+DEFAULT_SOURCES = ("AIonopedia", "ILBERT", "after_AIonopedia", "simulation", *PUBLIC_PROPERTY_SOURCES)
 EXCLUDED_SOURCES = {"ILThermo"}
 IDENTIFIER_COLUMNS = ("cation", "anion", "solute", "solvent", "smiles", "SMILES", "mol_id")
 SMILES_COLUMNS = ("cation", "anion", "solute", "solvent", "smiles", "SMILES")
-CONDITION_COLUMNS = ("temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
+CONDITION_COLUMNS = ("x_water_unitless", "temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
 NON_LABEL_COLUMNS = {*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS}
 FRACTION_COLUMNS = {"ESP_pos_frac", "ESP_neg_frac", "q_pos_frac"}
 BOX_3D_FILENAME = "3d_box_structured.csv"
@@ -81,6 +83,9 @@ HARD_THRESHOLDS: dict[str, tuple[float, float]] = {
     "partition_log10": (-10, 15),
     "electrical_conductivity_S/m_log10": (-20, 4),
     "x_CO2_unitless": (0, 1),
+    "x_gas_unitless": (0, 1),
+    "x_water_unitless": (0, 1),
+    "water_activity_coefficient_unitless": (0, math.inf),
     "glass_transition_temperature_K": (100, 600),
     "refractive_index_unitless": (1, 2),
     "thermal_conductivity_W/m/K": (0, 10),
@@ -99,6 +104,7 @@ HARD_THRESHOLDS: dict[str, tuple[float, float]] = {
     "solv": (-100, 100),
 }
 STRICTLY_POSITIVE_COLUMNS = {
+    "water_activity_coefficient_unitless",
     "density_g/cm^3",
     "melting_point_K",
     "thermal_conductivity_W/m/K",
@@ -114,6 +120,7 @@ OUTPUT_ORDER = (
     "solvent",
     "smiles",
     "SMILES",
+    "x_water_unitless",
     "temperature_K",
     "pressure_kPa",
     "frequency_MHz",
@@ -567,6 +574,8 @@ def clean_structured_file(
     df = select_3d_box_columns(pd.read_csv(input_path), input_path.name)
     input_rows = len(df)
     rejected_rows: list[dict[str, object]] = []
+    provenance_path = input_path.parent / "_audit" / f"{input_path.stem}_provenance.csv"
+    provenance = pd.read_csv(provenance_path) if provenance_path.is_file() else None
 
     for column in df.columns:
         if column in IDENTIFIER_COLUMNS or column == "phase":
@@ -622,6 +631,21 @@ def clean_structured_file(
             active = active & ~invalid_role
 
     df = coerce_numeric_columns(df)
+    if input_path.parent.name in PUBLIC_PROPERTY_SOURCES:
+        required_numeric = ["temperature_K", "pressure_kPa", *label_columns(df)]
+        if input_path.parent.name == "WaterActivity":
+            required_numeric.append("x_water_unitless")
+        for column in required_numeric:
+            values = df[column]
+            invalid = ~values.map(lambda value: pd.notna(value) and math.isfinite(value))
+            if column == "temperature_K":
+                invalid |= values.le(0)
+            elif column == "pressure_kPa":
+                invalid |= values.lt(0)
+            mask = active & invalid
+            if mask.any():
+                add_rejections(rejected_rows, df, mask, "invalid_numeric", column, values)
+                active &= ~mask
     df, active, repaired_rows = reconcile_charge_states(
         df,
         input_path.name,
@@ -649,6 +673,19 @@ def clean_structured_file(
     cleaned = ordered_frame(df[active].reset_index(drop=True))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cleaned.to_csv(output_path, index=False)
+
+    if provenance is not None:
+        audit_root = output_path.parent / "_audit"
+        audit_root.mkdir(parents=True, exist_ok=True)
+        provenance["status"] = provenance["structured_row_index"].map(active).map(
+            {True: "accepted", False: "rejected"}
+        )
+        output_indexes = {index: position for position, index in enumerate(df.index[active])}
+        provenance["cleaned_row_index"] = provenance["structured_row_index"].map(output_indexes)
+        provenance.to_csv(audit_root / provenance_path.name, index=False)
+        raw_trace = provenance.set_index("structured_row_index").to_dict("index")
+        for row in rejected_rows:
+            row.update(raw_trace.get(row["row_index"], {}))
 
     if rejected_rows:
         rejected_path.parent.mkdir(parents=True, exist_ok=True)
@@ -753,6 +790,11 @@ def clean_non_ilthermo_structured(
         source_dir = input_root / source
         if not source_dir.exists():
             continue
+        if source in PUBLIC_PROPERTY_SOURCES and (source_dir / "_audit").is_dir():
+            destination = output_root / source / "_audit"
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.copytree(source_dir / "_audit", destination)
         for input_path in sorted(source_dir.glob("*_structured.csv")):
             output_path = output_root / source / input_path.name
             rejected_path = output_root / "rejected_rows" / source / f"{input_path.stem}_rejected.csv"

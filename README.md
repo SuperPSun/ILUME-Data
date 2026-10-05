@@ -11,7 +11,8 @@ pip install -r requirements.txt
 python scripts/structure_raw_data.py
 ```
 
-Raw sources are `data/raw/{AIonopedia,ILBERT,ILThermo,after_AIonopedia,simulation_data}/`.
+The existing `structure_raw_data.py` sources are
+`data/raw/{AIonopedia,ILBERT,ILThermo,after_AIonopedia,simulation_data}/`.
 Outputs use the same names under `data/structured/`, except `simulation_data` becomes
 `simulation`. Select sources with `--sources AIonopedia ILBERT ILThermo after_AIonopedia simulation`.
 
@@ -22,7 +23,7 @@ electrical conductivity, heat capacity, refractive index, thermal conductivity a
 viscosity, before condition matching. Explicit pressures, cleaned inputs and
 simulation pressure fields are unchanged.
 
-Rebuild merged, final and Stage2/Stage3 data in dependency order:
+Rebuild merged, final and supervised Stage1/Stage2/Stage3 data in dependency order:
 
 ```bash
 python scripts/merge_data.py
@@ -62,7 +63,8 @@ python scripts/build_training_splits.py import-zinc-diversity
 ```
 
 - `extract-pretrain` reads top-level final experiment/simulation CSVs and atomically
-  replaces `data/training_splits/stage1/`, including removal of prior augmentation.
+  replaces Stage1 entities, including removal of prior augmentation, while preserving
+  `data/training_splits/stage1/properties/`.
   `anion.csv`, `cation.csv` and `molecule.csv` contain dataset entities only;
   `IL.csv` contains canonical pairs from both sources, `experiment_IL.csv` only
   experimental pairs. `simulation_mol.csv`, `solute.csv` and `solvent.csv` preserve
@@ -107,10 +109,11 @@ with links to source terms.
 
 ## Stage2 Property Splits
 
-`build-splits` rebuilds Stage2, Stage3 and `_audit`, leaving Stage1 untouched.
-Simulation supervision is explicitly registered as nine Stage2 tasks: pooled
-PBE/TZVP HOMO and LUMO, partial atomic charge, HF molecular QM properties, density,
-heat capacity, thermal expansion, heat of vaporization and organic transfer.
+`build-splits` rebuilds `stage1/properties`, Stage2, Stage3 and `_audit`, leaving
+Stage1 entity CSVs and augmentation untouched. Nine simulation tasks are registered:
+pooled PBE/TZVP HOMO/LUMO, partial atomic charge and HF molecular QM properties now
+belong to Stage1; density, heat capacity, thermal expansion, heat of vaporization
+and organic transfer belong to Stage2.
 `isobaric_coefficient_of_volume_expansion` is excluded during merged-data
 publication, so it is unavailable to final-data, training and analysis
 workflows. Other experiment tasks enter Stage3. Unknown top-level simulation
@@ -123,7 +126,7 @@ Each task splits complete systems independently: `(cation, anion)` for ILs,
 supervision. Temperature and pressure never define identity; all condition rows
 for one system stay together within that task.
 
-| Stage2 tasks | Partition rule (default seed 42) |
+| Supervised simulation tasks | Partition rule (default seed 42) |
 |---|---|
 | Thermal expansion, heat of vaporization, partial atomic charge | Sorted groups, task-local seeded shuffle, grouped 80/10/10 train/validation/test |
 | HOMO, LUMO | Shared inherited legacy role-specific 80/10/10 mapping; [ADR 0004](docs/adr/0004-stage2-homo-lumo-scalar-tasks.md) |
@@ -134,9 +137,14 @@ not applied. Test labels are for final evaluation, never tuning or early stoppin
 these tests do not measure catastrophic forgetting because Stage3 does not modify
 the Stage2 model.
 
-Before splitting, density, heat capacity and organic transfer exclude systems in
+Before splitting, density, heat capacity, heat of vaporization and organic transfer exclude systems in
 their respective experiment references. Exclusion is property-local; missing
 references abort.
+Heat of vaporization references experimental
+`enthalpy_of_vaporization_or_sublimation.csv`. The existing package contains 218
+liquid–gas observations across 137 ILs; these are vaporization labels despite the
+historical combined name. All temperatures of shared IL systems are excluded from
+the simulation split; upstream records remain.
 `_audit/stage2_overlap_exclusions.csv` records identities and excluded/matching row counts.
 
 ### Orbital and partial-charge resources
@@ -159,18 +167,149 @@ The complete `charge_20260514/` resource is copied once beside the partial-charg
 catalog points to its manifest. Staging precedes replacement; allow disk space
 and build time for this duplicated payload.
 
+Stage1 property paths are `stage1/properties/{homo,lumo,partial_atomic_charge,simulated_qm_elec_hf}/`.
+Task IDs remain `simulation/...`; catalog `stage` becomes 1 and resource paths follow
+the new location. Partition algorithms, legacy orbital namespaces and seed remain
+unchanged, preserving membership for unchanged inputs. Final files retain their
+simulation provenance bucket. Rebuilding removes the four former Stage2 directories.
+Existing consumer prepared/checkpoint outputs remain read-only until consumer
+support is migrated separately.
+
 ### Producer interface
 
 `data/training_splits/task_catalog.csv` is the versioned contract: qualified task
 IDs, materialized paths, task/target levels, identity/condition columns, split/sample
 units, method, experiment reference, label source, optional resource manifest and
-statistics. Schema v2 includes Stage2 `partitions` and per-partition row/system
+statistics. Schema v2 includes supervised Stage1/Stage2 `partitions` and per-partition row/system
 counts; consumers must not infer test availability by probing files.
 `target_columns` names CSV columns for object tasks and logical labels for atom
 tasks, interpreted with `task_kind`, `target_level` and `label_source`.
 [ADR 0003](docs/adr/0003-stage2-physics-supervision-contract.md) records the original
 producer decision; ADR 0004 supersedes its orbital clauses. The partition table
 above describes current Stage2 splitting.
+
+## Public gas/water expansion
+
+The two public sources use `crawl_public_properties.py` and
+`structure_public_properties.py`; all later steps extend the existing pipeline.
+Raw snapshots under `data/raw/{IL4GAS,WaterActivity}/` record original URLs, pinned
+commit, download time, SHA-256, size and row count in `manifest.json`. Failed
+experimental downloads preserve the previous complete source. Structure processing
+verifies hashes and splits ionic roles by charge rather than fragment order.
+
+- [IL4GAS](https://github.com/Yu-Xin-Qiu/IL4GAS), commit
+  `a3a16fd0c2a186119efe231b570aa9ebbc38d6c8`: ten experimental CSVs, 19,745 raw rows.
+  Gas SMILES use `solute`, and bar converts to kPa. Merge converts existing
+  `x_CO2_unitless` into CO₂ gas records and publishes only
+  `experiment/gas_solubility.csv`, target `x_gas_unitless`. Raw x is used directly;
+  ln(x), COSMO and screening predictions are not labels. Identity is
+  `(cation, anion, solute)`; T and P remain conditions.
+- [Water activity dataset](https://github.com/MohanMood/NLP_Ionic-Liquid_Properties),
+  commit `ba9768dbdd1c8f2dd90c091b27babc9c22db0c0c`: 3,578 raw rows. The
+  [paper](https://pubs.rsc.org/en/content/articlehtml/2025/gc/d5gc02803e) defines
+  `Activityt_water` as γ, so it maps directly to
+  `water_activity_coefficient_unitless`, without division by mole fraction.
+  `experiment/water_activity_coefficient.csv` retains `x_water_unitless`, T and P
+  as conditions. x=0/1 and γ>1 are valid; γ must be finite and positive.
+
+Both tasks enter Stage3 using existing splits. Structure/clean rejections and raw
+references/record IDs stay in audits, without becoming labels or deduplication keys.
+Equivalent structures from these new sources reuse existing sources' representative
+SMILES when available, preserving the old tasks' chemical identity strings.
+Final `_audit/public_properties/` preserves source traces;
+`gas_solubility_legacy_co2_conversion.csv` records the old CO₂ conversion.
+Analysis adds `gas_solubility_by_gas.csv` and `gas_solubility_by_gas_source.csv`;
+source counts include each contributing source. Gas/water relationship formulas
+remain `pending_formula` until separately approved.
+These two tasks publish no relationship signatures, including for single raw points,
+until their gas/concentration reference formulas are approved.
+
+Existing pEC50 remains. No ILToxDB ingestion is added because it mixes IC50, EC50
+and CC50 without reliably preserving their original designation. ECW is archive-only:
+`python scripts/crawl_public_properties.py --sources ECW` downloads the SI when
+available and records gaps/failures under `data/raw/ECW/`. No ECW task is published;
+the incomplete hybrid table and 660 predictions are not used as a complete set of labels.
+
+### User-run rebuild and validation
+
+Implementation checks use temporary roots. Official datasets, analyses and consumer
+configuration remain unchanged until you run the commands below in the environment
+with `requirements.txt` installed. Existing Stage1 entities and augmentation are
+preserved; extraction and augmentation are not part of this rebuild.
+
+```bash
+cd /data/pengs/ILUME-Data
+set -euo pipefail
+
+ILUME_EXPANSION_RUN=$(date +%Y%m%d-%H%M%S)
+ILUME_EXPANSION_BACKUP="data/backups/expansion-$ILUME_EXPANSION_RUN"
+mkdir -p "$ILUME_EXPANSION_BACKUP"
+for ILUME_EXPANSION_TREE in merged final training_splits; do
+  cp -a "data/$ILUME_EXPANSION_TREE" "$ILUME_EXPANSION_BACKUP/"
+done
+for ILUME_EXPANSION_TREE in raw/IL4GAS raw/WaterActivity \
+  structured/IL4GAS structured/WaterActivity \
+  cleaned/IL4GAS cleaned/WaterActivity cleaned/ILThermo; do
+  if [ -d "data/$ILUME_EXPANSION_TREE" ]; then
+    cp -a --parents "data/$ILUME_EXPANSION_TREE" "$ILUME_EXPANSION_BACKUP/"
+  fi
+done
+
+python scripts/crawl_public_properties.py --sources IL4GAS WaterActivity
+python scripts/structure_public_properties.py --sources IL4GAS WaterActivity
+python scripts/structure_cleaned_ilthermo.py
+python scripts/clean_structured_data.py
+python scripts/merge_data.py
+python scripts/build_final_data.py
+python scripts/build_training_splits.py build-splits --seed 42
+
+python scripts/analyze_final_properties.py --input-root data/final \
+  --output-dir "analysis/dataset-expansion-$ILUME_EXPANSION_RUN"
+python scripts/analyze_dataset_relationship_graph.py audit \
+  --input-root data/training_splits \
+  --output-dir "data/analysis/dataset-expansion-audit-$ILUME_EXPANSION_RUN" --seed 42
+python scripts/analyze_dataset_relationship_graph.py compute \
+  --input-root data/training_splits \
+  --output-dir "data/analysis/dataset-expansion-graph-$ILUME_EXPANSION_RUN" --seed 42
+```
+
+Verify the contract and migration after rebuilding:
+
+```bash
+export ILUME_EXPANSION_BACKUP
+python - <<'PY'
+import os
+from pathlib import Path
+import pandas as pd
+
+root = Path('data/training_splits')
+catalog = pd.read_csv(root / 'task_catalog.csv').set_index('task_id')
+names = ('homo', 'lumo', 'partial_atomic_charge', 'simulated_qm_elec_hf')
+assert set(catalog.loc[catalog.stage.eq(1)].index) == {f'simulation/{n}' for n in names}
+assert catalog.stage.eq(2).sum() == 5
+backup = Path(os.environ['ILUME_EXPANSION_BACKUP'])
+for name in names:
+    record = catalog.loc[f'simulation/{name}']
+    assert record.materialized_path == f'stage1/properties/{name}'
+    assert not (root / 'stage2' / name).exists()
+    old = backup / 'training_splits/stage2' / name
+    new = root / record.materialized_path
+    if old.is_dir():
+        old_files = {p.relative_to(old): p.read_bytes() for p in old.rglob('*') if p.is_file()}
+        new_files = {p.relative_to(new): p.read_bytes() for p in new.rglob('*') if p.is_file()}
+        assert old_files == new_files, name
+for name in ('gas_solubility', 'water_activity_coefficient', 'enthalpy_of_vaporization_or_sublimation'):
+    assert catalog.loc[f'experiment/{name}', 'stage'] == 3
+assert not Path('data/final/experiment/x_co2.csv').exists()
+assert not Path('data/final/experiment/transfer.csv').exists()
+assert 'x_water_unitless' in catalog.loc['experiment/water_activity_coefficient', 'condition_columns']
+audit = pd.read_csv(root / '_audit/stage2_overlap_exclusions.csv')
+hvap = audit.loc[audit.stage2_task_id.eq('simulation/heat_of_vaporization')]
+print('Hvap excluded systems/rows:', len(hvap), hvap.excluded_stage2_rows.sum())
+print(catalog.groupby('stage').size().to_dict())
+print('Contract and unchanged-input partition migration verified.')
+PY
+```
 
 ## 3D Box Fingerprints
 
@@ -197,8 +336,8 @@ signatures and inspect approvals without pairwise metrics. Output directories mu
 be new or empty. Stage3×Stage3 and Stage2→Stage3 outputs include overlap counts,
 provenance, NA/stability tables, annotated heatmaps and five relationship graphs:
 Spearman, distance correlation, directed binary I/H, multiclass MI and CV-NMAE.
-Dynamic permittivity and CO₂ use the approved 10 GHz selection and
-reference-solubility formulas. Viscosity, electrical conductivity and self
+Dynamic permittivity uses the approved 10 GHz selection. Unified gas solubility
+and water activity await formula approval. Viscosity, electrical conductivity and self
 diffusion use the approved Arrhenius temperature-pressure formula. Experimental
 transfer-organic is included only for shared-solute comparisons with solvation
 and transfer; its other Stage3 matrix cells are marked `incompatible_topology`.

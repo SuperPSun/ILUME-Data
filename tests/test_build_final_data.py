@@ -25,12 +25,13 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
         "enthalpy.csv",
         "entropy.csv",
         "heat_capacity_at_vapor_saturation_pressure.csv",
-        "enthalpy_of_vaporization_or_sublimation.csv",
         "enthalpy_of_transition_or_fusion.csv",
         "equilibrium_temperature.csv",
         "isobaric_coefficient_of_volume_expansion.csv",
     ):
         (experiment / filename).write_bytes(b"excluded,1\\n")
+    retained_hvap = experiment / "enthalpy_of_vaporization_or_sublimation.csv"
+    retained_hvap.write_bytes(b"enthalpy_of_vaporization_or_sublimation_kJ/mol,temperature_K\n100,298.15\n")
     retained_simulation = simulation / "heat_of_vaporization.csv"
     retained_simulation.write_bytes(b"heat_of_vaporization,1\\n")
     pd.DataFrame(
@@ -114,12 +115,12 @@ def test_build_final_data_copies_buckets_and_excludes_requested_experiment_prope
     build_final_data(merged_root, final_root, charge_data_root)
     assert manifest_path.read_bytes() == first_manifest
     assert not stale_file.exists()
+    assert (final_root / "experiment" / retained_hvap.name).read_bytes() == retained_hvap.read_bytes()
     for filename in (
         "thermal_diffusivity.csv",
         "enthalpy.csv",
         "entropy.csv",
         "heat_capacity_at_vapor_saturation_pressure.csv",
-        "enthalpy_of_vaporization_or_sublimation.csv",
         "enthalpy_of_transition_or_fusion.csv",
         "equilibrium_temperature.csv",
         "isobaric_coefficient_of_volume_expansion.csv",

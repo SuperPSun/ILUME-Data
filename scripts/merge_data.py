@@ -13,10 +13,11 @@ import pandas as pd
 from rdkit import Chem, rdBase
 from rdkit.Chem import inchi
 
-EXPERIMENT_SOURCES = ("AIonopedia", "ILBERT", "ILThermo", "after_AIonopedia")
+PUBLIC_PROPERTY_SOURCES = ("IL4GAS", "WaterActivity")
+EXPERIMENT_SOURCES = ("AIonopedia", "ILBERT", "ILThermo", "after_AIonopedia", *PUBLIC_PROPERTY_SOURCES)
 SIMULATION_SOURCES = ("simulation",)
 IDENTIFIER_COLUMNS = ("mol_id", "cation", "anion", "solute", "solvent", "smiles", "SMILES")
-CONDITION_COLUMNS = ("temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
+CONDITION_COLUMNS = ("x_water_unitless", "temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
 ORBITAL_AUDIT_COLUMNS = (
     "ion_role",
     "provenance_source_file",
@@ -54,7 +55,7 @@ ORBITAL_GAP_ANOMALY_COLUMNS = (
     "absolute_residual_eV",
     "tolerance_eV",
 )
-PROPERTY_OUTPUT_SLUGS = {"pressure_kPa_log10": "equilibrium_pressure"}
+PROPERTY_OUTPUT_SLUGS = {"pressure_kPa_log10": "equilibrium_pressure", "x_gas_unitless": "gas_solubility"}
 PROPERTY_LABEL_ALIASES = {
     ("after_AIonopedia", "partition_log10"): "transfer_kcal/mol",
     ("simulation", "solvation_kcal/mol"): "transfer_organic_kcal/mol",
@@ -176,12 +177,15 @@ def normalize_chemical_identities(
                             identity_key,
                             {
                                 "smiles": set(),
+                                "existing_source_smiles": set(),
                                 "occurrence_count": 0,
                                 "sources": set(),
                                 "source_files": set(),
                             },
                         )
                         entry["smiles"].add(canonical)
+                        if str(frame["source"].iloc[0]) not in PUBLIC_PROPERTY_SOURCES:
+                            entry["existing_source_smiles"].add(canonical)
                         entry["occurrence_count"] += int(count)
                         entry["sources"].add(str(frame["source"].iloc[0]))
                         entry["source_files"].add(
@@ -189,7 +193,7 @@ def normalize_chemical_identities(
                         )
 
     representatives = {
-        identity_key: min(entry["smiles"])
+        identity_key: min(entry["existing_source_smiles"] or entry["smiles"])
         for identity_key, entry in observations.items()
     }
     for properties in buckets.values():
@@ -624,6 +628,7 @@ def collect_bucket(
     sources: tuple[str, ...],
     *,
     default_pressure_labels: frozenset[str] = frozenset(),
+    gas_conversion_audit: list[dict[str, object]] | None = None,
 ) -> tuple[dict[str, list[pd.DataFrame]], list[dict[str, object]], list[dict[str, object]]]:
     properties: dict[str, list[pd.DataFrame]] = {}
     orbital_gap_summaries: list[dict[str, object]] = []
@@ -712,6 +717,16 @@ def collect_bucket(
                 if property_df.empty:
                     continue
                 target_label = output_label(source, label)
+                if source in EXPERIMENT_SOURCES and label == "x_CO2_unitless":
+                    target_label = "x_gas_unitless"
+                    property_df["solute"] = "O=C=O"
+                    if gas_conversion_audit is not None:
+                        for index, row in property_df.iterrows():
+                            gas_conversion_audit.append({
+                                "source": source, "source_file": path.name,
+                                "source_row_number": index + 2, **row.to_dict(),
+                                "conversion": "x_CO2_unitless -> x_gas_unitless; solute=O=C=O",
+                            })
                 if (
                     source in EXPERIMENT_SOURCES
                     and f"{output_slug(target_label)}.csv"
@@ -823,10 +838,12 @@ def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     output_root.mkdir(parents=True, exist_ok=True)
     clean_output_root(output_root)
 
+    gas_conversion_audit: list[dict[str, object]] = []
     experiment, experiment_gap_summaries, experiment_gap_anomalies = collect_bucket(
         input_root,
         EXPERIMENT_SOURCES,
         default_pressure_labels=EXPERIMENT_DEFAULT_PRESSURE_LABELS,
+        gas_conversion_audit=gas_conversion_audit,
     )
     simulation, simulation_gap_summaries, simulation_gap_anomalies = collect_bucket(
         input_root,
@@ -853,6 +870,16 @@ def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     )
     audit_root = output_root / "_audit"
     audit_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(gas_conversion_audit, columns=["source", "source_file", "source_row_number",
+        "cation", "anion", "solute", "temperature_K", "pressure_kPa", "x_CO2_unitless", "conversion"]).to_csv(
+        audit_root / "gas_solubility_legacy_co2_conversion.csv", index=False)
+    for source in PUBLIC_PROPERTY_SOURCES:
+        source_audit = input_root / source / "_audit"
+        if source_audit.is_dir():
+            destination = audit_root / "public_properties" / source
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.copytree(source_audit, destination)
     pd.DataFrame(
         [*experiment_gap_summaries, *simulation_gap_summaries],
         columns=ORBITAL_GAP_SUMMARY_COLUMNS,
