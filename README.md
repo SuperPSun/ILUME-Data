@@ -326,6 +326,175 @@ after copying to verify file contents and obsolete-file removal.
 Data transfer does not migrate consumer model configuration or existing prepared
 and checkpoint artifacts; those artifacts retain their original dataset identities.
 
+## Lethesh electrochemical limits and QDB.266 partition audit
+
+Use the existing public-source entrypoints with
+`--sources Lethesh2022 Toots2025_QDB266`. Raw snapshots retain original files,
+URLs, DOI, download time, SHA-256 and experimental record counts in their manifests.
+Lethesh archives the publisher HTML, Europe PMC article XML and supplementary ZIP;
+QDB.266 archives the experimental-property ZIP, repository page and author's thesis.
+
+[Lethesh et al. (2022)](https://doi.org/10.3389/fchem.2022.859304) Table 1 is the
+only potential-label source. Its temperature columns must match the measured
+temperatures in Methods 2.2, and its Ec/Ea/ESW header order is checked. Regression
+curves and extrapolated temperatures are not ingested. The reviewed structure map
+is [lethesh2022_ion_map.json](configs/lethesh2022_ion_map.json), bound to the
+supplementary PDF checksum. Unresolved names/structures are rejected with reasons.
+Following the user's explicit source-precedence decision, Table 1 names and
+Figure 1 structures determine identity when supplementary names or Methods lists
+conflict. The snapshot yields 22 canonical ILs and 110 complete Ea/Ec conditions.
+Both Pyr1,103 salts use the drawn 3-methoxypropyl side chain; N1,1,1,3 uses TFSI,
+and N2,2,1,102 uses FSI. The original discrepancies and approved resolution remain
+in the mapping and row provenance (`source_conflict`, `identity_resolution`);
+20 conditions retain these annotations. Unknown identities are still rejected.
+
+Final outputs are `experiment/{anodic_potential_limit,cathodic_potential_limit}.csv`,
+with targets `anodic_potential_limit_V` and `cathodic_potential_limit_V`. Both retain
+cation, anion, temperature, `reference_electrode`, `working_electrode`,
+`scan_rate_mV/s` and `source_list`. These experimental conditions participate in
+deduplication and catalog discovery; categorical electrodes are not numerical labels.
+Potentials retain the reported Ag/Ag+ quasi-reference scale. Numeric pressure is
+not invented from the paper's "standard pressure" description. Water-content bounds,
+purity, replicate count, selected cycle and original values are recorded in audit.
+
+ESW is derived as Ea−Ec and is never a third training task. `ESW_consistency.csv`
+preserves all parsed measurements, reported ESW, derived ESW and differences.
+The initial snapshot has 105 exact matches, three differences within the 0.15 V
+combined rounding bound and two larger discrepancies. Finite Ea/Ec values are
+retained despite ESW inconsistencies. The two targets share the grouped Stage3
+split namespace, including IL folds, while other task namespaces are unchanged.
+Strategies with fewer than five groups are omitted for these two tasks and recorded
+in `_audit/stage3_strategy_omissions.csv`; the two anions cannot form five anion folds.
+Adding these small tasks can change existing Stage3 memberships through the
+existing joint-test registry, which prefers test systems not shared with small
+tasks. A full split rebuild does not promise unchanged old Stage3 folds; previously
+prepared/checkpoint artifacts retain their original identities.
+Their relationship formulas remain `pending_formula`, including single observations.
+
+[Toots et al. / QDB.266](https://qsardb.org/repository/handle/10967/266) uses only
+`properties/logK/values`, joined to compound structures by ID; model predictions
+and descriptors are excluded. Structures require one positive, one negative and
+one neutral fragment, consistent SMILES/InChI, and finite logK. Comparison uses
+exact temperature and the existing canonical-SMILES/Fixed-H identity rules;
+direct SMILES overlap is reported separately from chemical-identity overlap.
+
+For a concentration ratio K=c_IL/c_gas, the candidate conversion is
+`ΔG° = [-R*T*ln(10)*log10(K) + R*T*ln(c°_IL/c°_gas)] / 4184`, with
+R=8.31446261815324 J/mol/K. Equal concentration standards give a zero correction.
+The concentration-standard ratio is distinct from the measured K. The author
+thesis supports a gas/IL concentration ratio at 298.15 K, but the existing
+solvation inputs do not document their standard state. Logarithm/infinite-dilution
+conventions and significant numerical discrepancies also require source review.
+Offset fits, sign/log-base alternatives and 1 atm/1 bar standard-state variants
+are diagnostic only; no fitted correction is applied.
+
+The QDB merge gate defaults to closed. Its candidate values, overlap pairs,
+system/record-weighted residuals, group summaries, hypothetical counts and issues
+remain under `_audit/`; no top-level solvation CSV is emitted without reviewed
+evidence. The initial archive parses 6,531 rows into 134 canonical ILs, 170 solutes
+and 6,488 systems; 2,680 systems overlap at 298.15 K. The candidate union would
+add 3,492 IL–solute systems across all temperatures, but actual additions are zero.
+Audit-only processing removes any previously structured labels during source
+replacement; stale or altered cleaned QDB labels fail the merge gate before output
+replacement. There is no independent logK task.
+
+`structure_public_properties.py --solvation-file ...` selects the comparison
+baseline. `--qdb-compatibility-evidence ...` is reserved for a reviewed JSON record
+containing `approved`, input archive/baseline SHA-256, reviewer, definition citations,
+anomaly resolutions, empty `unresolved_issues`, log base 10, `c_IL/c_gas`, 298.15 K,
+`infinite_dilution: true`
+and a documented `liquid_to_gas_standard_concentration_ratio`. Optional
+`excluded_compounds` maps compound IDs to explicit rejection reasons. An evidence
+record cannot be reused for different input hashes. Cleaned labels are hashed and
+verified again by merge. This initial ingestion has no approved evidence record.
+
+### Formal rebuild after reviewing the temporary validation
+
+Implementation validation uses a temporary root; official final/splits/analysis
+are not regenerated as part of implementation. Run the following separately:
+
+```bash
+cd /data/pengs/ILUME-Data
+set -euo pipefail
+ILUME_ESW_RUN=$(date +%Y%m%d-%H%M%S)
+export ILUME_ESW_BACKUP="data/backups/electrochem-partition-$ILUME_ESW_RUN"
+mkdir -p "$ILUME_ESW_BACKUP"
+for ILUME_ESW_TREE in merged final training_splits raw/Lethesh2022 raw/Toots2025_QDB266 \
+  structured/Lethesh2022 structured/Toots2025_QDB266 cleaned/Lethesh2022 cleaned/Toots2025_QDB266; do
+  if [ -d "data/$ILUME_ESW_TREE" ]; then
+    cp -a --parents "data/$ILUME_ESW_TREE" "$ILUME_ESW_BACKUP/"
+  fi
+done
+python scripts/crawl_public_properties.py --sources Lethesh2022 Toots2025_QDB266
+python scripts/structure_public_properties.py --sources Lethesh2022 Toots2025_QDB266
+python scripts/clean_structured_data.py --sources Lethesh2022 Toots2025_QDB266
+python scripts/merge_data.py
+python scripts/build_final_data.py
+python scripts/build_training_splits.py build-splits --seed 42
+python scripts/analyze_final_properties.py --input-root data/final \
+  --output-dir "analysis/electrochem-partition-$ILUME_ESW_RUN"
+python scripts/analyze_dataset_relationship_graph.py audit --input-root data/training_splits \
+  --output-dir "data/analysis/electrochem-partition-audit-$ILUME_ESW_RUN" --seed 42
+python scripts/analyze_dataset_relationship_graph.py compute --input-root data/training_splits \
+  --output-dir "data/analysis/electrochem-partition-graph-$ILUME_ESW_RUN" --seed 42
+```
+
+Before proceeding, inspect both sources' `summary.json`, the rejected identities
+and QDB overlap pairs under `data/structured/<source>/_audit/`. After rebuilding,
+verify the two potential catalog entries are Stage3, Ea/Ec IL fold memberships
+match, their condition columns are preserved, and no ESW or logK task exists.
+With the gate closed, final solvation and hydration must match the backup byte for
+byte. Raw and merged provenance remains available through final `_audit/public_properties/`.
+
+Run this acceptance check in the same shell after the rebuild (the gate remains
+closed; enabling a future reviewed merge requires a separate acceptance review):
+
+```bash
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+import pandas as pd
+
+root = Path('data')
+catalog = pd.read_csv(root / 'training_splits/task_catalog.csv')
+names = ['anodic_potential_limit', 'cathodic_potential_limit']
+conditions = ['cation', 'anion', 'temperature_K', 'reference_electrode',
+              'working_electrode', 'scan_rate_mV/s']
+for name in names:
+    task = catalog.loc[catalog.task_id.eq('experiment/' + name)]
+    assert len(task) == 1 and task.stage.item() == 3
+    assert task.target_columns.item() == name + '_V'
+    frame = pd.read_csv(root / 'final/experiment' / (name + '.csv'))
+    assert set(conditions + [name + '_V', 'source_list']) == set(frame)
+    assert frame[conditions + [name + '_V']].notna().all().all()
+assert not catalog.task_id.str.contains(r'(?i)(?:^|/)(?:ESW|logK)$', regex=True).any()
+tasks = root / 'training_splits/stage3/experiment'
+ea, ec = [tasks / name for name in names]
+folds = list((ea / 'IL').rglob('fold*.csv'))
+assert folds
+for path in folds:
+    left = pd.read_csv(path)[conditions].sort_values(conditions).reset_index(drop=True)
+    right = pd.read_csv(ec / path.relative_to(ea))[conditions].sort_values(conditions).reset_index(drop=True)
+    pd.testing.assert_frame_equal(left, right)
+for repeat in sorted({path.parent for path in folds}):
+    seen = set()
+    for path in repeat.glob('fold*.csv'):
+        frame = pd.read_csv(path)
+        systems = set(frame[['cation', 'anion']].itertuples(index=False, name=None))
+        assert seen.isdisjoint(systems), 'IL occurs in multiple folds'
+        seen.update(systems)
+summary = json.loads((root / 'structured/Toots2025_QDB266/_audit/summary.json').read_text())
+assert not summary['merge_allowed'] and summary['actual_new_systems'] == 0
+for stage in ('structured', 'cleaned'):
+    assert not list((root / stage / 'Toots2025_QDB266').glob('*.csv'))
+backup = Path(os.environ['ILUME_ESW_BACKUP']) / 'data/final/experiment'
+for name in ('solvation', 'hydration'):
+    assert (root / 'final/experiment' / (name + '.csv')).read_bytes() == (backup / (name + '.csv')).read_bytes()
+print('Accepted:', len(folds), 'paired IL folds; QDB audit-only; solvation/hydration unchanged')
+PY
+```
+
 ## 3D Box Fingerprints
 
 ```bash

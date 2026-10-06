@@ -47,6 +47,11 @@ formula is approved. This also applies to their single observations: raw points 
 different gas identities or water concentrations are not comparable IL signatures.
 Stage1 supervised property tasks are outside this Stage2/Stage3 graph.
 
+Anodic and cathodic potential limits are also `pending_formula`: their reference
+and working electrodes remain categorical conditions, with scan rate recorded as
+a numeric condition. No scalar signatures are produced before a reference formula
+is approved. ESW is derived as Ea−Ec in source audit, not a separate graph task.
+
 Signatures use 298.15 K and 101.325 kPa, with 589 nm for refractive index. Observed
 constant conditions remain at their actual values with `reference_mismatch`.
 Varying conditions are extrapolated when necessary; coordinate distances and

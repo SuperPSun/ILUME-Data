@@ -1,0 +1,126 @@
+{
+  "source": "10.3389/fchem.2022.859304; Figure 1 and Supplementary Table S1",
+  "ionic_liquids": {
+    "[emim][tfsi]": {
+      "cation": "CC[n+]1ccn(C)c1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 1"
+    },
+    "[emim][fsi]": {
+      "cation": "CC[n+]1ccn(C)c1",
+      "anion": "O=S(=O)(F)[N-]S(=O)(=O)F",
+      "evidence": "Figure 1; Methods 2.1; Table 1 entry 2; Figure S6 (absent from Table S1)"
+    },
+    "[pyr1,3][tfsi]": {
+      "cation": "CCC[N+]1(C)CCCC1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 3"
+    },
+    "[pyr1,3][fsi]": {
+      "cation": "CCC[N+]1(C)CCCC1",
+      "anion": "O=S(=O)(F)[N-]S(=O)(=O)F",
+      "evidence": "Figure 1; Table S1 entry 4"
+    },
+    "[pyr1,4][tfsi]": {
+      "cation": "CCCC[N+]1(C)CCCC1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 5 name and abbreviation; CAS duplicates FSI entry and is not used for identity"
+    },
+    "[pyr1,4][fsi]": {
+      "cation": "CCCC[N+]1(C)CCCC1",
+      "anion": "O=S(=O)(F)[N-]S(=O)(=O)F",
+      "evidence": "Figure 1; Table S1 entries 2/6 (duplicate)"
+    },
+    "[pyr1,5][tfsi]": {
+      "cation": "CCCCC[N+]1(C)CCCC1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 7"
+    },
+    "[pyr1,102][tfsi]": {
+      "cation": "COCC[N+]1(C)CCCC1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 8, N-(2-methoxyethyl)"
+    },
+    "[pip1,4][tfsi]": {
+      "cation": "CCCC[N+]1(C)CCCCC1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 11"
+    },
+    "[pip1,3][tfsi]": {
+      "cation": "CCC[N+]1(C)CCCCC1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 12"
+    },
+    "[pip1,3][fsi]": {
+      "cation": "CCC[N+]1(C)CCCCC1",
+      "anion": "O=S(=O)(F)[N-]S(=O)(=O)F",
+      "evidence": "Figure 1; Table S1 entry 13"
+    },
+    "[n1,1,1,4][tfsi]": {
+      "cation": "CCCC[N+](C)(C)C",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 15"
+    },
+    "[n1,1,1,6][tfsi]": {
+      "cation": "CCCCCC[N+](C)(C)C",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 16"
+    },
+    "[n4,4,4,1][tfsi]": {
+      "cation": "CCCC[N+](C)(CCCC)CCCC",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 17"
+    },
+    "[n1,1,2,102][tfsi]": {
+      "cation": "COCC[N+](C)(C)CC",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 18"
+    },
+    "[n1,1,2,102][fsi]": {
+      "cation": "COCC[N+](C)(C)CC",
+      "anion": "O=S(=O)(F)[N-]S(=O)(=O)F",
+      "evidence": "Figure 1; Table S1 entry 19"
+    },
+    "[n1,1,2phenyleth][tfsi]": {
+      "cation": "CC[N+](C)(C)CCc1ccccc1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1 drawn N,N-dimethyl-N-ethyl-N-(2-phenylethyl); Table S1 entry 21 (Figure 1 caption index differs)"
+    },
+    "[n1,1,2benz][tfsi]": {
+      "cation": "CC[N+](C)(C)Cc1ccccc1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Figure 1; Table S1 entry 22"
+    },
+    "[pyr1,103][tfsi]": {
+      "cation": "COCCC[N+]1(C)CCCC1",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Table 1 entry 9; Figure 1; user-approved precedence of main-text table and structure figure",
+      "source_conflict": "Table S1 names 2-methoxypropyl; Figure 1 draws an unbranched N-(3-methoxypropyl) chain. Positional isomer unresolved.",
+      "identity_resolution": "User-approved resolution: Table 1 IL names and Figure 1 structures take precedence over conflicting supplementary names and Methods lists; original discrepancies remain in provenance."
+    },
+    "[pyr1,103][fsi]": {
+      "cation": "COCCC[N+]1(C)CCCC1",
+      "anion": "O=S(=O)(F)[N-]S(=O)(=O)F",
+      "evidence": "Table 1 entry 10; Figure 1; user-approved precedence of main-text table and structure figure",
+      "source_conflict": "Table 1 and Figure S6 use Pyr1,103; Table S1 entry 9 and Methods 2.1 use Pyr1,102. Also positional-isomer conflict for Pyr1,103.",
+      "identity_resolution": "User-approved resolution: Table 1 IL names and Figure 1 structures take precedence over conflicting supplementary names and Methods lists; original discrepancies remain in provenance."
+    },
+    "[n1,1,1,3][tfsi]": {
+      "cation": "CCC[N+](C)(C)C",
+      "anion": "O=S(=O)([N-]S(=O)(=O)C(F)(F)F)C(F)(F)F",
+      "evidence": "Table 1 entry 14; Figure 1; user-approved precedence of main-text table and structure figure",
+      "source_conflict": "Table 1 labels TFSI; Table S1 entry 14 and Methods 2.1 label FSI. Anion identity unresolved.",
+      "identity_resolution": "User-approved resolution: Table 1 IL names and Figure 1 structures take precedence over conflicting supplementary names and Methods lists; original discrepancies remain in provenance."
+    },
+    "[n2,2,1,102][fsi]": {
+      "cation": "COCC[N+](C)(CC)CC",
+      "anion": "O=S(=O)(F)[N-]S(=O)(=O)F",
+      "evidence": "Table 1 entry 20; Figure 1; user-approved precedence of main-text table and structure figure",
+      "source_conflict": "Table 1/Table S1 abbreviation/Figure S6 use FSI; Table S1 entry 20 full name specifies TFSI and reuses entry 18 CAS. Anion identity unresolved.",
+      "identity_resolution": "User-approved resolution: Table 1 IL names and Figure 1 structures take precedence over conflicting supplementary names and Methods lists; original discrepancies remain in provenance."
+    }
+  },
+  "unresolved": {},
+  "supplement_pdf_sha256": "3b17120a9c184ec8f2e98650421c892829b800a59913356ecfc5bb0f8988d32b",
+  "identity_policy": "User-approved resolution: Table 1 IL names and Figure 1 structures take precedence over conflicting supplementary names and Methods lists; original discrepancies remain in provenance."
+}

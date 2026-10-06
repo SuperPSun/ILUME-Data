@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import hashlib
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 import re
@@ -13,11 +15,11 @@ import pandas as pd
 from rdkit import Chem, rdBase
 from rdkit.Chem import inchi
 
-PUBLIC_PROPERTY_SOURCES = ("IL4GAS", "WaterActivity")
+PUBLIC_PROPERTY_SOURCES = ("IL4GAS", "WaterActivity", "Lethesh2022", "Toots2025_QDB266")
 EXPERIMENT_SOURCES = ("AIonopedia", "ILBERT", "ILThermo", "after_AIonopedia", *PUBLIC_PROPERTY_SOURCES)
 SIMULATION_SOURCES = ("simulation",)
 IDENTIFIER_COLUMNS = ("mol_id", "cation", "anion", "solute", "solvent", "smiles", "SMILES")
-CONDITION_COLUMNS = ("x_water_unitless", "temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
+CONDITION_COLUMNS = ("x_water_unitless", "temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase", "reference_electrode", "working_electrode", "scan_rate_mV/s")
 ORBITAL_AUDIT_COLUMNS = (
     "ion_role",
     "provenance_source_file",
@@ -107,6 +109,7 @@ UNIT_SUFFIXES = (
     "_nm",
     "_m/s",
     "_eV",
+    "_V",
     "_K",
 )
 
@@ -835,6 +838,14 @@ def write_bucket(
 def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     input_root = Path(input_root)
     output_root = Path(output_root)
+    qdb_root = input_root / "Toots2025_QDB266"
+    qdb_files = list(qdb_root.glob("*.csv"))
+    if qdb_files:
+        summary_path = qdb_root / "_audit/summary.json"
+        summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
+        hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in qdb_files}
+        if not summary.get("merge_allowed") or hashes != summary.get("cleaned_output_sha256"):
+            raise ValueError("QDB.266 solvation publication blocked: reviewed compatibility evidence and unchanged cleaned data required")
     output_root.mkdir(parents=True, exist_ok=True)
     clean_output_root(output_root)
 

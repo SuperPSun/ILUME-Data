@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import shutil
 import sys
@@ -20,12 +22,13 @@ if str(SRC_ROOT) not in sys.path:
 
 from raw_prep import net_formal_charge, reconcile_smiles_charge  # noqa: E402
 
-PUBLIC_PROPERTY_SOURCES = ("IL4GAS", "WaterActivity")
+PUBLIC_PROPERTY_SOURCES = ("IL4GAS", "WaterActivity", "Lethesh2022", "Toots2025_QDB266")
 DEFAULT_SOURCES = ("AIonopedia", "ILBERT", "after_AIonopedia", "simulation", *PUBLIC_PROPERTY_SOURCES)
 EXCLUDED_SOURCES = {"ILThermo"}
 IDENTIFIER_COLUMNS = ("cation", "anion", "solute", "solvent", "smiles", "SMILES", "mol_id")
 SMILES_COLUMNS = ("cation", "anion", "solute", "solvent", "smiles", "SMILES")
-CONDITION_COLUMNS = ("x_water_unitless", "temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase")
+TEXT_CONDITION_COLUMNS = ("phase", "reference_electrode", "working_electrode")
+CONDITION_COLUMNS = ("x_water_unitless", "temperature_K", "pressure_kPa", "frequency_MHz", "wavelength_nm", "phase", "reference_electrode", "working_electrode", "scan_rate_mV/s")
 NON_LABEL_COLUMNS = {*IDENTIFIER_COLUMNS, *CONDITION_COLUMNS}
 FRACTION_COLUMNS = {"ESP_pos_frac", "ESP_neg_frac", "q_pos_frac"}
 BOX_3D_FILENAME = "3d_box_structured.csv"
@@ -126,6 +129,9 @@ OUTPUT_ORDER = (
     "frequency_MHz",
     "wavelength_nm",
     "phase",
+    "reference_electrode",
+    "working_electrode",
+    "scan_rate_mV/s",
 )
 
 
@@ -204,7 +210,7 @@ def cached_canonical_smiles(value: object, cache: dict[str, str | None]) -> obje
 def coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for column in out.columns:
-        if column in IDENTIFIER_COLUMNS or column == "phase":
+        if column in IDENTIFIER_COLUMNS or column in TEXT_CONDITION_COLUMNS:
             continue
         out[column] = pd.to_numeric(out[column], errors="coerce")
     return out
@@ -578,7 +584,7 @@ def clean_structured_file(
     provenance = pd.read_csv(provenance_path) if provenance_path.is_file() else None
 
     for column in df.columns:
-        if column in IDENTIFIER_COLUMNS or column == "phase":
+        if column in IDENTIFIER_COLUMNS or column in TEXT_CONDITION_COLUMNS:
             df[column] = df[column].map(clean_text)
 
     smiles_cache = smiles_cache_for(df)
@@ -632,13 +638,22 @@ def clean_structured_file(
 
     df = coerce_numeric_columns(df)
     if input_path.parent.name in PUBLIC_PROPERTY_SOURCES:
-        required_numeric = ["temperature_K", "pressure_kPa", *label_columns(df)]
+        required_numeric = ["temperature_K", *label_columns(df)]
+        if input_path.parent.name in {"IL4GAS", "WaterActivity"}:
+            required_numeric.append("pressure_kPa")
+        if input_path.parent.name == "Lethesh2022":
+            required_numeric.append("scan_rate_mV/s")
+            for column in ("reference_electrode", "working_electrode"):
+                mask = active & df[column].isna()
+                if mask.any():
+                    add_rejections(rejected_rows, df, mask, "missing_condition", column, "")
+                    active &= ~mask
         if input_path.parent.name == "WaterActivity":
             required_numeric.append("x_water_unitless")
         for column in required_numeric:
             values = df[column]
             invalid = ~values.map(lambda value: pd.notna(value) and math.isfinite(value))
-            if column == "temperature_K":
+            if column in {"temperature_K", "scan_rate_mV/s"}:
                 invalid |= values.le(0)
             elif column == "pressure_kPa":
                 invalid |= values.lt(0)
@@ -812,6 +827,14 @@ def clean_non_ilthermo_structured(
                     repaired_path,
                 )
             )
+        if source == "Toots2025_QDB266" and (output_root / source / "_audit/summary.json").is_file():
+            summary_path = output_root / source / "_audit/summary.json"
+            summary = json.loads(summary_path.read_text())
+            summary["cleaned_output_sha256"] = {
+                p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in (output_root / source).glob("*.csv")
+            }
+            summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     write_reports(results, output_root)
     return results
 

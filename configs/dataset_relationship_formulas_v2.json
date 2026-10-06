@@ -28,7 +28,9 @@
     "experiment/thermal_decomposition_temperature.csv": "unconditioned",
     "experiment/dynamic_relative_permittivity.csv": "reference_frequency_10ghz",
     "experiment/gas_solubility.csv": "pending_formula",
-    "experiment/water_activity_coefficient.csv": "pending_formula"
+    "experiment/water_activity_coefficient.csv": "pending_formula",
+    "experiment/anodic_potential_limit.csv": "pending_formula",
+    "experiment/cathodic_potential_limit.csv": "pending_formula"
   },
   "binary_thresholds": {},
   "stability": {"bootstrap": 200, "permutation": 199, "cv_repeats": 20, "cv_permutation": 99, "minimum_bootstrap_valid": 100}

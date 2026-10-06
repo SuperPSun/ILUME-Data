@@ -42,6 +42,8 @@ def test_raw_pending_and_zero_df(config):
 def test_expanded_tasks_require_new_formula_approval(config):
     assert config['formulas']['experiment/gas_solubility.csv'] == 'pending_formula'
     assert config['formulas']['experiment/water_activity_coefficient.csv'] == 'pending_formula'
+    assert config['formulas']['experiment/anodic_potential_limit.csv'] == 'pending_formula'
+    assert config['formulas']['experiment/cathodic_potential_limit.csv'] == 'pending_formula'
     assert 'experiment/x_co2.csv' not in config['formulas']
     assert config['formulas']['experiment/enthalpy_of_vaporization_or_sublimation.csv'] == 'linear_temperature'
 
@@ -49,16 +51,18 @@ def test_expanded_tasks_require_new_formula_approval(config):
 @pytest.mark.parametrize(('dataset', 'target', 'condition'), (
     ('gas_solubility', 'x_gas_unitless', 'solute'),
     ('water_activity_coefficient', 'water_activity_coefficient_unitless', 'x_water_unitless'),
+    ('anodic_potential_limit', 'anodic_potential_limit_V', 'reference_electrode'),
+    ('cathodic_potential_limit', 'cathodic_potential_limit_V', 'reference_electrode'),
 ))
 def test_pending_public_tasks_do_not_use_single_raw_signatures(config, dataset, target, condition):
     data = pd.DataFrame({'cation': ['cat'], 'anion': ['an'], target: [.1],
                          'temperature_K': [298.15], 'pressure_kPa': [100.],
-                         condition: ['O=C=O'] if condition == 'solute' else [.2]})
+                         condition: ['O=C=O'] if condition == 'solute' else ['Ag/Ag+'] if condition == 'reference_electrode' else [.2]})
     source = f'experiment/{dataset}.csv'
     node = {'node_id': f'{source}::{target}', 'source_dataset': source, 'target_property': target,
             'stage': 3, 'system_type': 'il_solute' if condition == 'solute' else 'il',
             'excluded_reason': '', 'formula': 'pending_formula', 'files': [], 'frame': data,
-            'condition_columns': 'temperature_K;pressure_kPa' + (';x_water_unitless' if condition != 'solute' else '')}
+            'condition_columns': 'temperature_K;pressure_kPa' + (';' + condition if condition != 'solute' else '')}
     inventory, review, signatures, _ = graph.build_signatures([node], config)
     assert signatures.signature.isna().all()
     assert signatures.status.eq('pending_formula').all()

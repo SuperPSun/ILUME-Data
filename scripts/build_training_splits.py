@@ -74,6 +74,9 @@ CONDITION_COLUMN_ORDER = (
     "frequency_MHz",
     "wavelength_nm",
     "phase",
+    "reference_electrode",
+    "working_electrode",
+    "scan_rate_mV/s",
 )
 CONDITION_COLUMNS = set(CONDITION_COLUMN_ORDER)
 ORBITAL_AUDIT_COLUMNS = (
@@ -563,6 +566,12 @@ def _group_fold_signature(
             for fold in range(5)
         )
     )
+
+
+def stage3_group_split_namespace(task_id: str) -> str:
+    if task_id in {"experiment/anodic_potential_limit", "experiment/cathodic_potential_limit"}:
+        return "experiment/lethesh2022_limits"
+    return task_id
 
 
 def task_group_kfold_assignments(
@@ -5621,6 +5630,7 @@ def build_training_splits(
 
     task_catalog_rows: list[dict[str, object]] = []
     fold_balance_rows: list[dict[str, object]] = []
+    strategy_omissions: list[dict[str, object]] = []
     stage2_overlap_audits: list[pd.DataFrame] = []
     partial_charge_resource_audit = pd.DataFrame(
         columns=PARTIAL_CHARGE_RESOURCE_AUDIT_COLUMNS
@@ -5903,9 +5913,16 @@ def build_training_splits(
                     strategy,
                     columns,
                 )
+                if (stage3_group_split_namespace(task.task_id) == "experiment/lethesh2022_limits"
+                        and group_values.nunique() < 5):
+                    strategies.remove(strategy)
+                    strategy_omissions.append({"task_id": task.task_id, "strategy": strategy,
+                                               "groups": int(group_values.nunique()),
+                                               "reason": "fewer_than_five_groups"})
+                    continue
                 group_folds = task_group_kfold_assignments(
                     group_values,
-                    task_id=task.task_id,
+                    task_id=stage3_group_split_namespace(task.task_id),
                     strategy=strategy,
                     repeats=repeats,
                     seed=seed,
@@ -5995,7 +6012,7 @@ def build_training_splits(
                     "strategies": ";".join(strategies),
                     "repeats": repeats,
                     "strategy_units": json.dumps(
-                        _task_strategy_units(task),
+                        {k: v for k, v in _task_strategy_units(task).items() if k in strategies},
                         sort_keys=True,
                         separators=(",", ":"),
                     ),
@@ -6033,6 +6050,8 @@ def build_training_splits(
             kind="stable",
         ).reset_index(drop=True)
         write_dataframe(staged_root / "task_catalog.csv", task_catalog)
+        write_dataframe(audit_root / "stage3_strategy_omissions.csv", pd.DataFrame(
+            strategy_omissions, columns=["task_id", "strategy", "groups", "reason"]))
         replace_directory(stage1_properties_root, output_root / "stage1" / "properties")
         replace_directory(stage2_root, output_root / "stage2")
         replace_directory(stage3_root, output_root / "stage3")

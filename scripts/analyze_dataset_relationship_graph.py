@@ -643,6 +643,11 @@ def build_signatures(nodes, config):
                 if col not in frame:
                     coverage[col] = {"missing_column": True}
                     continue
+                if col in {"reference_electrode", "working_electrode"}:
+                    coverage[col] = {"n_missing": int(frame[col].isna().sum()),
+                                     "values": sorted(frame[col].dropna().unique().tolist()),
+                                     "n_varied_systems": int((frame.groupby(identity)[col].nunique() > 1).sum())}
+                    continue
                 v = pd.to_numeric(frame[col], errors="coerce")
                 coverage[col] = {"n_missing": int((~np.isfinite(v)).sum()),
                                  "min": float(v.min()) if np.isfinite(v.min()) else None,
@@ -665,8 +670,9 @@ def build_signatures(nodes, config):
                         for keys, group in frame.groupby(["cation", "anion"], sort=True)]
             for row in rows:
                 if (node["formula"] == "pending_formula" and node["source_dataset"] in {
-                        "experiment/gas_solubility.csv", "experiment/water_activity_coefficient.csv"}):
-                    # A single raw point also lacks an approved gas/concentration reference.
+                        "experiment/gas_solubility.csv", "experiment/water_activity_coefficient.csv",
+                        "experiment/anodic_potential_limit.csv", "experiment/cathodic_potential_limit.csv"}):
+                    # A single raw point also lacks an approved condition/reference formula.
                     row.update(signature=np.nan, status="pending_formula", signature_kind="pending_formula")
                 row.update(node_id=node["node_id"], dataset=node["source_dataset"],
                            target_property=node["target_property"], stage=node["stage"],

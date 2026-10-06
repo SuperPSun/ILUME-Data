@@ -76,7 +76,7 @@ PROPERTY_SYSTEM_OVERLAP_COLUMNS = [
     "property_b_overlap_ratio",
 ]
 
-NUMERIC_CONDITION_COLUMNS = tuple(column for column in CONDITION_COLUMNS if column != "phase")
+NUMERIC_CONDITION_COLUMNS = tuple(column for column in CONDITION_COLUMNS if column not in {"phase", "reference_electrode", "working_electrode"})
 PLOTTING_CONDITION_DEFAULTS = {
     "temperature_K": 298.15,
     "pressure_kPa": 101.325,
