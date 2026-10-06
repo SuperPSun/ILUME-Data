@@ -2,11 +2,11 @@
 
 ## Global Summary
 
-- Analyzed properties: 41
-- Total data points across analyzed properties: 1766235
-- Sum of property-level unique systems: 1485174
+- Analyzed properties: 43
+- Total data points across analyzed properties: 1766455
+- Sum of property-level unique systems: 1485218
 - Properties recommended for system holdout test: 33
-- Properties recommended for grouped CV: 8
+- Properties recommended for grouped CV: 10
 - Properties recommended for leave-one-system-out or descriptive analysis: 0
 
 ## Largest Properties
@@ -19,12 +19,12 @@
 | simulation | heat_of_vaporization | 41701 | 20895 | system_holdout_test |
 | experiment | viscosity | 39941 | 2586 | system_holdout_test |
 | simulation | charge | 28203 | 28203 | system_holdout_test |
-| simulation | gap | 27258 | 27258 | system_holdout_test |
 | simulation | q_min | 27258 | 27258 | system_holdout_test |
+| simulation | gap | 27258 | 27258 | system_holdout_test |
 | simulation | q_max | 27258 | 27258 | system_holdout_test |
-| simulation | esp_min | 27258 | 27258 | system_holdout_test |
 | simulation | quadrupole | 27258 | 27258 | system_holdout_test |
-| simulation | dipole | 27258 | 27258 | system_holdout_test |
+| simulation | esp_min | 27258 | 27258 | system_holdout_test |
+| simulation | esp_max | 27258 | 27258 | system_holdout_test |
 
 ## High Leakage Risk Properties
 
@@ -33,6 +33,8 @@ These properties should not be split by random rows because repeated systems can
 | bucket | property | unique_systems | multi_point_system_ratio | max_points_per_system |
 | --- | --- | --- | --- | --- |
 | experiment | dynamic_relative_permittivity | 49 | 1.0 | 18 |
+| experiment | anodic_potential_limit | 22 | 1.0 | 5 |
+| experiment | cathodic_potential_limit | 22 | 1.0 | 5 |
 | simulation | heat_of_vaporization | 20895 | 0.9957406078009093 | 2 |
 | simulation | density | 26204 | 0.9941993588765075 | 9 |
 | experiment | equilibrium_pressure | 95 | 0.9894736842105263 | 151 |
@@ -42,8 +44,6 @@ These properties should not be split by random rows because repeated systems can
 | experiment | gas_solubility | 487 | 0.9527720739219713 | 906 |
 | experiment | density | 5966 | 0.9446865571572243 | 2509 |
 | experiment | heat_capacity | 352 | 0.875 | 1757 |
-| experiment | surface_tension | 1141 | 0.845749342681858 | 180 |
-| experiment | refractive_index | 726 | 0.803030303030303 | 237 |
 
 ## System Holdout Test Candidates
 
@@ -66,6 +66,8 @@ These properties should not be split by random rows because repeated systems can
 
 | bucket | property | unique_systems | data_points |
 | --- | --- | --- | --- |
+| experiment | anodic_potential_limit | 22 | 110 |
+| experiment | cathodic_potential_limit | 22 | 110 |
 | experiment | self_diffusion_coefficient | 36 | 382 |
 | experiment | static_relative_permittivity | 44 | 65 |
 | experiment | dynamic_relative_permittivity | 49 | 882 |
@@ -84,17 +86,17 @@ None.
 Experimental ionic-liquid systems are keyed by `(cation, anion)`; measurement conditions are ignored.
 
 - Full pairwise statistics: `property_system_overlap.csv`
-- Properties with IL systems: 20
+- Properties with IL systems: 22
 
 ## Generated Figures
 
 - condition_availability: 1
 - coverage: 4
 - normalized_property_violin: 1
-- property_distribution_1d: 41
-- property_distribution_2d: 55
+- property_distribution_1d: 43
+- property_distribution_2d: 61
 - property_system_overlap: 1
-- system_frequency: 41
+- system_frequency: 43
 
 Key summary figures:
 - `figures/coverage/property_coverage_all.png`
