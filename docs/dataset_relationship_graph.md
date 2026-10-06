@@ -54,11 +54,12 @@ ranges are recorded. `extrapolated` refers to departure from individual coordina
 ranges, not a guarantee that the reference lies inside a multivariate convex hull.
 Rank-deficient designs return NA. Every varying condition in the approved formula
 is retained for the general linear and Arrhenius formulas; pressure is not silently
-dropped there. The x_CO2 exception follows its explicit identifiable-term rule
+dropped there. The legacy x_CO2 exception follows its explicit identifiable-term rule
 below. Two-point linear fits have no residual degrees of freedom and cannot
 estimate uncertainty.
 
-Single observations remain raw, including those in pending datasets. No-condition
+Single observations remain raw, including those in pending datasets, except the
+unified gas and water tasks described above. No-condition
 replicates and same-condition replicates use medians; the latter remain at their
 observed conditions. Density is fitted in natural-log space and restored to its
 original units. Existing log10 targets are never logged a second time. Viscosity,
@@ -75,14 +76,16 @@ Dynamic relative permittivity uses only observations at exactly 10 GHz
 median. A system without that exact frequency is `missing_reference_frequency`.
 No Debye, Cole-Cole, or other frequency extrapolation is used.
 
-For multi-observation x_CO2 systems, the response is
+For legacy catalogs containing standalone x_CO2 systems, the response is
 `ln(P_kPa/x_CO2) = a + b(1/T - 1/298.15) + c(P_kPa - 101.325)/T`.
 Only varying terms that increase the design rank are retained, in formula order.
 The reference signature is `101.325 exp(-a)`. Inputs require positive temperature
 and pressure and `0 < x_CO2 < 1`; single-observation systems retain the raw value.
+Current publication replaces this task with unified gas solubility; this legacy
+formula is not applied to the new task.
 
 Solvation temperature fits operate on IL-solute sequences; single-observation
-sequences enter the additive solute model unchanged. Transfer has no temperature
+sequences enter the additive solute model unchanged. Legacy IL transfer has no temperature
 correction and rejects unexpectedly varying temperature. Unit signatures have
 equal weight in the IL+solute model, constrained to mean(solute effect)=0.
 Filtering precedes connectivity checking. Only the eligible connected component
@@ -95,6 +98,9 @@ all temperature-fit errors.
 
 Solvation-transfer and comparisons of either dataset with ordinary IL properties
 use the solute-controlled IL-level `(cation, anion)` effects.
+Current hydration has only `(solute, temperature_K)` identities and is inventoried
+as a non-IL node, outside these IL matrices. Transfer comparisons below apply only
+to legacy catalogs that still contain the IL transfer task.
 
 Experimental `transfer_organic` is read only from `random/fold1..5.csv`; test,
 summary and alternate development strategies are not concatenated. Replicates

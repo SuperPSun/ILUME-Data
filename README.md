@@ -42,8 +42,8 @@ sources are combined in `source_list`. The output has no ionic-liquid identity.
 counts/minima/maxima/medians, and excluded unmatched transfer rows respectively.
 Merged inputs, final solvation and organic transfer are preserved. Missing one
 input, missing required fields or invalid numbers stop publication.
-The hydration migration rebuilds final only; existing training splits and analysis
-outputs retain the previous transfer contract until separately regenerated.
+After final publication, rebuild training splits and analysis outputs to propagate
+the hydration contract; `build_final_data.py` does not update those downstream products.
 
 This migration is required for legacy final data with role-separated orbital files
 or no `charge_20260514/structure_manifest.csv`; mixed contracts fail discovery.
@@ -76,7 +76,7 @@ python scripts/build_training_splits.py import-zinc-diversity
   use charge-preserving generic rules, remain sanitized single fragments with zero
   net charge, and exclude ion-specific rules; see [ADR 0002](docs/adr/0002-neutral-shared-structural-rules.md).
 - `import-zinc-diversity` is a separate offline import. `all` runs extraction,
-  rule/PubChem augmentation and Stage2/Stage3, but excludes ZINC. Once ZINC is
+  rule/PubChem augmentation and supervised Stage1/Stage2/Stage3 splits, but excludes ZINC. Once ZINC is
   published, `augment-pretrain` refuses to erase it: a full rebuild restarts at extraction.
 
 ### Local ZINC22 diversity augmentation
@@ -107,7 +107,7 @@ Keep large ZINC payloads local; do not commit or redistribute them. Chemistry,
 cache and publication decisions are in [ADR 0001](docs/adr/0001-zinc22-diversity-augmentation.md),
 with links to source terms.
 
-## Stage2 Property Splits
+## Supervised Property Splits
 
 `build-splits` rebuilds `stage1/properties`, Stage2, Stage3 and `_audit`, leaving
 Stage1 entity CSVs and augmentation untouched. Nine simulation tasks are registered:
@@ -186,7 +186,7 @@ counts; consumers must not infer test availability by probing files.
 tasks, interpreted with `task_kind`, `target_level` and `label_source`.
 [ADR 0003](docs/adr/0003-stage2-physics-supervision-contract.md) records the original
 producer decision; ADR 0004 supersedes its orbital clauses. The partition table
-above describes current Stage2 splitting.
+above describes current supervised simulation splitting.
 
 ## Public gas/water expansion
 
@@ -232,10 +232,10 @@ the incomplete hybrid table and 660 predictions are not used as a complete set o
 
 ### User-run rebuild and validation
 
-Implementation checks use temporary roots. Official datasets, analyses and consumer
-configuration remain unchanged until you run the commands below in the environment
-with `requirements.txt` installed. Existing Stage1 entities and augmentation are
-preserved; extraction and augmentation are not part of this rebuild.
+Use temporary output roots for implementation checks. The commands below rebuild
+official datasets and analyses in an environment with `requirements.txt` installed.
+Existing Stage1 entities and augmentation are preserved; extraction and augmentation
+are not part of this rebuild. Consumer data and model configuration require a separate migration.
 
 ```bash
 cd /data/pengs/ILUME-Data
@@ -310,6 +310,21 @@ print(catalog.groupby('stage').size().to_dict())
 print('Contract and unchanged-input partition migration verified.')
 PY
 ```
+
+### Consumer data migration
+
+Consumer `data/` corresponds to `data/training_splits/` in this repository.
+The consumer destinations are `/data/pengs/ILUME/data`,
+`szx:/home/sunp/ILUME/data` and `h100:/workspace/pengs/ILUME/data`.
+Back up each destination on its own host before replacement. Sync
+`stage1/properties/`, `stage2/`, `stage3/` and `_audit/`, preserving existing Stage1
+entity CSVs and `stage1/augmentation/`; publish `task_catalog.csv` last.
+Remove obsolete task directories through the backed-up sync so that former
+Stage2 property directories and the old experiment transfer task cannot survive
+beside the new contract. Use `rsync -acni --delete` on each synchronized tree
+after copying to verify file contents and obsolete-file removal.
+Data transfer does not migrate consumer model configuration or existing prepared
+and checkpoint artifacts; those artifacts retain their original dataset identities.
 
 ## 3D Box Fingerprints
 
