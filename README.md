@@ -25,6 +25,10 @@ simulation pressure fields are unchanged.
 
 Rebuild merged, final and supervised Stage1/Stage2/Stage3 data in dependency order:
 
+For a pre-conversion `WaterActivity` snapshot, first run the water crawl/structure/
+clean commands in [the water-solvation migration](#infinite-dilution-water-activity-to-solvation).
+Merge intentionally rejects old unversioned water snapshots.
+
 ```bash
 python scripts/merge_data.py
 python scripts/build_final_data.py
@@ -209,20 +213,138 @@ verifies hashes and splits ionic roles by charge rather than fragment order.
   [paper](https://pubs.rsc.org/en/content/articlehtml/2025/gc/d5gc02803e) defines
   `Activityt_water` as γ, so it maps directly to
   `water_activity_coefficient_unitless`, without division by mole fraction.
-  `experiment/water_activity_coefficient.csv` retains `x_water_unitless`, T and P
-  as conditions. x=0/1 and γ>1 are valid; γ must be finite and positive.
+  Structured/cleaned and merged data retain `x_water_unitless`, T and P.
+  x=0/1 and γ>1 are valid; γ must be finite and positive. The independent
+  water-activity task is retired from final and training splits; see the conversion
+  contract below. Its raw measurements, including finite-composition data, remain.
 
-Both tasks enter Stage3 using existing splits. Structure/clean rejections and raw
+Gas solubility enters Stage3 using existing splits. Converted water observations
+join the existing Stage3 solvation task. Structure/clean rejections and raw
 references/record IDs stay in audits, without becoming labels or deduplication keys.
 Equivalent structures from these new sources reuse existing sources' representative
 SMILES when available, preserving the old tasks' chemical identity strings.
 Final `_audit/public_properties/` preserves source traces;
 `gas_solubility_legacy_co2_conversion.csv` records the old CO₂ conversion.
 Analysis adds `gas_solubility_by_gas.csv` and `gas_solubility_by_gas_source.csv`;
-source counts include each contributing source. Gas/water relationship formulas
-remain `pending_formula` until separately approved.
-These two tasks publish no relationship signatures, including for single raw points,
-until their gas/concentration reference formulas are approved.
+source counts include each contributing source. The gas relationship formula
+remains `pending_formula`; raw gas points do not publish signatures until a gas
+reference formula is approved. The historical water formula entry is inactive
+because there is no independent water task in the rebuilt catalog.
+
+### Infinite-dilution water activity to solvation
+
+`merge_data.py` uses only accepted `WaterActivity` observations with exactly
+`x_water_unitless == 0`. Finite compositions are not extrapolated into neat-IL
+labels. For a neutral 1:1 IL formula unit, it derives:
+
+```text
+V_IL [m³/mol] = M_IL [g/mol] / density [g/cm³] * 1e-6
+solvation_kcal/mol = R*T*ln(gamma_water_infinity * Psat_water_Pa * V_IL / (R*T)) / 4184
+R = 8.31446261815324 J/(mol K)
+```
+
+This uses equal gas/liquid concentration standard states, ideal saturated water
+vapor and a neglected Poynting correction. It is not simply `RT ln(gamma)`.
+The standard-state derivation is in [Processes 2020, 8, 623, equations 4–8](https://doi.org/10.3390/pr8050623).
+Water saturation pressure follows [IAPWS SR1-86(1992), equation 1](https://iapws.org/technical-guidance/release/Supp-sat),
+using ITS-90, 273.16 ≤ T < 647.096 K with no extrapolation. Crawl archives both
+primary PDFs with their URLs and SHA-256; structure verifies and carries them into
+the source audit. The water archive must be refreshed once to include these files.
+
+Conversion uses experimental density inputs after the existing canonical-SMILES
+and Fixed-H identity normalization. Temperature must match exactly. Pressure must
+be within 100–102 kPa: exact P is preferred, otherwise the nearest P in that interval
+is used under an explicit incompressible-liquid approximation. There is no T
+interpolation or simulated-density fallback. At the chosen T/P, the median of
+distinct experimental densities supplies one conversion per gamma observation;
+all contributing density measurements, their range and the resulting free-energy
+range remain in audit. Existing density labels are unchanged. Unsupported ion
+stoichiometry, missing density and invalid conversion inputs are audited separately.
+
+Every candidate is compared with all existing water labels at the same IL/T.
+If any absolute residual exceeds **0.05 kcal/mol**, all new converted conditions
+of that IL are quarantined for source/standard-state review; old labels remain.
+This is an explicit consistency screen, not an offset fit or a deduplication
+tolerance. Passed observations use `solute=O` and `source_list=WaterActivity`
+through the existing solvation merge and near-value rules. No tolerance is widened.
+
+`_audit/water_solvation/{conversion_records,density_matches,overlap_pairs}.csv`
+retain raw source rows/references, gamma uncertainties, conversion inputs,
+temperature/pressure matching and rejected/quarantined candidates. `summary.json`
+records assumptions, reference/dependency hashes, decisions, overlap residuals
+and before/after coverage. Normal hydration reconstruction then uses the expanded
+solvation data and audits any changed water hydration candidates. QDB.266 remains
+behind its separate closed compatibility gate; this conversion does not approve it.
+
+Final removes `water_activity_coefficient.csv` only after verifying a fresh merged
+conversion audit. Stale source hashes block merge before replacing existing output.
+Rebuilding splits removes the retired task and its catalog row, preserves Stage1
+entity corpora, and follows existing split algorithms. Existing prepared model
+artifacts are not automatically migrated.
+
+The [2026-10-31 isolated validation](data/analysis/water-solvation-validation-20261031/report.md)
+published 454 converted observations: solvation rows 23,783 → 24,237, ILs 74 → 132,
+IL–solute systems 3,611 → 3,684 and IL–solute–T conditions 23,781 → 24,178.
+It quarantined 27 records from six conflicting ILs, left 189 records without
+same-temperature density and five unsupported stoichiometries in audit, and kept
+2,846 other-composition records upstream. These are observed results, not expected
+counts enforced in code. All five split seeds and a relationship audit passed;
+official generated outputs have not been rebuilt by this implementation.
+
+After temporary validation, rebuild official outputs in the existing environment:
+
+```bash
+cd /data/pengs/ILUME-Data
+set -euo pipefail
+python scripts/crawl_public_properties.py --sources WaterActivity
+python scripts/structure_public_properties.py --sources WaterActivity
+python scripts/clean_structured_data.py --sources WaterActivity
+python scripts/merge_data.py
+python scripts/build_final_data.py
+for WATER_SOLVATION_SEED in 42 123 1234 3407 90756; do
+  python scripts/build_training_splits.py build-splits --seed "$WATER_SOLVATION_SEED" \
+    --output-root "data/training_splits/$WATER_SOLVATION_SEED"
+done
+python scripts/analyze_final_properties.py --input-root data/final \
+  --output-dir analysis
+for WATER_SOLVATION_SEED in 42 123 1234 3407 90756; do
+  rm -rf -- "data/analysis/$WATER_SOLVATION_SEED"
+  python scripts/analyze_dataset_relationship_graph.py compute \
+    --input-root "data/training_splits/$WATER_SOLVATION_SEED" \
+    --output-dir "data/analysis/$WATER_SOLVATION_SEED" \
+    --seed "$WATER_SOLVATION_SEED"
+done
+```
+
+Use `python` from the active environment. Property analysis overwrites its outputs
+under `analysis/`. Relationship outputs use the fixed per-seed directories above;
+the loop removes only the corresponding old seed directory because the graph
+script requires an empty output directory. `compute` includes its audit; do not
+run a separate audit for the same rebuild.
+Do not run `extract-pretrain` for this task migration.
+Each seed directory has its own authoritative catalog; these commands do not
+rewrite a historical catalog directly under `data/training_splits/`.
+
+After the rebuild, check the published contract without hard-coding dataset size:
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import json
+import pandas as pd
+root = Path('data')
+assert not (root / 'final/experiment/water_activity_coefficient.csv').exists()
+audit = json.loads((root / 'final/_audit/water_solvation/summary.json').read_text())
+solvation = pd.read_csv(root / 'final/experiment/solvation.csv')
+assert len(solvation) == audit['after']['rows']
+assert set(solvation) == {'cation', 'anion', 'solute', 'temperature_K', 'solvation_kcal/mol', 'source_list'}
+for seed in (42, 123, 1234, 3407, 90756):
+    catalog = pd.read_csv(root / 'training_splits' / str(seed) / 'task_catalog.csv')
+    assert 'experiment/water_activity_coefficient' not in set(catalog.task_id)
+    assert 'experiment/solvation' in set(catalog.task_id)
+print(audit['added'], audit['status_counts'])
+PY
+```
 
 Existing pEC50 remains. No ILToxDB ingestion is added because it mixes IC50, EC50
 and CC50 without reliably preserving their original designation. ECW is archive-only:
@@ -298,11 +420,12 @@ for name in names:
         old_files = {p.relative_to(old): p.read_bytes() for p in old.rglob('*') if p.is_file()}
         new_files = {p.relative_to(new): p.read_bytes() for p in new.rglob('*') if p.is_file()}
         assert old_files == new_files, name
-for name in ('gas_solubility', 'water_activity_coefficient', 'enthalpy_of_vaporization_or_sublimation'):
+for name in ('gas_solubility', 'enthalpy_of_vaporization_or_sublimation'):
     assert catalog.loc[f'experiment/{name}', 'stage'] == 3
 assert not Path('data/final/experiment/x_co2.csv').exists()
 assert not Path('data/final/experiment/transfer.csv').exists()
-assert 'x_water_unitless' in catalog.loc['experiment/water_activity_coefficient', 'condition_columns']
+assert 'experiment/water_activity_coefficient' not in catalog.index
+assert not Path('data/final/experiment/water_activity_coefficient.csv').exists()
 audit = pd.read_csv(root / '_audit/stage2_overlap_exclusions.csv')
 hvap = audit.loc[audit.stage2_task_id.eq('simulation/heat_of_vaporization')]
 print('Hvap excluded systems/rows:', len(hvap), hvap.excluded_stage2_rows.sum())
@@ -521,7 +644,8 @@ be new or empty. Stage3×Stage3 and Stage2→Stage3 outputs include overlap coun
 provenance, NA/stability tables, annotated heatmaps and five relationship graphs:
 Spearman, distance correlation, directed binary I/H, multiclass MI and CV-NMAE.
 Dynamic permittivity uses the approved 10 GHz selection. Unified gas solubility
-and water activity await formula approval. Viscosity, electrical conductivity and self
+awaits formula approval; water activity is retired as an independent task after
+conversion of supported infinite-dilution data into solvation. Viscosity, electrical conductivity and self
 diffusion use the approved Arrhenius temperature-pressure formula. Experimental
 transfer-organic is included only for shared-solute comparisons with solvation
 and transfer; its other Stage3 matrix cells are marked `incompatible_topology`.

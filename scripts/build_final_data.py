@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
 import shutil
 import tempfile
@@ -25,6 +26,7 @@ EXCLUDED_EXPERIMENT_FILES = (
     "enthalpy_of_transition_or_fusion.csv",
     "equilibrium_temperature.csv",
     "isobaric_coefficient_of_volume_expansion.csv",
+    "water_activity_coefficient.csv",
 )
 EXCLUDED_SIMULATION_FILES = ("3d_box.csv",)
 STRUCTURE_MANIFEST_COLUMNS = (
@@ -156,6 +158,14 @@ def build_final_data(
     input_root = Path(input_root)
     output_root = Path(output_root)
     charge_data_root = Path(charge_data_root)
+    if (input_root / "experiment/water_activity_coefficient.csv").exists():
+        summary_path = input_root / "_audit/water_solvation/summary.json"
+        summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+        expected = summary.get("merged_output_sha256", {})
+        if (summary.get("conversion_policy") != "water_gamma_infinite_dilution_v1"
+                or "water_activity_coefficient.csv" not in expected
+                or any(file_sha256(input_root / "experiment" / name) != digest for name, digest in expected.items())):
+            raise ValueError("Water activity retirement requires a current conversion audit; rerun merge")
     output_root.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(dir=output_root.parent) as temporary_dir:

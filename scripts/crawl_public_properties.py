@@ -37,6 +37,10 @@ SNAPSHOTS = {
         "files": ["Dataset/Dataset-IL-Water-Activity_SMILES_Atom-Count.csv"],
     },
 }
+WATER_THERMODYNAMIC_REFERENCES = {
+    "water_solvation_standard_states.pdf": "https://mdpi-res.com/d_attachment/processes/processes-08-00623/article_deploy/processes-08-00623.pdf",
+    "water_saturation_iapws1992.pdf": "https://iapws.org/public/documents/6dGkr/Supp-sat.pdf",
+}
 EXPERIMENT_ARCHIVES = {
     "Lethesh2022": {
         "doi": "10.3389/fchem.2022.859304",
@@ -138,6 +142,14 @@ def crawl_source(source: str, raw_root: Path) -> dict:
                     shutil.copy2(previous, staged / filename)
                     entry["retained_sha256"] = hashlib.sha256(previous.read_bytes()).hexdigest()
             manifest["files"].append(entry)
+        if source == "WaterActivity":
+            for filename, url in WATER_THERMODYNAMIC_REFERENCES.items():
+                payload = fetch_bytes(url)
+                if not payload.startswith(b"%PDF"):
+                    raise ValueError(f"{filename}: thermodynamic reference is not a PDF")
+                (staged / filename).write_bytes(payload)
+                manifest["files"].append({"filename": filename, "url": url, "role": "thermodynamic_reference",
+                    "status": "downloaded", "sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)})
         if source == "ECW":
             manifest.update(doi="10.1039/D3TA04310J", training_status="deferred", gap=ECW_GAP)
             (staged / "gap.md").write_text(ECW_GAP + "\n", encoding="utf-8")

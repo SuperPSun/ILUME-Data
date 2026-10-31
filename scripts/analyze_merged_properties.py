@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from itertools import combinations
 import math
 import re
@@ -284,6 +285,17 @@ def analyze_property_manifest(
         plot_manifest,
         property_system_overlap,
     )
+    water_audit = input_root / "_audit/water_solvation/summary.json"
+    if water_audit.exists():
+        conversion = json.loads(water_audit.read_text())
+        pd.DataFrame([{"status": status, "records": count} for status, count in conversion["status_counts"].items()]).to_csv(
+            output_dir / "water_solvation_conversion_summary.csv", index=False)
+        with (output_dir / "property_analysis_report.md").open("a") as handle:
+            handle.write("\n\n## Water solvation conversion\n\n"
+                         f"{conversion['published_records_before_merge']} infinite-dilution water observations passed conversion "
+                         "before normal solvation merging. See `water_solvation_conversion_summary.csv` and "
+                         "input `_audit/water_solvation/` for original activities, density dependencies and overlap conflicts. "
+                         "The independent water-activity task is retired from final and training splits.\n")
     return summary
 
 

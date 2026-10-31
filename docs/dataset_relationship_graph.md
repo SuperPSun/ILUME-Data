@@ -40,11 +40,12 @@ reference conditions and stability counts. An unknown included dataset is explic
 pending, never assigned a default model. Approval means choosing an approximation,
 not certifying that it is valid over every observed condition range.
 
-Unified gas solubility and water activity coefficient are explicitly pending.
-Their observations and condition coverage are inventoried, including water mole
-fraction, but they publish no scalar signatures until a gas/concentration reference
-formula is approved. This also applies to their single observations: raw points at
-different gas identities or water concentrations are not comparable IL signatures.
+Unified gas solubility is explicitly pending and publishes no scalar signatures
+until a gas reference formula is approved, including for single observations.
+Water activity is retired from rebuilt final data and training catalogs. Supported
+infinite-dilution records enter solvation after conversion and consistency review;
+finite-composition data remain upstream/audit-only. The historical water formula
+entry remains pending for old catalogs and does not create a current task.
 Stage1 supervised property tasks are outside this Stage2/Stage3 graph.
 
 Anodic and cathodic potential limits are also `pending_formula`: their reference

@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 from raw_prep import net_formal_charge, parse_ion_pair_identity  # noqa: E402
-from crawl_public_properties import GAS_SMILES, SNAPSHOTS, EXPERIMENT_ARCHIVES, PUBLIC_SOURCES, required_columns  # noqa: E402
+from crawl_public_properties import GAS_SMILES, SNAPSHOTS, EXPERIMENT_ARCHIVES, PUBLIC_SOURCES, WATER_THERMODYNAMIC_REFERENCES, required_columns  # noqa: E402
 from merge_data import canonicalize_identity_smiles, fixed_h_inchikey  # noqa: E402
 
 
@@ -379,8 +379,12 @@ def structure_source(source: str, raw_root: Path, output_root: Path,
     manifest = json.loads((source_root / "manifest.json").read_text(encoding="utf-8"))
     expected = {Path(path).name for path in SNAPSHOTS[source]["files"]}
     entries = {entry["filename"]: entry for entry in manifest["files"]}
-    if set(entries) != expected:
+    reference_names = set(WATER_THERMODYNAMIC_REFERENCES) if source == "WaterActivity" else set()
+    if set(entries) != expected | reference_names:
         raise ValueError(f"{source}: incomplete snapshot manifest")
+    for filename in reference_names:
+        if hashlib.sha256((source_root / filename).read_bytes()).hexdigest() != entries[filename]["sha256"]:
+            raise ValueError(f"{filename}: thermodynamic reference hash mismatch")
     rows, provenance, rejected = [], [], []
     for filename in sorted(expected):
         entry = entries[filename]
@@ -411,6 +415,7 @@ def structure_source(source: str, raw_root: Path, output_root: Path,
                 cation, anion = row["Cation_SMILES"], row["Anion_SMILES"]
                 trace.update(reference=row["Ref"], source_record_id=row.get("Sl-No", ""),
                              raw_cation=cation, raw_anion=anion,
+                             raw_gamma_uncertainty=row.get("Delta[Act]_comp0", ""),
                              conversion="Activityt_water -> gamma directly; pressure already kPa")
                 record = {"cation": cation, "anion": anion,
                           "x_water_unitless": pd.to_numeric(row["Mole_frac_water"], errors="coerce"),
@@ -443,6 +448,12 @@ def structure_source(source: str, raw_root: Path, output_root: Path,
         pd.DataFrame(rejected, columns=["rejection_reason"] if not rejected else None).to_csv(
             audit / "structure_rejected.csv", index=False)
         shutil.copy2(source_root / "manifest.json", audit / "manifest.json")
+        for filename in reference_names:
+            shutil.copy2(source_root / filename, audit / filename)
+        if source == "WaterActivity":
+            (audit / "summary.json").write_text(json.dumps({"conversion_policy": "water_gamma_infinite_dilution_v1",
+                "structured_output_sha256": {f"{stem}_structured.csv": hashlib.sha256(
+                    (staged / f"{stem}_structured.csv").read_bytes()).hexdigest()}}, indent=2) + "\n")
         destination = output_root / source
         if destination.exists():
             shutil.rmtree(destination)

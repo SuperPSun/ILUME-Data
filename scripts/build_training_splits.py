@@ -141,6 +141,7 @@ STAGE2_EXPERIMENT_REFERENCES = {
 }
 EXCLUDED_EXPERIMENT_TRAINING_DATASETS = {
     "experiment/isobaric_coefficient_of_volume_expansion.csv",
+    "experiment/water_activity_coefficient.csv",
 }
 STAGE2_OVERLAP_AUDIT_COLUMNS = [
     "stage2_task_id",

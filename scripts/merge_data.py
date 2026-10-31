@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import hashlib
+import math
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 import re
@@ -14,6 +15,7 @@ from pathlib import Path
 import pandas as pd
 from rdkit import Chem, rdBase
 from rdkit.Chem import inchi
+from rdkit.Chem import Descriptors
 
 PUBLIC_PROPERTY_SOURCES = ("IL4GAS", "WaterActivity", "Lethesh2022", "Toots2025_QDB266")
 EXPERIMENT_SOURCES = ("AIonopedia", "ILBERT", "ILThermo", "after_AIonopedia", *PUBLIC_PROPERTY_SOURCES)
@@ -82,6 +84,10 @@ EXPERIMENT_DEFAULT_PRESSURE_LABELS = frozenset(
 SCALAR_VALUE_ABSOLUTE_TOLERANCE = Decimal("5e-7")
 SOLVATION_REVISION_PAIR_TOLERANCE = Decimal("0.005")
 FLOAT_SIGNIFICANT_DIGITS = 15
+WATER_SOLVATION_POLICY = "water_gamma_infinite_dilution_v1"
+WATER_SOLVATION_R = 8.31446261815324
+# A consistency screen, independent of the unchanged scalar deduplication tolerance.
+WATER_OVERLAP_TOLERANCE_KCAL = 0.05
 CHEMICAL_IDENTITY_AUDIT_COLUMNS = (
     "fixed_h_inchikey",
     "representative_smiles",
@@ -835,6 +841,181 @@ def write_bucket(
     return manifest_rows
 
 
+def water_saturation_pressure_pa(temperature: float) -> float:
+    """IAPWS SR1-86(1992), equation 1; ITS-90 temperatures, no extrapolation."""
+    if not math.isfinite(temperature) or not 273.16 <= temperature < 647.096:
+        raise ValueError("water_saturation_temperature_out_of_range")
+    theta = 1 - temperature / 647.096
+    coefficients = (-7.85951783, 1.84408259, -11.7866497, 22.6807411, -15.9618719, 1.80122502)
+    powers = (1, 1.5, 3, 3.5, 4, 7.5)
+    return 22.064e6 * math.exp(647.096 / temperature * sum(a * theta ** b for a, b in zip(coefficients, powers)))
+
+
+def water_gamma_to_solvation(gamma: float, temperature: float, molar_mass: float, density: float) -> float:
+    """Equal gas/liquid concentration standards; ideal saturated vapor approximation."""
+    if any(not math.isfinite(v) or v <= 0 for v in (gamma, molar_mass, density)):
+        raise ValueError("invalid_water_conversion_input")
+    volume_m3_mol = molar_mass / density * 1e-6  # g/mol / (g/cm3)
+    return WATER_SOLVATION_R * temperature / 4184 * math.log(
+        gamma * water_saturation_pressure_pa(temperature) * volume_m3_mol / (WATER_SOLVATION_R * temperature))
+
+
+def solvation_coverage(frame):
+    return {"rows": len(frame), "ILs": len(frame[["cation", "anion"]].drop_duplicates()),
+            "solutes": int(frame.solute.nunique()),
+            "systems": len(frame[["cation", "anion", "solute"]].drop_duplicates()),
+            "conditions": len(frame[["cation", "anion", "solute", "temperature_K"]].drop_duplicates())}
+
+
+def prepare_water_solvation(experiment, input_root):
+    """Derive water labels jointly with experimental density; retain all decisions in audit."""
+    root = input_root / "WaterActivity"
+    path = root / "water_activity_coefficient_structured.csv"
+    if not path.exists():
+        return None
+    summary_path = root / "_audit/summary.json"
+    summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in root.glob("*.csv")}
+    if (summary.get("conversion_policy") != WATER_SOLVATION_POLICY
+            or hashes != summary.get("cleaned_output_sha256")
+            or set(hashes) != {path.name}):
+        raise ValueError("WaterActivity conversion blocked: rerun crawl, structure and clean")
+    trace = pd.read_csv(root / "_audit/water_activity_coefficient_structured_provenance.csv")
+    accepted = trace.loc[trace.status.eq("accepted")].copy()
+    if sorted(accepted.cleaned_row_index.tolist()) != list(range(sum(len(f) for f in experiment.get("water_activity_coefficient_unitless", [])))):
+        raise ValueError("WaterActivity: cleaned provenance coverage mismatch")
+    raw_trace = accepted.set_index("cleaned_row_index").to_dict("index")
+    # Verify the archived primary references before trusting a refreshed source snapshot.
+    manifest = json.loads((root / "_audit/manifest.json").read_text())
+    references = [e for e in manifest["files"] if e.get("role") == "thermodynamic_reference"]
+    if {e["filename"] for e in references} != {"water_solvation_standard_states.pdf", "water_saturation_iapws1992.pdf"}:
+        raise ValueError("WaterActivity: thermodynamic reference archive missing")
+    for entry in references:
+        if hashlib.sha256((root / "_audit" / entry["filename"]).read_bytes()).hexdigest() != entry["sha256"]:
+            raise ValueError("WaterActivity: thermodynamic reference hash mismatch")
+    keys = ["cation", "anion", "temperature_K"]
+    density_rows = []
+    for frame in experiment.get("density_g/cm^3", []):
+        for index, row in frame.iterrows():
+            density_rows.append({**row.to_dict(), "density_cleaned_row_number": int(index) + 2})
+    densities = pd.DataFrame(density_rows)
+    density_groups = {key: group for key, group in densities.groupby(keys)} if not densities.empty else {}
+    decisions, selected_density = [], []
+    for frame in experiment.get("water_activity_coefficient_unitless", []):
+        if not frame.source.eq("WaterActivity").all():
+            raise ValueError("Unreviewed water activity source")
+        for index, row in frame.iterrows():
+            original = raw_trace[index]
+            decision = {**original, **row.to_dict(), "cleaned_row_number": int(index) + 2,
+                        "conversion_policy": WATER_SOLVATION_POLICY, "solute": "O"}
+            decisions.append(decision)
+            if row["x_water_unitless"] != 0:
+                decision["status"] = "finite_composition_not_converted"
+                continue
+            gamma, temperature = float(row["water_activity_coefficient_unitless"]), float(row["temperature_K"])
+            if not math.isfinite(gamma) or gamma <= 0 or not 273.16 <= temperature < 647.096:
+                decision["status"] = "invalid_conversion_numeric"
+                continue
+            ions = [Chem.MolFromSmiles(row[c]) for c in ("cation", "anion")]
+            if (any(m is None or len(Chem.GetMolFrags(m)) != 1 for m in ions)
+                    or [Chem.GetFormalCharge(m) for m in ions] != [1, -1]):
+                decision["status"] = "unsupported_ion_stoichiometry"
+                continue
+            if not 100 <= row["pressure_kPa"] <= 102:
+                decision["status"] = "outside_near_atmospheric_pressure"
+                continue
+            key = tuple(row[k] for k in keys)
+            group = density_groups.get(key)
+            if group is None:
+                decision["status"] = "missing_same_temperature_density"
+                continue
+            rho = pd.to_numeric(group["density_g/cm^3"], errors="coerce")
+            valid = rho.map(lambda v: pd.notna(v) and math.isfinite(v) and v > 0)
+            if "pressure_kPa" not in group:
+                decision["status"] = "missing_density_pressure"
+                continue
+            eligible = group.loc[valid & group.pressure_kPa.between(100, 102)].copy()
+            if eligible.empty:
+                decision["status"] = "missing_near_atmospheric_density"
+                continue
+            delta = (eligible.pressure_kPa - row["pressure_kPa"]).abs()
+            eligible = eligible.loc[delta.eq(delta.min())]
+            # Repeated publication of an identical density does not change its weight.
+            values = eligible["density_g/cm^3"].drop_duplicates()
+            density = float(values.median())
+            mass = sum(Descriptors.MolWt(m) for m in ions)
+            candidate = water_gamma_to_solvation(gamma, temperature, mass, density)
+            decision.update(status="candidate", molar_mass_g_mol=mass, density_g_cm3=density,
+                            density_min_g_cm3=float(values.min()), density_max_g_cm3=float(values.max()),
+                            density_unique_values=len(values), density_pressure_kPa=float(eligible.pressure_kPa.iloc[0]),
+                            density_pressure_difference_kPa=float(delta.min()),
+                            density_match="exact_T_P" if delta.min() == 0 else "exact_T_near_atmospheric_P",
+                            molar_volume_m3_mol=mass / density * 1e-6,
+                            water_saturation_pressure_Pa=water_saturation_pressure_pa(temperature),
+                            candidate_solvation_kcal_mol=candidate,
+                            candidate_min_kcal_mol=water_gamma_to_solvation(gamma, temperature, mass, float(values.max())),
+                            candidate_max_kcal_mol=water_gamma_to_solvation(gamma, temperature, mass, float(values.min())))
+            for density_row in eligible.to_dict("records"):
+                selected_density.append({"water_cleaned_row_number": int(index) + 2, **{k: row[k] for k in keys},
+                    "water_raw_row_number": original["raw_row_number"],
+                    "density_source": density_row["source"], "density_source_file": density_row["source_file"],
+                    "density_cleaned_row_number": density_row["density_cleaned_row_number"],
+                    "density_g_cm3": density_row["density_g/cm^3"], "density_pressure_kPa": density_row["pressure_kPa"]})
+    decisions = pd.DataFrame(decisions, columns=None if decisions else ["status", *keys])
+    old_frames = experiment.get("solvation_kcal/mol", [])
+    baseline = pd.concat(old_frames, ignore_index=True) if old_frames else pd.DataFrame(columns=[*keys, "solute", "solvation_kcal/mol"])
+    before = solvation_coverage(aggregate_property(old_frames, "solvation_kcal/mol")[0]) if old_frames else solvation_coverage(baseline)
+    baseline = baseline.loc[baseline.solute.eq("O")]
+    baseline_groups = {key: g for key, g in baseline.groupby(keys)}
+    overlap, conflicting_ils = [], set()
+    for index, row in decisions.loc[decisions.status.eq("candidate")].iterrows():
+        group = baseline_groups.get(tuple(row[k] for k in keys))
+        if group is None:
+            continue
+        residuals = row.candidate_solvation_kcal_mol - group["solvation_kcal/mol"]
+        # All old observations are compared, including duplicates and conflicting labels.
+        if residuals.abs().max() > WATER_OVERLAP_TOLERANCE_KCAL:
+            conflicting_ils.add((row.cation, row.anion))
+        for (_, old), residual in zip(group.iterrows(), residuals):
+            overlap.append({"water_cleaned_row_number": row.cleaned_row_number, **{k: row[k] for k in keys},
+                "candidate_solvation_kcal_mol": row.candidate_solvation_kcal_mol,
+                "existing_solvation_kcal_mol": old["solvation_kcal/mol"], "residual_kcal_mol": residual,
+                "existing_source": old.get("source"), "existing_source_file": old.get("source_file")})
+    outputs = []
+    for index, row in decisions.loc[decisions.status.eq("candidate")].iterrows():
+        if (row.cation, row.anion) in conflicting_ils:
+            decisions.at[index, "status"] = "overlap_conflict_IL_quarantined"
+            continue
+        decisions.at[index, "status"] = "published"
+        outputs.append({**{k: row[k] for k in keys}, "solute": "O", "solvation_kcal/mol": row.candidate_solvation_kcal_mol,
+                        "source": "WaterActivity", "source_file": path.name})
+    if outputs:
+        experiment.setdefault("solvation_kcal/mol", []).append(pd.DataFrame(outputs))
+    residual = pd.Series([r["residual_kcal_mol"] for r in overlap], dtype=float)
+    dependencies = {str(p.relative_to(input_root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for source in EXPERIMENT_SOURCES for p in (input_root / source).glob("*.csv")
+                    if p.name == path.name or any(p.name == f.source_file.iloc[0] and source == f.source.iloc[0]
+                        for f in [*experiment.get("density_g/cm^3", []), *old_frames])}
+    audit_summary = {"conversion_policy": WATER_SOLVATION_POLICY, "input_hashes": dependencies,
+        "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "formula": "R*T*ln(gamma_water_infinity * Psat_water_Pa * (M_IL_g_mol/rho_g_cm3*1e-6)/(R*T))/4184",
+        "R_J_mol_K": WATER_SOLVATION_R, "standard_state": "equal gas/liquid molar concentrations; one cation-anion pair is one IL formula unit",
+        "approximations": "ideal saturated water vapor; Poynting correction neglected; incompressible density within 100-102 kPa",
+        "density_selection": "exact T; nearest P within 100-102 kPa, exact P preferred; median of distinct experimental densities; no T interpolation",
+        "overlap_conflict_tolerance_kcal_mol": WATER_OVERLAP_TOLERANCE_KCAL,
+        "conflict_policy": "quarantine all derived conditions of an IL if any matched old water label differs by more than the consistency bound; no fitted offset",
+        "references": references, "input_records": len(decisions), "published_records_before_merge": len(outputs),
+        "status_counts": decisions.status.value_counts().to_dict(), "conflicting_ILs": len(conflicting_ils), "before": before,
+        "overlap_pairs": len(overlap), "overlap_residual_kcal_mol": {
+            "bias": float(residual.mean()) if len(residual) else None,
+            "MAE": float(residual.abs().mean()) if len(residual) else None,
+            "RMSE": float((residual.pow(2).mean()) ** .5) if len(residual) else None,
+            "max_absolute": float(residual.abs().max()) if len(residual) else None}}
+    return decisions, pd.DataFrame(selected_density, columns=None if selected_density else
+        ["water_cleaned_row_number", *keys, "density_source", "density_source_file", "density_cleaned_row_number"]), pd.DataFrame(overlap,
+        columns=None if overlap else ["water_cleaned_row_number", *keys, "candidate_solvation_kcal_mol", "existing_solvation_kcal_mol", "residual_kcal_mol"]), audit_summary
+
+
 def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     input_root = Path(input_root)
     output_root = Path(output_root)
@@ -847,7 +1028,6 @@ def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
         if not summary.get("merge_allowed") or hashes != summary.get("cleaned_output_sha256"):
             raise ValueError("QDB.266 solvation publication blocked: reviewed compatibility evidence and unchanged cleaned data required")
     output_root.mkdir(parents=True, exist_ok=True)
-    clean_output_root(output_root)
 
     gas_conversion_audit: list[dict[str, object]] = []
     experiment, experiment_gap_summaries, experiment_gap_anomalies = collect_bucket(
@@ -862,6 +1042,8 @@ def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     )
     buckets = {"experiment": experiment, "simulation": simulation}
     identity_audit = normalize_chemical_identities(buckets)
+    water_audit = prepare_water_solvation(experiment, input_root)
+    clean_output_root(output_root)
 
     manifest_rows: list[dict[str, object]] = []
     manifest_rows.extend(
@@ -881,6 +1063,18 @@ def merge_data(input_root: Path, output_root: Path) -> list[dict[str, object]]:
     )
     audit_root = output_root / "_audit"
     audit_root.mkdir(parents=True, exist_ok=True)
+    if water_audit is not None:
+        directory = audit_root / "water_solvation"
+        directory.mkdir()
+        for name, frame in zip(("conversion_records", "density_matches", "overlap_pairs"), water_audit[:3]):
+            frame.to_csv(directory / f"{name}.csv", index=False)
+        water_audit[3]["merged_output_sha256"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for name in ("solvation", "water_activity_coefficient")
+            if (p := output_root / "experiment" / f"{name}.csv").exists()}
+        solvation = output_root / "experiment/solvation.csv"
+        after = solvation_coverage(pd.read_csv(solvation)) if solvation.exists() else water_audit[3]["before"]
+        water_audit[3].update(after=after, added={k: after[k] - water_audit[3]["before"][k] for k in after})
+        (directory / "summary.json").write_text(json.dumps(water_audit[3], indent=2) + "\n")
     pd.DataFrame(gas_conversion_audit, columns=["source", "source_file", "source_row_number",
         "cation", "anion", "solute", "temperature_K", "pressure_kPa", "x_CO2_unitless", "conversion"]).to_csv(
         audit_root / "gas_solubility_legacy_co2_conversion.csv", index=False)

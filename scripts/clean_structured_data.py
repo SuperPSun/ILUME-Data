@@ -805,6 +805,13 @@ def clean_non_ilthermo_structured(
         source_dir = input_root / source
         if not source_dir.exists():
             continue
+        if source == "WaterActivity":
+            summary = json.loads((source_dir / "_audit/summary.json").read_text())
+            hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source_dir.glob("*.csv")}
+            if summary.get("conversion_policy") != "water_gamma_infinite_dilution_v1" or hashes != summary.get("structured_output_sha256"):
+                raise ValueError("WaterActivity: stale structured snapshot; rerun structure")
+            for old in (output_root / source).glob("*.csv"):
+                old.unlink()
         if source in PUBLIC_PROPERTY_SOURCES and (source_dir / "_audit").is_dir():
             destination = output_root / source / "_audit"
             if destination.exists():
@@ -827,7 +834,7 @@ def clean_non_ilthermo_structured(
                     repaired_path,
                 )
             )
-        if source == "Toots2025_QDB266" and (output_root / source / "_audit/summary.json").is_file():
+        if source in {"WaterActivity", "Toots2025_QDB266"} and (output_root / source / "_audit/summary.json").is_file():
             summary_path = output_root / source / "_audit/summary.json"
             summary = json.loads(summary_path.read_text())
             summary["cleaned_output_sha256"] = {

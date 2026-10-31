@@ -19,6 +19,8 @@ ANION = "F[B-](F)(F)F"
 
 def public_payload(url: str) -> bytes:
     filename = unquote(url.rsplit("/", 1)[1])
+    if filename.endswith('.pdf'):
+        return b'%PDF-1.4\nreference fixture'
     if filename.startswith("unique_"):
         gas = filename.removeprefix("unique_").removesuffix("_data.csv")
         rows = [{"T/K": 298.15, "P/bar": 1.01325, f"x_{gas}": .1,
@@ -134,7 +136,7 @@ def test_new_sources_reuse_existing_equivalent_identity_representatives(tmp_path
     new = "C[N@H+]1C=CN=C1"
     for source, row in (
         ("ILBERT", {"cation": old, "anion": ANION, "density_g/cm^3": 1.2}),
-        ("WaterActivity", {"cation": new, "anion": ANION, "x_water_unitless": .5,
+        ("IL4GAS", {"cation": new, "anion": ANION, "x_water_unitless": .5,
                            "temperature_K": 298.15, "pressure_kPa": 100.,
                            "water_activity_coefficient_unitless": 2.}),
     ):
@@ -158,6 +160,8 @@ def test_new_sources_reuse_existing_equivalent_identity_representatives(tmp_path
 ))
 def test_numeric_rejections_keep_raw_provenance(tmp_path, monkeypatch, column, value):
     def payload(url):
+        if url.endswith('.pdf'):
+            return public_payload(url)
         frame = pd.read_csv(io.BytesIO(public_payload(url)))
         frame[column] = frame[column].astype(object)
         frame.loc[0, column] = value

@@ -3624,9 +3624,8 @@ def test_stage1_property_migration_preserves_legacy_partitions_and_entities(tmp_
                                    for path in (output_root / "stage1/properties").rglob("*") if path.is_file()}
     tasks = catalog.set_index("task_id")
     assert tasks.loc["experiment/gas_solubility", "stage"] == 3
-    assert tasks.loc["experiment/water_activity_coefficient", "stage"] == 3
-    assert "x_water_unitless" in tasks.loc["experiment/water_activity_coefficient", "condition_columns"]
-    assert tasks.loc["experiment/water_activity_coefficient", "target_columns"] == "water_activity_coefficient_unitless"
+    assert "experiment/water_activity_coefficient" not in tasks.index
+    assert not (output_root / "stage3/experiment/water_activity_coefficient").exists()
     assert tasks.loc["simulation/heat_of_vaporization", "experiment_reference"] == "experiment/enthalpy_of_vaporization_or_sublimation"
 
 
